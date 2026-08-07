@@ -1,7 +1,7 @@
 [project]
 name = "physicsverifier"
 version = "0.1.0"
-description = "Add your description here"
+description = "Evaluate physics-competition solutions with semantic rule retrieval and optional symbolic checks."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
