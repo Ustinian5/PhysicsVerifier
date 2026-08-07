@@ -20,6 +20,9 @@ except ImportError:  # pragma: no cover - environment-dependent
     OpenAI = None  # type: ignore[assignment]
 
 
+UNIFIED_SEMANTIC_MATCHER_PROMPT_VERSION = "semantic-navigation-background-only-v1"
+
+
 class SemanticSelectionError(RuntimeError):
     """Identify which semantic-tree stage failed without hiding the root error."""
 

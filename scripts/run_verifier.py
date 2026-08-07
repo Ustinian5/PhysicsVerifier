@@ -210,6 +210,35 @@ def _build_symbolic_audit(sample_result: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _write_batch_outputs(
+    raw_results: List[Dict[str, Any]],
+    *,
+    output_path: Path,
+    symbolic_output_path: Path,
+    full_output_path: Path | None,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    symbolic_output_path.parent.mkdir(parents=True, exist_ok=True)
+    if full_output_path is not None:
+        full_output_path.parent.mkdir(parents=True, exist_ok=True)
+    results = [_build_main_result(item) for item in raw_results if isinstance(item, dict)]
+    symbolic_audit_all = [_build_symbolic_audit(item) for item in raw_results if isinstance(item, dict)]
+    symbolic_audit = [
+        item
+        for item in symbolic_audit_all
+        if (
+            item.get("checked_diagnostics")
+            or item.get("symbolic_checks")
+            or item.get("experience_code_checks")
+            or item.get("suppressed_diagnostics")
+        )
+    ]
+    _write_json_checkpoint(output_path, results)
+    _write_json_checkpoint(symbolic_output_path, symbolic_audit)
+    if full_output_path is not None:
+        _write_json_checkpoint(full_output_path, raw_results)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run PhysicsVerifier top-down checking.")
     parser.add_argument("--input", "-i", type=str, default="data/evaluation_sample_30.json")
@@ -249,12 +278,28 @@ def main() -> None:
         action="store_true",
         help="Disable the deterministic experience-code symbolic verification (on by default).",
     )
+    cache_group = parser.add_mutually_exclusive_group()
+    cache_group.add_argument(
+        "--llm-cache",
+        dest="enable_llm_cache",
+        action="store_true",
+        help="Enable the cross-run Semantic Checker disk cache (legacy default).",
+    )
+    cache_group.add_argument(
+        "--no-llm-cache",
+        dest="enable_llm_cache",
+        action="store_false",
+        help="Disable cross-run LLM cache reuse; required for controlled repeated experiments.",
+    )
+    parser.set_defaults(enable_llm_cache=True)
     parser.add_argument(
         "--unified-catalog",
         type=str,
         default=None,
-        help="Path to the unified rules catalog JSON. When set and the file exists, "
-             "this takes priority over --catalog.",
+        help=(
+            "Path to a unified rules catalog JSON. An explicit missing path is fatal; "
+            "the formal evaluation pipeline additionally requires unified_rules_v2."
+        ),
     )
     parser.add_argument(
         "--experience-code-manifest",
@@ -371,6 +416,13 @@ def main() -> None:
         help="Print a throughput summary every N completed samples; 0 disables.",
     )
     parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Atomically persist full-run outputs every N completed samples; 0 writes only at the end.",
+    )
+    parser.add_argument(
         "--verbose-per-sample",
         action="store_true",
         help="Print one line before each sample (very noisy; use for deep debugging).",
@@ -380,6 +432,10 @@ def main() -> None:
 
     if args.semantic_json_attempts is not None and args.semantic_json_attempts < 1:
         parser.error("--semantic-json-attempts must be at least 1")
+    if args.checkpoint_every < 0:
+        parser.error("--checkpoint-every must be non-negative")
+    if args.unified_catalog and not Path(args.unified_catalog).is_file():
+        parser.error(f"Unified rules catalog does not exist: {args.unified_catalog}")
 
     if args.topic_skip_prediction:
         os.environ["PHYSICSVERIFIER_TOPIC_SKIP_PREDICTION"] = "1"
@@ -404,6 +460,7 @@ def main() -> None:
         rules_catalog_path=args.catalog,
         llm_model=args.model,
         enable_symbolic_check=not args.no_symbolic_check,
+        enable_llm_cache=bool(args.enable_llm_cache),
         unified_rules_path=args.unified_catalog,
         experience_code_manifest_path=args.experience_code_manifest,
         experience_code_module=args.experience_code_module,
@@ -468,6 +525,20 @@ def main() -> None:
         _write_json_checkpoint(out_path, raw_results)
         print(f"Semantic retrieval traces saved to {out_path}")
     else:
+        sym_path = Path(args.symbolic_output)
+        full_path = Path(args.full_output) if args.full_output else None
+        checkpoint_every = max(0, int(args.checkpoint_every))
+
+        def _checkpoint(rows: List[Dict[str, Any]]) -> None:
+            if checkpoint_every <= 0 or len(rows) % checkpoint_every != 0:
+                return
+            _write_batch_outputs(
+                rows,
+                output_path=out_path,
+                symbolic_output_path=sym_path,
+                full_output_path=full_path,
+            )
+
         raw_results = verifier.run_batch(
             samples,
             progress_interval=max(0, int(args.progress_interval)),
@@ -476,34 +547,14 @@ def main() -> None:
                 args.unified_retrieval_mode == "semantic"
                 and not args.continue_on_semantic_error
             ),
+            on_result=_checkpoint,
         )
-
-        # Main output: only final diagnostics (after symbolic suppression), without symbolic metadata.
-        results = [_build_main_result(r) for r in (raw_results or []) if isinstance(r, dict)]
-
-        # Symbolic audit output: only samples that had symbolic checks or produced symbolic outputs.
-        symbolic_audit_all = [_build_symbolic_audit(r) for r in (raw_results or []) if isinstance(r, dict)]
-        symbolic_audit = [
-            a
-            for a in symbolic_audit_all
-            if (
-                a.get("checked_diagnostics")
-                or a.get("symbolic_checks")
-                or a.get("experience_code_checks")
-                or a.get("suppressed_diagnostics")
-            )
-        ]
-
-        out_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-
-        sym_path = Path(args.symbolic_output)
-        sym_path.parent.mkdir(parents=True, exist_ok=True)
-        sym_path.write_text(json.dumps(symbolic_audit, ensure_ascii=False, indent=2), encoding="utf-8")
-
-        if args.full_output:
-            full_path = Path(args.full_output)
-            full_path.parent.mkdir(parents=True, exist_ok=True)
-            full_path.write_text(json.dumps(raw_results, ensure_ascii=False, indent=2), encoding="utf-8")
+        _write_batch_outputs(
+            raw_results or [],
+            output_path=out_path,
+            symbolic_output_path=sym_path,
+            full_output_path=full_path,
+        )
 
         print(f"Done. Results saved to {out_path}")
         print(f"Done. Symbolic audit saved to {sym_path}")

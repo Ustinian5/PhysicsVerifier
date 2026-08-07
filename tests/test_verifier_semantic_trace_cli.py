@@ -269,6 +269,62 @@ class SemanticTraceAdapterTests(unittest.TestCase):
         self.assertEqual(result["empty_reason"], "invalid_json_response")
         json.dumps(result, ensure_ascii=False)
 
+    def test_explicit_missing_unified_catalog_never_falls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            legacy = root / "legacy.json"
+            legacy.write_text(json.dumps({"domains": []}), encoding="utf-8")
+
+            with self.assertRaises(FileNotFoundError):
+                PhysicsRuleVerifier(
+                    rules_catalog_path=str(legacy),
+                    unified_rules_path=str(root / "missing.json"),
+                    llm_model=None,
+                    enable_symbolic_check=False,
+                )
+
+    def test_legacy_mode_without_unified_catalog_remains_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            catalog = root / "legacy.json"
+            catalog.write_text(json.dumps({"domains": []}), encoding="utf-8")
+            verifier = PhysicsRuleVerifier(
+                rules_catalog_path=str(catalog),
+                unified_rules_path=None,
+                llm_model=None,
+                enable_symbolic_check=False,
+                log_dir=str(root / "logs"),
+                results_dir=str(root / "results"),
+            )
+
+        self.assertFalse(verifier._unified_mode)
+
+    def test_llm_cache_can_be_disabled_for_controlled_repeats(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            verifier = self._verifier(
+                Path(temp_dir),
+                _EmptyTraceMatcher(),
+                enable_llm_cache=False,
+            )
+
+        self.assertFalse(verifier.enable_llm_cache)
+        self.assertFalse(verifier.semantic_checker.enable_cache)
+
+    def test_full_batch_exposes_per_sample_checkpoint_callback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            verifier = self._verifier(Path(temp_dir), _EmptyTraceMatcher())
+            verifier.verify = lambda sample: {"id": sample["id"], "diagnostics": []}
+            snapshots: list[list[str]] = []
+
+            results = verifier.run_batch(
+                [{"id": "first"}, {"id": "second"}],
+                progress_interval=0,
+                on_result=lambda rows: snapshots.append([str(row["id"]) for row in rows]),
+            )
+
+        self.assertEqual(["first", "second"], [row["id"] for row in results])
+        self.assertEqual([["first"], ["first", "second"]], snapshots)
+
     def test_empty_tree_exposes_reason_and_is_not_a_rule_hit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             verifier = self._verifier(Path(temp_dir), _EmptyTraceMatcher())
@@ -386,6 +442,7 @@ class SemanticCliControlTests(unittest.TestCase):
     ) -> tuple[list[dict], int, str, dict]:
         input_path = root / "samples.json"
         output_path = root / ("continued.json" if continue_after_error else "fail_fast.json")
+        (root / "catalog.json").write_text(json.dumps(_catalog()), encoding="utf-8")
         if mode == "success":
             samples = [{"id": "hit", "question": "q", "prediction": "claim", "answer": "reference"}]
         elif mode in {"empty_only", "unavailable"}:
@@ -482,6 +539,7 @@ class SemanticCliControlTests(unittest.TestCase):
             "4",
             "--semantic-output-adapter",
             "forced_tool_call",
+            "--no-llm-cache",
             "--progress-interval",
             "0",
         ]
@@ -538,6 +596,7 @@ class SemanticCliControlTests(unittest.TestCase):
         self.assertEqual(len(payload), 2)
         self.assertEqual(state["kwargs"]["semantic_json_attempts"], 4)
         self.assertEqual(state["kwargs"]["semantic_output_adapter"], "forced_tool_call")
+        self.assertFalse(state["kwargs"]["enable_llm_cache"])
         self.assertIn("empty_without_rules=1", output)
         self.assertIn("semantic_tree_empty is not a successful rule hit", output)
 

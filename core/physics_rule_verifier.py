@@ -10,7 +10,7 @@ import os
 import re
 import math
 import time
-from typing import List, Dict, Any, Optional, Set, Tuple
+from typing import List, Dict, Any, Optional, Set, Tuple, Callable
 from pathlib import Path
 
 from core.rule_catalog_retrieval import (
@@ -52,6 +52,7 @@ class PhysicsRuleVerifier:
         log_dir: str = "logs",
         results_dir: str = "results",
         enable_symbolic_check: bool = True,
+        enable_llm_cache: bool = True,
         unified_rules_path: Optional[str] = None,
         experience_code_manifest_path: str = "results/experience_symbolic_program_manifest_v2_unified.json",
         experience_code_module: str = "symbolic.generated_experience_checks_v2_unified",
@@ -84,6 +85,7 @@ class PhysicsRuleVerifier:
             experience_rules_path,
         )
         self.llm_model = llm_model
+        self.enable_llm_cache = bool(enable_llm_cache)
         self.precision_mode = str(precision_mode or "strict").strip().lower()
         if self.precision_mode not in {"strict", "balanced", "score_only"}:
             self.precision_mode = "strict"
@@ -147,9 +149,12 @@ class PhysicsRuleVerifier:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.results_dir.mkdir(parents=True, exist_ok=True)
 
-        # Unified catalog takes priority when available
+        # An explicitly requested unified catalog must never silently fall
+        # back to the legacy top-down catalog.
         self._unified_mode = False
-        if unified_rules_path and Path(unified_rules_path).exists():
+        if unified_rules_path:
+            if not Path(unified_rules_path).is_file():
+                raise FileNotFoundError(f"Unified rules catalog does not exist: {unified_rules_path}")
             self.rules_catalog_path = unified_rules_path
             self._unified_mode = True
         else:
@@ -178,7 +183,8 @@ class PhysicsRuleVerifier:
         self.semantic_checker = SemanticRuleChecker(
             llm_model=self.llm_model,
             rule_mode='srd', # We will inject SRDs dynamically
-            rule_translations_path="rule_translations.json" # Dummy path, we'll overwrite
+            rule_translations_path="rule_translations.json", # Dummy path, we'll overwrite
+            enable_cache=self.enable_llm_cache,
         )
         # Clear initial translations as we will set them per request
         self.semantic_checker.rule_translations = {} 
@@ -2250,6 +2256,7 @@ JSON Output:
         progress_interval: int = 10,
         verbose_per_sample: bool = False,
         fail_fast_on_semantic_error: bool = False,
+        on_result: Optional[Callable[[List[Dict]], None]] = None,
     ) -> List[Dict]:
         """Run verifier on each sample; optionally log throughput milestones.
 
@@ -2257,6 +2264,7 @@ JSON Output:
             Set to 0 to disable milestone logs.
         verbose_per_sample: if True, print a line before each sample (very noisy).
         fail_fast_on_semantic_error: stop after the first failed API-tree sample and return its trace.
+        on_result: optional callback invoked after each completed sample with all results so far.
         """
         results: List[Dict] = []
         total = len(samples)
@@ -2281,6 +2289,8 @@ JSON Output:
                 print(f"Verifying sample {sid}...", flush=True)
             res = self.verify(s)
             results.append(res)
+            if on_result is not None:
+                on_result(results)
             if fail_fast_on_semantic_error and str(res.get("selection_strategy") or "") in {
                 "semantic_error",
                 "semantic_unavailable",
