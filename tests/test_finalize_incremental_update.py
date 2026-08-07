@@ -9,6 +9,7 @@ from scripts.finalize_incremental_update import (
     _compose_incremental_blueprints,
     _stabilize_catalog_order,
     _validate_deterministic_formal_bundle,
+    _validate_formal_cluster_coverage,
     _validate_generalization_fingerprints,
     finalize_incremental_update,
 )
@@ -477,6 +478,46 @@ def _prepare_case(root: Path, *, base_rule_ids: list[str]) -> tuple[Path, Path, 
 
 
 class FinalizeIncrementalUpdateTests(unittest.TestCase):
+    def test_formal_cluster_coverage_rejects_derived_count_drift(self) -> None:
+        rule_input = {
+            "rules": [
+                {"topic_key": "Mechanics::Kinematics", "rule_id": "r1"},
+                {"topic_key": "Mechanics::Kinematics", "rule_id": "r2"},
+            ]
+        }
+        clusters = {
+            "topics": [
+                {
+                    "topic_key": "Mechanics::Kinematics",
+                    "rule_count": 0,
+                    "cluster_count": 0,
+                    "clusters": [
+                        {
+                            "cluster_id": "embedding_cluster_01",
+                            "size": 1,
+                            "rule_ids": ["r1", "r2"],
+                        }
+                    ],
+                    "residual_rule_ids": [],
+                }
+            ]
+        }
+
+        validation = _validate_formal_cluster_coverage(rule_input, clusters)
+
+        self.assertFalse(validation["passed"])
+        self.assertEqual(validation["missing"], [])
+        self.assertEqual(validation["foreign"], [])
+        self.assertEqual(
+            validation["rule_count_mismatches"][0]["expected"], 2
+        )
+        self.assertEqual(
+            validation["cluster_count_mismatches"][0]["expected"], 1
+        )
+        self.assertEqual(
+            validation["cluster_size_mismatches"][0]["expected"], 2
+        )
+
     def test_stabilizes_existing_domain_and_topic_order(self) -> None:
         base = {
             "domains": [
@@ -1069,6 +1110,36 @@ class FinalizeIncrementalUpdateTests(unittest.TestCase):
             ) as builder:
                 with self.assertRaisesRegex(
                     ValueError, "manifest: configuration_sha256_mismatch"
+                ):
+                    finalize_incremental_update(
+                        workspace=workspace,
+                        base_catalog_path=base_path,
+                        knowledge_path=knowledge,
+                        tagged_path=tagged,
+                    )
+
+            builder.assert_not_called()
+
+    def test_partial_cluster_labeling_scope_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace, base_path, knowledge, tagged = _prepare_case(
+                root, base_rule_ids=["old"]
+            )
+            manifest_path = workspace / "incremental_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["run_configuration"]["cluster_labeling"]["max_topics"] = 1
+            manifest["configuration_sha256"] = (
+                incremental_manifest_configuration_sha256(manifest)
+            )
+            _write(manifest_path, manifest)
+
+            with patch(
+                "scripts.finalize_incremental_update.build_unified_catalog"
+            ) as builder:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "partial_cluster_labeling_scope_not_allowed",
                 ):
                     finalize_incremental_update(
                         workspace=workspace,

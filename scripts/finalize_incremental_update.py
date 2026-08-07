@@ -205,6 +205,44 @@ def _validate_manifest_inputs(
                     "fields": missing,
                 }
             )
+    cluster_labeling = run_configuration.get("cluster_labeling")
+    formal_embedding = run_configuration.get("formal_embedding")
+    if isinstance(cluster_labeling, dict):
+        if cluster_labeling.get("max_topics") != 0:
+            mismatches.append(
+                {
+                    "input": "run_configuration",
+                    "reason": "partial_cluster_labeling_scope_not_allowed",
+                    "stage": "cluster_labeling",
+                    "field": "max_topics",
+                    "expected": 0,
+                    "actual": cluster_labeling.get("max_topics"),
+                }
+            )
+        min_rule_count = cluster_labeling.get("min_rule_count")
+        min_cluster_size = (
+            formal_embedding.get("min_cluster_size")
+            if isinstance(formal_embedding, dict)
+            else None
+        )
+        if (
+            not isinstance(min_rule_count, int)
+            or isinstance(min_rule_count, bool)
+            or not isinstance(min_cluster_size, int)
+            or isinstance(min_cluster_size, bool)
+            or not 0 <= min_rule_count <= min_cluster_size
+        ):
+            mismatches.append(
+                {
+                    "input": "run_configuration",
+                    "reason": "cluster_labeling_threshold_can_skip_clusters",
+                    "stage": "cluster_labeling",
+                    "field": "min_rule_count",
+                    "expected": "0 <= min_rule_count <= formal_embedding.min_cluster_size",
+                    "actual": min_rule_count,
+                    "formal_min_cluster_size": min_cluster_size,
+                }
+            )
     normalized_policy: Dict[str, Any] | None = None
     try:
         normalized_policy = validate_change_policy(
@@ -768,24 +806,64 @@ def _validate_formal_cluster_coverage(
     assigned_by_topic: Dict[str, List[str]] = {}
     duplicate_rule_ids: List[str] = []
     duplicate_topic_keys: List[str] = []
+    rule_count_mismatches: List[Dict[str, Any]] = []
+    cluster_count_mismatches: List[Dict[str, Any]] = []
+    cluster_size_mismatches: List[Dict[str, Any]] = []
     for topic in formal_clusters.get("topics", []) or []:
         if not isinstance(topic, dict):
             continue
         topic_key = str(topic.get("topic_key") or "")
         if topic_key in assigned_by_topic:
             duplicate_topic_keys.append(topic_key)
-        assigned = [
-            str(rule_id)
+        clusters = [
+            cluster
             for cluster in (topic.get("clusters") or [])
             if isinstance(cluster, dict)
+        ]
+        assigned = [
+            str(rule_id)
+            for cluster in clusters
             for rule_id in (cluster.get("rule_ids") or [])
         ]
         assigned.extend(str(item) for item in topic.get("residual_rule_ids") or [])
+        if topic.get("rule_count") != len(assigned):
+            rule_count_mismatches.append(
+                {
+                    "topic_key": topic_key,
+                    "expected": len(assigned),
+                    "actual": topic.get("rule_count"),
+                }
+            )
+        if topic.get("cluster_count") != len(clusters):
+            cluster_count_mismatches.append(
+                {
+                    "topic_key": topic_key,
+                    "expected": len(clusters),
+                    "actual": topic.get("cluster_count"),
+                }
+            )
+        for cluster in clusters:
+            rule_ids = list(cluster.get("rule_ids") or [])
+            if cluster.get("size") != len(rule_ids):
+                cluster_size_mismatches.append(
+                    {
+                        "topic_key": topic_key,
+                        "cluster_id": str(
+                            cluster.get("cluster_id") or cluster.get("id") or ""
+                        ),
+                        "expected": len(rule_ids),
+                        "actual": cluster.get("size"),
+                    }
+                )
         if len(assigned) != len(set(assigned)):
             duplicate_rule_ids.extend(
                 rule_id for rule_id in assigned if assigned.count(rule_id) > 1
             )
         assigned_by_topic[topic_key] = assigned
+    expected_topic_keys = set(expected_by_topic)
+    assigned_topic_keys = set(assigned_by_topic)
+    missing_topic_keys = sorted(expected_topic_keys - assigned_topic_keys)
+    unexpected_topic_keys = sorted(assigned_topic_keys - expected_topic_keys)
     expected_pairs = {
         (topic_key, rule_id)
         for topic_key, rule_ids in expected_by_topic.items()
@@ -805,6 +883,11 @@ def _validate_formal_cluster_coverage(
             and not foreign
             and not duplicates
             and not duplicate_topic_keys
+            and not missing_topic_keys
+            and not unexpected_topic_keys
+            and not rule_count_mismatches
+            and not cluster_count_mismatches
+            and not cluster_size_mismatches
         ),
         "expected_rule_count": len(expected_pairs),
         "assigned_rule_count": len(assigned_pairs),
@@ -812,6 +895,11 @@ def _validate_formal_cluster_coverage(
         "foreign": [list(item) for item in foreign],
         "duplicate_rule_ids": duplicates,
         "duplicate_topic_keys": sorted(set(duplicate_topic_keys)),
+        "missing_topic_keys": missing_topic_keys,
+        "unexpected_topic_keys": unexpected_topic_keys,
+        "rule_count_mismatches": rule_count_mismatches,
+        "cluster_count_mismatches": cluster_count_mismatches,
+        "cluster_size_mismatches": cluster_size_mismatches,
     }
 
 
