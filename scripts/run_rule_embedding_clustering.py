@@ -10,6 +10,12 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from rule_framework.incremental_validation import incremental_artifact_binding
+
 try:
     from dotenv import load_dotenv  # type: ignore
 except ImportError:  # pragma: no cover
@@ -253,6 +259,8 @@ def run_embedding_clustering(
     similarity_threshold: float,
     min_cluster_size: int,
     batch_size: int,
+    incremental_manifest_path: Path | None = None,
+    incremental_stage: str = "embedding",
 ) -> Dict[str, Any]:
     payload = _load_json(input_path)
     rules = [item for item in payload.get("rules", []) if isinstance(item, dict)]
@@ -334,6 +342,7 @@ def run_embedding_clustering(
             "embedding_model": embedding_model,
             "similarity_threshold": similarity_threshold,
             "min_cluster_size": min_cluster_size,
+            "batch_size": batch_size,
             "rule_count": len(rules),
             "topic_count": len(topics),
             "cache_hit_count": len(existing),
@@ -341,6 +350,14 @@ def run_embedding_clustering(
         },
         "topics": topics,
     }
+    if incremental_manifest_path is not None:
+        result["metadata"].update(
+            incremental_artifact_binding(
+                incremental_manifest_path,
+                stage=incremental_stage,
+                input_paths={"rule_input": input_path},
+            )
+        )
     _write_json(output_path, result)
     return result
 
@@ -355,6 +372,8 @@ def main() -> None:
     parser.add_argument("--min-cluster-size", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--resume", action="store_true", help="Kept for command stability; cache is always reused if present.")
+    parser.add_argument("--incremental-manifest", default="")
+    parser.add_argument("--incremental-stage", default="embedding")
     args = parser.parse_args()
 
     result = run_embedding_clustering(
@@ -365,6 +384,10 @@ def main() -> None:
         similarity_threshold=float(args.similarity_threshold),
         min_cluster_size=int(args.min_cluster_size),
         batch_size=int(args.batch_size),
+        incremental_manifest_path=(
+            Path(args.incremental_manifest) if args.incremental_manifest else None
+        ),
+        incremental_stage=str(args.incremental_stage),
     )
     print(json.dumps({"metadata": result["metadata"]}, ensure_ascii=True, indent=2))
 

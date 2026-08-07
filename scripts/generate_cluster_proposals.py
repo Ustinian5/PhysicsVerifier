@@ -7,11 +7,16 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+from rule_framework.incremental_validation import (
+    incremental_artifact_binding,
+    incremental_manifest_configuration_sha256,
+)
 
 try:
     import httpx
@@ -27,6 +32,15 @@ try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover - environment dependent
     load_dotenv = None
+
+
+CLUSTER_LABEL_PROMPT_VERSION = "embedding-cluster-labeling-v1"
+CLUSTER_LABEL_SYSTEM_PROMPT = (
+    "You are labeling embedding-derived scenario clusters for a physics rule navigation tree. The cluster "
+    "membership is fixed; do not add, remove, or move rules. Produce concise English names and summaries that "
+    "help a top-down semantic navigator choose the right cluster. Use scene_cues, boundary_cues, and explore_cues "
+    "as auxiliary navigation notes. Return JSON only."
+)
 
 
 def _norm_text(value: Any) -> str:
@@ -77,6 +91,33 @@ def _embedding_topic_fingerprint(topic_item: Dict[str, Any]) -> str:
 
 def _load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _incremental_configuration_binding(path_value: str) -> Dict[str, str]:
+    raw = str(path_value or "").strip()
+    if not raw:
+        return {}
+    path = Path(raw)
+    payload = _load_json(path)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Incremental manifest must contain a JSON object: {path}")
+    configuration_sha256 = str(payload.get("configuration_sha256") or "").strip()
+    if not configuration_sha256:
+        raise ValueError(
+            f"Incremental manifest is missing configuration_sha256: {path}"
+        )
+    actual_configuration_sha256 = incremental_manifest_configuration_sha256(
+        payload
+    )
+    if configuration_sha256 != actual_configuration_sha256:
+        raise ValueError(
+            "Incremental manifest configuration_sha256 does not match its current "
+            f"configuration: {path}"
+        )
+    return {
+        "incremental_configuration_sha256": configuration_sha256,
+        "incremental_manifest": str(path).replace("\\", "/"),
+    }
 
 
 def _dump_json(path: Path, payload: Any) -> None:
@@ -410,6 +451,46 @@ def _build_embedding_topic_prompt_payload(
     }
 
 
+def _cluster_label_resume_fingerprint(
+    topic_item: Dict[str, Any],
+    *,
+    rule_index: Dict[str, Dict[str, Any]],
+    system_prompt: str,
+    model: str,
+    temperature: float,
+    max_topics: int,
+    min_rule_count: int,
+    max_rules_per_cluster: int,
+    max_output_tokens: int | None,
+    incremental_configuration_sha256: str = "",
+    incremental_lineage: Mapping[str, Any] | None = None,
+) -> str:
+    payload = {
+        "schema_version": 2,
+        "prompt_version": CLUSTER_LABEL_PROMPT_VERSION,
+        "full_membership_sha256": _embedding_topic_fingerprint(topic_item),
+        "system_prompt": system_prompt,
+        "user_payload": _build_embedding_topic_prompt_payload(
+            topic_item,
+            rule_index=rule_index,
+            max_rules_per_cluster=max_rules_per_cluster,
+        ),
+        "model": model,
+        "temperature": temperature,
+        "max_topics": max_topics,
+        "min_rule_count": min_rule_count,
+        "max_rules_per_cluster": max_rules_per_cluster,
+        "max_output_tokens": max_output_tokens,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def _normalize_cluster_proposal(raw: Dict[str, Any], valid_rule_ids: set[str]) -> Dict[str, Any]:
     clusters: List[Dict[str, Any]] = []
     used_rule_ids: set[str] = set()
@@ -642,6 +723,9 @@ def generate_cluster_proposals_from_embedding_clusters(
     output_path: Path | None = None,
     resume: bool = False,
     continue_on_error: bool = False,
+    incremental_configuration_sha256: str = "",
+    incremental_manifest: str = "",
+    incremental_lineage: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     rule_index = _build_rule_index(rule_input)
     topics = [
@@ -655,12 +739,7 @@ def generate_cluster_proposals_from_embedding_clusters(
     if max_topics > 0:
         topics = topics[:max_topics]
 
-    system_prompt = (
-        "You are labeling embedding-derived scenario clusters for a physics rule navigation tree. The cluster "
-        "membership is fixed; do not add, remove, or move rules. Produce concise English names and summaries that "
-        "help a top-down semantic navigator choose the right cluster. Use scene_cues, boundary_cues, and explore_cues "
-        "as auxiliary navigation notes. Return JSON only."
-    )
+    system_prompt = CLUSTER_LABEL_SYSTEM_PROMPT
     proposals: List[Dict[str, Any]] = []
     failures: List[Dict[str, str]] = []
     if resume and output_path and output_path.exists():
@@ -674,7 +753,19 @@ def generate_cluster_proposals_from_embedding_clusters(
             if isinstance(item, dict)
         ]
     expected_fingerprints = {
-        _norm_text(item.get("topic_key") or "").casefold(): _embedding_topic_fingerprint(item)
+        _norm_text(item.get("topic_key") or "").casefold(): _cluster_label_resume_fingerprint(
+            item,
+            rule_index=rule_index,
+            system_prompt=system_prompt,
+            model=model,
+            temperature=temperature,
+            max_topics=max_topics,
+            min_rule_count=min_rule_count,
+            max_rules_per_cluster=max_rules_per_cluster,
+            max_output_tokens=max_output_tokens,
+            incremental_configuration_sha256=incremental_configuration_sha256,
+            incremental_lineage=incremental_lineage,
+        )
         for item in topics
     }
     proposals = [
@@ -686,6 +777,14 @@ def generate_cluster_proposals_from_embedding_clusters(
     for item in proposals:
         if not _norm_text(item.get("label_source") or ""):
             item["label_source"] = "model"
+    # A deterministic embedding fallback is a recoverable checkpoint, not a
+    # completed API label.  Resume must retry it after a transient model/network
+    # failure; otherwise the strict finalizer can never reach a promotable state.
+    proposals = [
+        item
+        for item in proposals
+        if item.get("label_source") != "embedding_fallback"
+    ]
     completed_topic_keys = {
         _norm_text(item.get("topic_key") or "").casefold() for item in proposals
     }
@@ -699,22 +798,36 @@ def generate_cluster_proposals_from_embedding_clusters(
     ]
 
     def _current_payload() -> Dict[str, Any]:
+        metadata = {
+            "generator": "embedding_cluster_labeling_v1",
+            "model": model,
+            "temperature": temperature,
+            "max_topics": max_topics,
+            "topic_count": len(proposals),
+            "target_topic_count": total_topics,
+            "failure_count": len(failures),
+            "fallback_label_count": sum(
+                1
+                for item in proposals
+                if item.get("label_source") == "embedding_fallback"
+            ),
+            "cjk_warning_count": sum(
+                1 for item in proposals if item.get("contains_cjk_generated_text")
+            ),
+            "min_rule_count": min_rule_count,
+            "max_rules_per_cluster": max_rules_per_cluster,
+            "max_output_tokens": max_output_tokens,
+            "prompt_version": CLUSTER_LABEL_PROMPT_VERSION,
+            "resume_fingerprint_schema_version": 2,
+        }
+        if incremental_configuration_sha256:
+            metadata["incremental_configuration_sha256"] = (
+                incremental_configuration_sha256
+            )
+            metadata["incremental_manifest"] = incremental_manifest
+            metadata["incremental_lineage"] = dict(incremental_lineage or {})
         return {
-            "metadata": {
-                "generator": "embedding_cluster_labeling_v1",
-                "model": model,
-                "topic_count": len(proposals),
-                "target_topic_count": total_topics,
-                "failure_count": len(failures),
-                "fallback_label_count": sum(
-                    1 for item in proposals if item.get("label_source") == "embedding_fallback"
-                ),
-                "cjk_warning_count": sum(
-                    1 for item in proposals if item.get("contains_cjk_generated_text")
-                ),
-                "min_rule_count": min_rule_count,
-                "max_rules_per_cluster": max_rules_per_cluster,
-            },
+            "metadata": metadata,
             "proposals": proposals,
             "failures": failures,
         }
@@ -794,6 +907,11 @@ def generate_cluster_proposals_from_embedding_clusters(
             raise
         normalized = _normalize_embedding_cluster_labels(raw, topic_item)
         cjk_offenders = _find_cjk_proposal_fields(raw)
+        failures = [
+            item
+            for item in failures
+            if _norm_text(item.get("topic_key") or "").casefold() != topic_key
+        ]
         proposals.append(
             {
                 "domain": _norm_text(topic_item.get("domain") or ""),
@@ -841,7 +959,41 @@ def main() -> None:
     parser.add_argument("--max-rules-per-cluster", type=int, default=8)
     parser.add_argument("--resume", action="store_true", help="Resume from an existing output file and skip completed topics.")
     parser.add_argument("--continue-on-error", action="store_true", help="Save failures and continue with remaining topics.")
+    parser.add_argument(
+        "--incremental-manifest",
+        default="",
+        help="Optional schema-v2 incremental manifest whose configuration hash binds this output.",
+    )
     args = parser.parse_args()
+
+    incremental_binding = _incremental_configuration_binding(
+        args.incremental_manifest
+    )
+    if args.incremental_manifest:
+        manifest_path = Path(args.incremental_manifest)
+        manifest_payload = _load_json(manifest_path)
+        base_proposal_record = (
+            (manifest_payload.get("inputs") or {}).get("base_cluster_proposals")
+            or {}
+        )
+        input_paths = {"precluster_catalog": Path(args.catalog)}
+        if args.embedding_clusters:
+            input_paths.update(
+                {
+                    "formal_clusters": Path(args.embedding_clusters),
+                    "formal_rule_input": Path(args.rule_input),
+                }
+            )
+        incremental_binding = incremental_artifact_binding(
+            manifest_path,
+            stage="cluster_labeling",
+            input_paths=input_paths,
+            input_sha256={
+                "base_cluster_proposals": str(
+                    base_proposal_record.get("sha256") or ""
+                )
+            },
+        )
 
     if load_dotenv:
         load_dotenv()
@@ -873,6 +1025,15 @@ def main() -> None:
             output_path=Path(args.output),
             resume=bool(args.resume),
             continue_on_error=bool(args.continue_on_error),
+            incremental_configuration_sha256=incremental_binding.get(
+                "incremental_configuration_sha256", ""
+            ),
+            incremental_manifest=incremental_binding.get(
+                "incremental_manifest", ""
+            ),
+            incremental_lineage=incremental_binding.get(
+                "incremental_lineage", {}
+            ),
         )
         _dump_json(Path(args.output), result)
         print(f"Wrote cluster proposals to {args.output}")
@@ -891,6 +1052,8 @@ def main() -> None:
         auxiliary_by_rule=_build_distilled_auxiliary_index(distilled_payload),
         max_output_tokens=int(args.max_output_tokens),
     )
+    if incremental_binding:
+        result.setdefault("metadata", {}).update(incremental_binding)
     _dump_json(Path(args.output), result)
     print(f"Wrote cluster proposals to {args.output}")
 

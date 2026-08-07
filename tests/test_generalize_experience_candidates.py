@@ -1,4 +1,7 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -6,14 +9,48 @@ from scripts.generalize_experience_candidates import (
     _build_prompt,
     _call_model,
     _extract_json_object,
+    _incremental_configuration_binding,
     _retry_user_prompt,
     _stable_rule_id,
     _thinking_kwargs,
     generalize_candidates,
 )
+from rule_framework.incremental_validation import (
+    incremental_manifest_configuration_sha256,
+)
 
 
 class GeneralizeExperienceCandidatesTest(unittest.TestCase):
+    def test_incremental_binding_rejects_manifest_changed_after_fingerprinting(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "incremental_manifest.json"
+            manifest = {
+                "schema_version": 2,
+                "inputs": {},
+                "candidate_delta": {},
+                "candidate_affected_topics": [],
+                "declared_change_topics": [],
+                "affected_topics": [],
+                "change_policy": {},
+                "commands": [],
+                "run_configuration": {"model": "model-a"},
+            }
+            manifest["configuration_sha256"] = (
+                incremental_manifest_configuration_sha256(manifest)
+            )
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+            self.assertEqual(
+                _incremental_configuration_binding(str(path))[
+                    "incremental_configuration_sha256"
+                ],
+                manifest["configuration_sha256"],
+            )
+
+            manifest["run_configuration"]["model"] = "model-b"
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                _incremental_configuration_binding(str(path))
+
     def test_rule_id_depends_on_source_set_not_generated_wording(self):
         first = _stable_rule_id("Mechanics", "Kinematics", ["candidate_b", "candidate_a"])
         second = _stable_rule_id("Mechanics", "Kinematics", ["candidate_a", "candidate_b"])
@@ -211,10 +248,22 @@ class GeneralizeExperienceCandidatesTest(unittest.TestCase):
             candidate_payload=candidate_payload,
             cluster_payload=cluster_payload,
             generate=fake_generate,
+            output_metadata={
+                "incremental_configuration_sha256": "configuration-a",
+                "incremental_manifest": "workspace/incremental_manifest.json",
+            },
         )
 
         self.assertEqual(result["metadata"]["generated_rule_count"], 1)
         self.assertEqual(result["metadata"]["pending_candidate_count"], 1)
+        self.assertEqual(
+            result["metadata"]["incremental_configuration_sha256"],
+            "configuration-a",
+        )
+        self.assertEqual(
+            result["metadata"]["incremental_manifest"],
+            "workspace/incremental_manifest.json",
+        )
         self.assertEqual(result["rules"][0]["sample_ids"], ["sample_1", "sample_2"])
         self.assertNotIn("source_candidate_ids", result["rules"][0])
         self.assertEqual(
@@ -607,6 +656,110 @@ class GeneralizeExperienceCandidatesTest(unittest.TestCase):
         self.assertTrue(second["metadata"]["complete"])
         self.assertTrue(second["cluster_results"][0]["reused"])
         self.assertEqual(first["rules"], second["rules"])
+
+    def test_resume_rejects_same_ids_when_content_or_model_context_changes(self):
+        candidate_payload = {
+            "rules": [
+                {
+                    "rule_id": candidate_id,
+                    "domain": "Mechanics",
+                    "topic": "Kinematics",
+                    "title": candidate_id,
+                    "trigger": "trigger",
+                    "check_logic": "logic",
+                    "sample_ids": [sample_id],
+                }
+                for candidate_id, sample_id in [
+                    ("candidate_a", "sample_1"),
+                    ("candidate_b", "sample_2"),
+                ]
+            ]
+        }
+        cluster_payload = {
+            "topics": [
+                {
+                    "domain": "Mechanics",
+                    "topic": "Kinematics",
+                    "clusters": [
+                        {
+                            "cluster_id": "cluster_1",
+                            "rule_ids": ["candidate_a", "candidate_b"],
+                        }
+                    ],
+                    "residual_rule_ids": [],
+                }
+            ]
+        }
+
+        def generated(*_):
+            return {
+                "rules": [
+                    {
+                        "source_candidate_ids": ["candidate_a", "candidate_b"],
+                        "title": "general",
+                        "trigger": "trigger",
+                        "check_logic": "logic",
+                        "error_type": "logic",
+                    }
+                ]
+            }
+
+        first = generalize_candidates(
+            candidate_payload=candidate_payload,
+            cluster_payload=cluster_payload,
+            generate=generated,
+            resume_context={
+                "model": "model-a",
+                "incremental_configuration_sha256": "configuration-a",
+            },
+        )
+        calls = []
+
+        def regenerated(*args):
+            calls.append(args)
+            return generated(*args)
+
+        changed_content = {
+            "rules": [dict(rule) for rule in candidate_payload["rules"]]
+        }
+        changed_content["rules"][0]["trigger"] = "changed trigger"
+        content_result = generalize_candidates(
+            candidate_payload=changed_content,
+            cluster_payload=cluster_payload,
+            generate=regenerated,
+            existing_payload=first,
+            resume_context={
+                "model": "model-a",
+                "incremental_configuration_sha256": "configuration-a",
+            },
+        )
+        model_result = generalize_candidates(
+            candidate_payload=candidate_payload,
+            cluster_payload=cluster_payload,
+            generate=regenerated,
+            existing_payload=first,
+            resume_context={
+                "model": "model-b",
+                "incremental_configuration_sha256": "configuration-a",
+            },
+        )
+        configuration_result = generalize_candidates(
+            candidate_payload=candidate_payload,
+            cluster_payload=cluster_payload,
+            generate=regenerated,
+            existing_payload=first,
+            resume_context={
+                "model": "model-a",
+                "incremental_configuration_sha256": "configuration-b",
+            },
+        )
+
+        self.assertEqual(len(calls), 3)
+        self.assertFalse(content_result["cluster_results"][0].get("reused", False))
+        self.assertFalse(model_result["cluster_results"][0].get("reused", False))
+        self.assertFalse(
+            configuration_result["cluster_results"][0].get("reused", False)
+        )
 
 
 if __name__ == "__main__":

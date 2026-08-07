@@ -5,9 +5,14 @@ import hashlib
 import json
 import os
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Sequence
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -19,11 +24,45 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise SystemExit("OpenAI package not found. Install project dependencies in the conda environment.") from exc
 
+from rule_framework.incremental_validation import (
+    incremental_artifact_binding,
+    incremental_manifest_configuration_sha256,
+)
+
 
 ERROR_TYPES = {"concept", "logic", "calculation", "modeling", "units"}
+GENERALIZATION_PROMPT_VERSION = "experience-candidate-generalization-v1"
+
 
 def _load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _incremental_configuration_binding(path_value: str) -> Dict[str, str]:
+    raw = str(path_value or "").strip()
+    if not raw:
+        return {}
+    path = Path(raw)
+    payload = _load_json(path)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Incremental manifest must contain a JSON object: {path}")
+    configuration_sha256 = str(payload.get("configuration_sha256") or "").strip()
+    if not configuration_sha256:
+        raise ValueError(
+            f"Incremental manifest is missing configuration_sha256: {path}"
+        )
+    actual_configuration_sha256 = incremental_manifest_configuration_sha256(
+        payload
+    )
+    if configuration_sha256 != actual_configuration_sha256:
+        raise ValueError(
+            "Incremental manifest configuration_sha256 does not match its current "
+            f"configuration: {path}"
+        )
+    return {
+        "incremental_configuration_sha256": configuration_sha256,
+        "incremental_manifest": str(path).replace("\\", "/"),
+    }
 
 
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
@@ -58,6 +97,16 @@ def _topic_key(domain: str, topic: str) -> str:
 def _stable_rule_id(domain: str, topic: str, source_candidate_ids: Iterable[str]) -> str:
     source = "\n".join([domain, topic, *sorted(_ordered_unique(source_candidate_ids))])
     return f"gen_{hashlib.sha1(source.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _sha256_json(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _normalize_symbolic_hint(value: Any) -> Dict[str, Any]:
@@ -338,6 +387,45 @@ def _cluster_result_key(item: Dict[str, Any]) -> tuple[str, str, str, tuple[str,
     )
 
 
+def _batch_resume_fingerprint(
+    batch: Dict[str, Any],
+    *,
+    min_source_candidates: int,
+    min_source_samples: int,
+    max_candidates_per_batch: int,
+    resume_context: Dict[str, Any] | None,
+) -> str:
+    candidates = []
+    for rule in batch.get("candidates", []) or []:
+        if not isinstance(rule, dict):
+            continue
+        candidates.append(
+            {
+                "prompt_payload": _candidate_prompt_payload(rule),
+                "sample_ids": _ordered_unique(rule.get("sample_ids") or []),
+                "source_rule_ids": _ordered_unique(rule.get("source_rule_ids") or []),
+                "count": int(rule.get("count") or 0),
+            }
+        )
+    return _sha256_json(
+        {
+            "schema_version": 2,
+            "prompt_version": GENERALIZATION_PROMPT_VERSION,
+            "domain": batch.get("domain"),
+            "topic": batch.get("topic"),
+            "cluster_id": batch.get("cluster_id"),
+            "source_cluster_id": batch.get("source_cluster_id"),
+            "batch_index": batch.get("batch_index"),
+            "batch_count": batch.get("batch_count"),
+            "candidates": candidates,
+            "min_source_candidates": min_source_candidates,
+            "min_source_samples": min_source_samples,
+            "max_candidates_per_batch": max_candidates_per_batch,
+            "resume_context": resume_context or {},
+        }
+    )
+
+
 def _build_result_payload(
     *,
     batches: List[Dict[str, Any]],
@@ -350,6 +438,7 @@ def _build_result_payload(
     scope_mode: str,
     min_source_candidates: int,
     min_source_samples: int,
+    output_metadata: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     formal_rules = [
         rule
@@ -374,34 +463,36 @@ def _build_result_payload(
         and not failed_results
         and not missing_candidate_ids
     )
+    metadata = {
+        "generator": "experience_candidate_generalizer_v1",
+        "scope_mode": scope_mode,
+        "complete": complete,
+        "selected_cluster_count": selected_cluster_count,
+        "selected_batch_count": len(batches),
+        "processed_batch_count": len(cluster_results),
+        "failed_batch_count": len(failed_results),
+        "input_candidate_count": len(scope_candidate_ids),
+        "residual_candidate_count": len(residual_candidate_ids),
+        "unclustered_candidate_count": len(unclustered_candidate_ids),
+        "missing_candidate_count": len(missing_candidate_ids),
+        "generated_rule_count": len(formal_rules),
+        "mapped_candidate_count": len(mapped_candidate_ids),
+        "pending_candidate_count": len(pending_candidate_ids),
+        "min_source_candidates": min_source_candidates,
+        "min_source_samples": min_source_samples,
+        "max_api_attempts_used": max(
+            (int(item.get("api_attempts") or 0) for item in cluster_results),
+            default=0,
+        ),
+        "models_used": _ordered_unique(
+            item.get("model_used")
+            for item in cluster_results
+            if _text(item.get("model_used") or "")
+        ),
+    }
+    metadata.update(output_metadata or {})
     return {
-        "metadata": {
-            "generator": "experience_candidate_generalizer_v1",
-            "scope_mode": scope_mode,
-            "complete": complete,
-            "selected_cluster_count": selected_cluster_count,
-            "selected_batch_count": len(batches),
-            "processed_batch_count": len(cluster_results),
-            "failed_batch_count": len(failed_results),
-            "input_candidate_count": len(scope_candidate_ids),
-            "residual_candidate_count": len(residual_candidate_ids),
-            "unclustered_candidate_count": len(unclustered_candidate_ids),
-            "missing_candidate_count": len(missing_candidate_ids),
-            "generated_rule_count": len(formal_rules),
-            "mapped_candidate_count": len(mapped_candidate_ids),
-            "pending_candidate_count": len(pending_candidate_ids),
-            "min_source_candidates": min_source_candidates,
-            "min_source_samples": min_source_samples,
-            "max_api_attempts_used": max(
-                (int(item.get("api_attempts") or 0) for item in cluster_results),
-                default=0,
-            ),
-            "models_used": _ordered_unique(
-                item.get("model_used")
-                for item in cluster_results
-                if _text(item.get("model_used") or "")
-            ),
-        },
+        "metadata": metadata,
         "rules": formal_rules,
         "cluster_results": cluster_results,
         "pending_candidate_ids": pending_candidate_ids,
@@ -426,6 +517,8 @@ def generalize_candidates(
     continue_on_error: bool = False,
     existing_payload: Dict[str, Any] | None = None,
     on_progress: Callable[[Dict[str, Any]], None] | None = None,
+    resume_context: Dict[str, Any] | None = None,
+    output_metadata: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     candidates = [
         item
@@ -550,6 +643,7 @@ def generalize_candidates(
             scope_mode="full" if full_scope else "filtered",
             min_source_candidates=minimum_candidates,
             min_source_samples=minimum_samples,
+            output_metadata=output_metadata,
         )
 
     for batch_number, batch in enumerate(batches, start=1):
@@ -564,8 +658,20 @@ def generalize_candidates(
             batch["cluster_id"],
             tuple(input_ids),
         )
-        if lookup_key in existing_results:
-            result = dict(existing_results[lookup_key])
+        resume_fingerprint = _batch_resume_fingerprint(
+            batch,
+            min_source_candidates=minimum_candidates,
+            min_source_samples=minimum_samples,
+            max_candidates_per_batch=batch_size,
+            resume_context=resume_context,
+        )
+        existing_result = existing_results.get(lookup_key)
+        if (
+            existing_result is not None
+            and _text(existing_result.get("resume_fingerprint_v2") or "")
+            == resume_fingerprint
+        ):
+            result = dict(existing_result)
             result["reused"] = True
             cluster_results.append(result)
             if on_progress:
@@ -585,6 +691,7 @@ def generalize_candidates(
                 "mappings": [],
                 "pending_candidate_ids": input_ids,
                 "skipped_reason": "insufficient_candidate_or_sample_support",
+                "resume_fingerprint_v2": resume_fingerprint,
             }
             cluster_results.append(result)
             if on_progress:
@@ -610,6 +717,7 @@ def generalize_candidates(
             result["source_cluster_id"] = batch["source_cluster_id"]
             result["batch_index"] = batch["batch_index"]
             result["batch_count"] = batch["batch_count"]
+            result["resume_fingerprint_v2"] = resume_fingerprint
         except Exception as exc:
             result = {
                 "domain": batch["domain"],
@@ -624,6 +732,7 @@ def generalize_candidates(
                 "mappings": [],
                 "pending_candidate_ids": input_ids,
                 "error": f"{type(exc).__name__}: {exc}",
+                "resume_fingerprint_v2": resume_fingerprint,
             }
             cluster_results.append(result)
             if on_progress:
@@ -676,7 +785,51 @@ def main() -> None:
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--continue-on-error", action="store_true")
+    parser.add_argument(
+        "--incremental-manifest",
+        default="",
+        help="Optional schema-v2 incremental manifest whose configuration hash binds this output.",
+    )
     args = parser.parse_args()
+
+    incremental_binding = _incremental_configuration_binding(
+        args.incremental_manifest
+    )
+    if args.incremental_manifest:
+        manifest_path = Path(args.incremental_manifest)
+        manifest_payload = _load_json(manifest_path)
+        base_generalized_record = (
+            (manifest_payload.get("inputs") or {}).get("base_generalized") or {}
+            if isinstance(manifest_payload, dict)
+            else {}
+        )
+        incremental_binding = incremental_artifact_binding(
+            manifest_path,
+            stage="candidate_generalization",
+            input_paths={
+                "candidate_rules": Path(args.candidates),
+                "candidate_clusters": Path(args.clusters),
+            },
+            input_sha256={
+                "base_generalized": str(
+                    base_generalized_record.get("sha256") or ""
+                )
+            },
+        )
+        incremental_binding["incremental_behavior_configuration"] = {
+            "model_chain": _ordered_unique([args.model, *args.fallback_model]),
+            "temperature": 0.0,
+            "max_clusters": max(0, int(args.max_clusters)),
+            "max_candidates_per_batch": max(
+                2, int(args.max_candidates_per_batch)
+            ),
+            "min_source_candidates": max(1, int(args.min_source_candidates)),
+            "min_source_samples": max(1, int(args.min_source_samples)),
+            "max_tokens": max(256, int(args.max_tokens)),
+            "request_timeout_seconds": max(1.0, float(args.request_timeout)),
+            "attempts": max(1, int(args.attempts)),
+            "thinking_enabled": bool(args.enable_thinking),
+        }
 
     if load_dotenv:
         load_dotenv()
@@ -720,6 +873,8 @@ def main() -> None:
         payload["metadata"]["output_mode"] = "prompt_json"
         payload["metadata"]["request_timeout_seconds"] = request_timeout
         payload["metadata"]["thinking_enabled"] = bool(args.enable_thinking)
+        payload["metadata"]["prompt_version"] = GENERALIZATION_PROMPT_VERSION
+        payload["metadata"]["resume_fingerprint_schema_version"] = 2
         _write_json(output_path, payload)
 
     result = generalize_candidates(
@@ -736,6 +891,15 @@ def main() -> None:
         continue_on_error=bool(args.continue_on_error),
         existing_payload=existing_payload,
         on_progress=save_progress,
+        resume_context={
+            "model_chain": _ordered_unique([args.model, *args.fallback_model]),
+            "temperature": 0.0,
+            "max_tokens": max(256, int(args.max_tokens)),
+            "attempts": max(1, int(args.attempts)),
+            "request_timeout_seconds": request_timeout,
+            "thinking_enabled": bool(args.enable_thinking),
+        },
+        output_metadata=incremental_binding,
     )
     save_progress(result)
     print(json.dumps(result["metadata"], ensure_ascii=False, indent=2))

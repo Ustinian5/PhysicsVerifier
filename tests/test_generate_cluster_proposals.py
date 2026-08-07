@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
 import uuid
 from pathlib import Path
 
 from scripts.generate_cluster_proposals import (
+    CLUSTER_LABEL_SYSTEM_PROMPT,
     _assert_english_only_proposal,
     _build_embedding_topic_prompt_payload,
     _build_client,
@@ -14,9 +16,13 @@ from scripts.generate_cluster_proposals import (
     _collect_topic_candidates,
     _chat_json,
     _extract_json_object,
-    _embedding_topic_fingerprint,
+    _incremental_configuration_binding,
+    _cluster_label_resume_fingerprint,
     add_catalog_fallback_proposals,
     generate_cluster_proposals_from_embedding_clusters,
+)
+from rule_framework.incremental_validation import (
+    incremental_manifest_configuration_sha256,
 )
 
 
@@ -31,6 +37,69 @@ def _case_dir() -> Path:
 
 
 class GenerateClusterProposalTests(unittest.TestCase):
+    def test_incremental_binding_rejects_manifest_changed_after_fingerprinting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "incremental_manifest.json"
+            manifest = {
+                "schema_version": 2,
+                "inputs": {},
+                "candidate_delta": {},
+                "candidate_affected_topics": [],
+                "declared_change_topics": [],
+                "affected_topics": [],
+                "change_policy": {},
+                "commands": [],
+                "run_configuration": {"model": "model-a"},
+            }
+            manifest["configuration_sha256"] = (
+                incremental_manifest_configuration_sha256(manifest)
+            )
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+            self.assertEqual(
+                _incremental_configuration_binding(str(path))[
+                    "incremental_configuration_sha256"
+                ],
+                manifest["configuration_sha256"],
+            )
+
+            manifest["run_configuration"]["model"] = "model-b"
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                _incremental_configuration_binding(str(path))
+
+    def test_cluster_label_fingerprint_covers_unsampled_and_residual_membership(self) -> None:
+        base = {
+            "domain": "Mechanics",
+            "topic": "Kinematics",
+            "topic_key": "Mechanics::Kinematics",
+            "rule_count": 4,
+            "clusters": [
+                {"cluster_id": "c1", "rule_ids": ["r1", "r2", "r3"]}
+            ],
+            "residual_rule_ids": ["residual_a"],
+        }
+        changed = json.loads(json.dumps(base))
+        changed["clusters"][0]["rule_ids"][-1] = "r4"
+        changed["residual_rule_ids"] = ["residual_b"]
+        kwargs = {
+            "rule_index": {
+                rule_id: {"rule_id": rule_id, "summary": rule_id}
+                for rule_id in ("r1", "r2", "r3", "r4")
+            },
+            "system_prompt": CLUSTER_LABEL_SYSTEM_PROMPT,
+            "model": "test-model",
+            "temperature": 0.0,
+            "max_topics": 1,
+            "min_rule_count": 1,
+            "max_rules_per_cluster": 2,
+            "max_output_tokens": None,
+        }
+
+        self.assertNotEqual(
+            _cluster_label_resume_fingerprint(base, **kwargs),
+            _cluster_label_resume_fingerprint(changed, **kwargs),
+        )
+
     def test_extract_json_object_accepts_plain_json(self) -> None:
         data = _extract_json_object('{"topic_summary":"x","should_add_clusters":true}')
         self.assertEqual(data["topic_summary"], "x")
@@ -403,7 +472,7 @@ class GenerateClusterProposalTests(unittest.TestCase):
             ]
         }
 
-        generate_cluster_proposals_from_embedding_clusters(
+        first = generate_cluster_proposals_from_embedding_clusters(
             embedding_clusters=embedding_clusters,
             rule_input={"rules": [{"rule_id": "r1", "summary": "s1"}, {"rule_id": "r2", "summary": "s2"}]},
             client=client,
@@ -414,6 +483,8 @@ class GenerateClusterProposalTests(unittest.TestCase):
             max_rules_per_cluster=2,
             output_path=output_path,
             resume=False,
+            incremental_configuration_sha256="configuration-a",
+            incremental_manifest="workspace/incremental_manifest.json",
         )
         generate_cluster_proposals_from_embedding_clusters(
             embedding_clusters=embedding_clusters,
@@ -426,10 +497,93 @@ class GenerateClusterProposalTests(unittest.TestCase):
             max_rules_per_cluster=2,
             output_path=output_path,
             resume=True,
+            incremental_configuration_sha256="configuration-a",
+            incremental_manifest="workspace/incremental_manifest.json",
         )
 
         self.assertEqual(completions.calls, 1)
         self.assertTrue(output_path.exists())
+        self.assertEqual(
+            first["metadata"]["incremental_configuration_sha256"],
+            "configuration-a",
+        )
+        self.assertEqual(
+            first["metadata"]["incremental_manifest"],
+            "workspace/incremental_manifest.json",
+        )
+
+        generate_cluster_proposals_from_embedding_clusters(
+            embedding_clusters=embedding_clusters,
+            rule_input={"rules": [{"rule_id": "r1", "summary": "s1"}, {"rule_id": "r2", "summary": "s2"}]},
+            client=client,
+            model="test-model",
+            temperature=0.0,
+            max_topics=1,
+            min_rule_count=1,
+            max_rules_per_cluster=2,
+            output_path=output_path,
+            resume=True,
+            incremental_configuration_sha256="configuration-b",
+            incremental_manifest="workspace/other_incremental_manifest.json",
+        )
+        self.assertEqual(completions.calls, 1)
+
+        generate_cluster_proposals_from_embedding_clusters(
+            embedding_clusters=embedding_clusters,
+            rule_input={
+                "rules": [
+                    {"rule_id": "r1", "summary": "changed summary"},
+                    {"rule_id": "r2", "summary": "s2"},
+                ]
+            },
+            client=client,
+            model="test-model",
+            temperature=0.0,
+            max_topics=1,
+            min_rule_count=1,
+            max_rules_per_cluster=2,
+            output_path=output_path,
+            resume=True,
+            incremental_configuration_sha256="configuration-a",
+            incremental_manifest="workspace/incremental_manifest.json",
+        )
+        generate_cluster_proposals_from_embedding_clusters(
+            embedding_clusters=embedding_clusters,
+            rule_input={"rules": [{"rule_id": "r1", "summary": "s1"}, {"rule_id": "r2", "summary": "s2"}]},
+            client=client,
+            model="different-model",
+            temperature=0.0,
+            max_topics=1,
+            min_rule_count=1,
+            max_rules_per_cluster=2,
+            output_path=output_path,
+            resume=True,
+            incremental_configuration_sha256="configuration-a",
+            incremental_manifest="workspace/incremental_manifest.json",
+        )
+        generate_cluster_proposals_from_embedding_clusters(
+            embedding_clusters=embedding_clusters,
+            rule_input={
+                "rules": [
+                    {"rule_id": "r1", "summary": "s1"},
+                    {"rule_id": "r2", "summary": "s2"},
+                ]
+            },
+            client=client,
+            model="test-model",
+            temperature=0.0,
+            max_topics=1,
+            min_rule_count=1,
+            max_rules_per_cluster=2,
+            output_path=output_path,
+            resume=True,
+            incremental_configuration_sha256="configuration-b",
+            incremental_manifest="workspace/incremental_manifest.json",
+        )
+
+        # Bundle/config identity is rebound in output metadata; only behavior inputs
+        # (content/model/prompt parameters) invalidate the model-result cache.
+        self.assertEqual(completions.calls, 4)
 
     def test_generate_from_embedding_clusters_uses_fallback_labels_on_error_when_continuing(self) -> None:
         class _Completions:
@@ -469,6 +623,120 @@ class GenerateClusterProposalTests(unittest.TestCase):
         self.assertEqual(proposal["clusters"][0]["candidate_rule_ids"], ["r1", "r2"])
         self.assertEqual(proposal["residual_rule_ids"], ["r3"])
 
+    def test_resume_retries_embedding_fallback_label(self) -> None:
+        root = _case_dir()
+        output_path = root / "cluster_proposals.json"
+        topic_item = {
+            "domain": "Mechanics",
+            "topic": "Kinematics",
+            "topic_key": "Mechanics::Kinematics",
+            "rule_count": 2,
+            "clusters": [
+                {
+                    "cluster_id": "embedding_cluster_01",
+                    "rule_ids": ["r1", "r2"],
+                    "size": 2,
+                }
+            ],
+            "residual_rule_ids": [],
+        }
+        fingerprint = _cluster_label_resume_fingerprint(
+            topic_item,
+            rule_index={"r1": {"rule_id": "r1"}, "r2": {"rule_id": "r2"}},
+            system_prompt=CLUSTER_LABEL_SYSTEM_PROMPT,
+            model="test-model",
+            temperature=0.0,
+            max_topics=1,
+            min_rule_count=1,
+            max_rules_per_cluster=2,
+            max_output_tokens=None,
+        )
+        output_path.write_text(
+            json.dumps(
+                {
+                    "metadata": {"fallback_label_count": 1},
+                    "proposals": [
+                        {
+                            "topic_key": "mechanics::kinematics",
+                            "source_fingerprint": fingerprint,
+                            "label_source": "embedding_fallback",
+                        }
+                    ],
+                    "failures": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        class _Completions:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def create(self, **kwargs):
+                self.calls += 1
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "choices": [
+                            type(
+                                "Choice",
+                                (),
+                                {
+                                    "message": type(
+                                        "Message",
+                                        (),
+                                        {
+                                            "content": json.dumps(
+                                                {
+                                                    "topic_summary": "Motion checks.",
+                                                    "rationale": "One motion cluster.",
+                                                    "clusters": [
+                                                        {
+                                                            "source_cluster_id": "embedding_cluster_01",
+                                                            "cluster_id": "motion",
+                                                            "name": "Motion",
+                                                            "summary": "Motion checks.",
+                                                            "description": "Motion checks.",
+                                                            "scene_cues": [],
+                                                            "boundary_cues": [],
+                                                            "explore_cues": [],
+                                                        }
+                                                    ],
+                                                }
+                                            )
+                                        },
+                                    )()
+                                },
+                            )()
+                        ]
+                    },
+                )()
+
+        completions = _Completions()
+        client = type(
+            "Client",
+            (),
+            {"chat": type("Chat", (), {"completions": completions})()},
+        )()
+        result = generate_cluster_proposals_from_embedding_clusters(
+            embedding_clusters={"topics": [topic_item]},
+            rule_input={"rules": [{"rule_id": "r1"}, {"rule_id": "r2"}]},
+            client=client,
+            model="test-model",
+            temperature=0.0,
+            max_topics=1,
+            min_rule_count=1,
+            max_rules_per_cluster=2,
+            output_path=output_path,
+            resume=True,
+            continue_on_error=True,
+        )
+
+        self.assertEqual(completions.calls, 1)
+        self.assertEqual(result["metadata"]["fallback_label_count"], 0)
+        self.assertEqual(result["proposals"][0]["label_source"], "model")
+
     def test_generate_from_embedding_clusters_drops_stale_failures_when_resuming(self) -> None:
         root = _case_dir()
         output_path = root / "cluster_proposals.json"
@@ -495,7 +763,17 @@ class GenerateClusterProposalTests(unittest.TestCase):
                             "domain": "Mechanics",
                             "topic": "Kinematics",
                             "topic_key": "mechanics::kinematics",
-                            "source_fingerprint": _embedding_topic_fingerprint(topic_item),
+                            "source_fingerprint": _cluster_label_resume_fingerprint(
+                                topic_item,
+                                rule_index={"r1": {"rule_id": "r1"}, "r2": {"rule_id": "r2"}},
+                                system_prompt=CLUSTER_LABEL_SYSTEM_PROMPT,
+                                model="test-model",
+                                temperature=0.0,
+                                max_topics=1,
+                                min_rule_count=1,
+                                max_rules_per_cluster=2,
+                                max_output_tokens=None,
+                            ),
                             "rule_count": 2,
                             "clusters": [],
                             "residual_rule_ids": [],

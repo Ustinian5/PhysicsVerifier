@@ -27,6 +27,10 @@ from scripts.build_unified_catalog import (
     merge_scenario_cluster_blueprints,
 )
 from scripts.compare_unified_catalogs import compare_catalogs
+from rule_framework.incremental_validation import (
+    incremental_artifact_binding,
+    sha256_file,
+)
 
 
 def _load_json(path: Path) -> Any:
@@ -465,6 +469,7 @@ def prepare_rules_for_cluster(
     embedding_input_output: Path | None = None,
     scenario_cluster_blueprints_paths: Sequence[Path] | None = None,
     preserve_baseline_rule_ids: bool = False,
+    incremental_manifest_path: Path | None = None,
 ) -> Dict[str, Any]:
     distilled_payload = _load_json(distilled_input)
     generalized_support_validated = _validate_generalized_support(distilled_payload)
@@ -539,8 +544,27 @@ def prepare_rules_for_cluster(
         },
         "rules": normalized_rules,
     }
+    if incremental_manifest_path is not None:
+        formal_inputs = {"generalized": distilled_input}
+        if baseline_catalog_path is not None:
+            formal_inputs["base_catalog"] = baseline_catalog_path
+        normalized_payload["metadata"].update(
+            incremental_artifact_binding(
+                incremental_manifest_path,
+                stage="formal_preparation",
+                input_paths=formal_inputs,
+            )
+        )
     _write_json(distilled_output, normalized_payload)
     embedding_payload = _embedding_input_payload(normalized_rules)
+    if incremental_manifest_path is not None:
+        embedding_payload["metadata"].update(
+            incremental_artifact_binding(
+                incremental_manifest_path,
+                stage="formal_embedding_input",
+                input_paths={"formal_rules": distilled_output},
+            )
+        )
     if embedding_input_output:
         _write_json(embedding_input_output, embedding_payload)
 
@@ -548,6 +572,22 @@ def prepare_rules_for_cluster(
     tagged_data = _load_json(tagged_path)
     blueprints = _load_blueprints(scenario_cluster_blueprints_paths)
     catalog = build_unified_catalog_from_data(knowledge_data, normalized_payload, tagged_data, blueprints)
+    if incremental_manifest_path is not None:
+        catalog_inputs = {
+            "generalized": distilled_input,
+            "formal_rules": distilled_output,
+            "knowledge": knowledge_path,
+            "tagged": tagged_path,
+        }
+        if baseline_catalog_path is not None:
+            catalog_inputs["base_catalog"] = baseline_catalog_path
+        catalog["metadata"].update(
+            incremental_artifact_binding(
+                incremental_manifest_path,
+                stage="precluster_catalog",
+                input_paths=catalog_inputs,
+            )
+        )
     _write_json(catalog_output, catalog)
 
     catalog_topics = _catalog_topic_keys(catalog)
@@ -587,6 +627,21 @@ def prepare_rules_for_cluster(
         "comparison": comparison.get("summary", {}),
         "cluster_coverage": comparison.get("cluster_coverage", {}),
     }
+    if incremental_manifest_path is not None:
+        report["incremental_artifacts"] = {
+            "configuration_sha256": normalized_payload["metadata"].get(
+                "incremental_configuration_sha256"
+            ),
+            "sha256": {
+                "formal_rules": sha256_file(distilled_output),
+                "formal_embedding_input": (
+                    sha256_file(embedding_input_output)
+                    if embedding_input_output is not None
+                    else ""
+                ),
+                "precluster_catalog": sha256_file(catalog_output),
+            },
+        }
     _write_json(report_output, report)
     return report
 
@@ -615,7 +670,22 @@ def main() -> None:
         default=None,
         help="Repeat to merge blueprint sources. Defaults to catalogs/scenario_cluster_blueprints.json.",
     )
+    parser.add_argument(
+        "--no-scenario-cluster-blueprints",
+        action="store_true",
+        help="Build the precluster catalog without any scenario-cluster seed.",
+    )
+    parser.add_argument(
+        "--incremental-manifest",
+        default="",
+        help="Optional schema-v2 manifest used to bind deterministic outputs.",
+    )
     args = parser.parse_args()
+    if args.no_scenario_cluster_blueprints and args.scenario_cluster_blueprints:
+        parser.error(
+            "--no-scenario-cluster-blueprints cannot be combined with "
+            "--scenario-cluster-blueprints"
+        )
 
     report = prepare_rules_for_cluster(
         distilled_input=Path(args.distilled_input),
@@ -627,11 +697,18 @@ def main() -> None:
         report_output=Path(args.report_output),
         embedding_input_output=Path(args.embedding_input_output) if args.embedding_input_output else None,
         scenario_cluster_blueprints_paths=(
-            [Path(item) for item in args.scenario_cluster_blueprints]
-            if args.scenario_cluster_blueprints is not None
-            else None
+            []
+            if args.no_scenario_cluster_blueprints
+            else (
+                [Path(item) for item in args.scenario_cluster_blueprints]
+                if args.scenario_cluster_blueprints is not None
+                else None
+            )
         ),
         preserve_baseline_rule_ids=bool(args.preserve_baseline_rule_ids),
+        incremental_manifest_path=(
+            Path(args.incremental_manifest) if args.incremental_manifest else None
+        ),
     )
     print(_console_json({"normalization": report["normalization"], "catalog": report["catalog"]}))
 
