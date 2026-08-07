@@ -2,10 +2,10 @@
 # Error-level: local Qwen3-4B-AWQ (vLLM) semantic baseline + PhysicsVerifier e2e.
 #
 # Usage (screen recommended; total wall time often 1–3h):
-#   bash scripts/run_local_4b_error_baseline_and_e2e.sh
+#   bash scripts/legacy/run_local_4b_error_baseline_and_e2e.sh
 #
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 PYTHON="${PYTHON:-$ROOT/.venv/bin/python}"
@@ -95,7 +95,7 @@ export SYMBOLIC_TOPIC_CHECK_LIMIT="${SYMBOLIC_TOPIC_CHECK_LIMIT:-32}"
 export TAG_MAIN="${TAG_MAIN:-e2e_main_error_4b_local}"
 export TAG_BASE="${TAG_BASE:-baseline_error_4b_local}"
 
-bash "$ROOT/scripts/run_dualchain_4b_error_level_e2e_and_baseline.sh"
+bash "$ROOT/scripts/legacy/run_dualchain_4b_error_level_e2e_and_baseline.sh"
 
 STAMP="$(cat "$ROOT/results/_dualchain_4b_error_only_stamp.txt")"
 MAIN_OUT="$ROOT/results/${TAG_MAIN}_${STAMP}"

@@ -2,8 +2,8 @@
 """Emit Markdown summary tables for dual-chain experiment dirs (stdlib only).
 
 Usage:
-  STAMP_BATCH=20260510_044549 python scripts/emit_dual_chain_results_md.py
-  STAMP_BATCH=... STAMP_4B=... python scripts/emit_dual_chain_results_md.py
+  STAMP_BATCH=20260510_044549 python scripts/legacy/emit_dual_chain_results_md.py
+  STAMP_BATCH=... STAMP_4B=... python scripts/legacy/emit_dual_chain_results_md.py
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import os
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def load_summary(metrics_path: Path) -> dict:

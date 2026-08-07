@@ -77,7 +77,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate runbook commands for scale-checkpoint experiments.")
     parser.add_argument("--manifest", type=str, default="results/scale_curve/checkpoint_manifest.json")
     parser.add_argument("--output-md", type=str, default="results/scale_curve/runbook.md")
-    parser.add_argument("--output-sh", type=str, default="scripts/run_scale_checkpoints.sh")
+    parser.add_argument("--output-sh", type=str, default="scripts/legacy/run_scale_checkpoints.sh")
     parser.add_argument("--model", type=str, default="qwen3-30b-a3b")
     args = parser.parse_args()
 
@@ -115,13 +115,13 @@ def main() -> None:
     lines_md.append("")
     lines_md.append("```bash")
     agg_cmd = (
-        "python scripts/aggregate_scale_curve.py "
+        "python scripts/legacy/aggregate_scale_curve.py "
         "--metrics-glob 'results/scale_curve/ckpt_*/strict_metrics.json' "
         "--output-csv results/scale_curve/curve_metrics.csv "
         "--output-json results/scale_curve/curve_metrics.json"
     )
     plot_cmd = (
-        "python scripts/plot_scale_curve.py "
+        "python scripts/legacy/plot_scale_curve.py "
         "--input-csv results/scale_curve/curve_metrics.csv "
         "--output results/scale_curve/scale_curve.png"
     )

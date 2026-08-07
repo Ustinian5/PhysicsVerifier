@@ -8,12 +8,12 @@
 # 默认 **并行** 跑四个任务（PARALLEL=1）；串行请设置 PARALLEL=0。
 #
 # Usage:
-#   bash scripts/run_four_qwen_baselines_and_no_symbolic_ablation.sh
-#   PARALLEL=0 bash scripts/run_four_qwen_baselines_and_no_symbolic_ablation.sh
+#   bash scripts/legacy/run_four_qwen_baselines_and_no_symbolic_ablation.sh
+#   PARALLEL=0 bash scripts/legacy/run_four_qwen_baselines_and_no_symbolic_ablation.sh
 #
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
 PYTHON="${PYTHON:-$ROOT_DIR/.venv/bin/python}"
@@ -83,7 +83,7 @@ run_ablation_fixed() {
   {
     echo "=== Ablation NO_SYMBOLIC_CHECK=1 -> $AB_TAG start $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
     cd "$ROOT_DIR"
-    NO_SYMBOLIC_CHECK=1 RUN_TAG="$AB_TAG" SKIP_BUILD=1 bash scripts/run_e2e_with_experience_symbolic.sh
+    NO_SYMBOLIC_CHECK=1 RUN_TAG="$AB_TAG" SKIP_BUILD=1 bash scripts/legacy/run_e2e_with_experience_symbolic.sh
     echo "=== Ablation done $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
   } >> "$ROOT_DIR/results/$AB_TAG/run.log" 2>&1
 }
@@ -108,7 +108,7 @@ if [[ "$PARALLEL" == "1" ]]; then
   wait $p3 || ec=1
   wait $p4 || ec=1
   echo "[parallel] all finished ec=$ec" | tee -a "$MASTER_LOG"
-  "$PYTHON" scripts/collect_four_exp_metrics.py --stamp "$STAMP" --write-md "$ROOT_DIR/results/four_exp_table_${STAMP}.md" || true
+  "$PYTHON" scripts/legacy/collect_four_exp_metrics.py --stamp "$STAMP" --write-md "$ROOT_DIR/results/four_exp_table_${STAMP}.md" || true
   exit "$ec"
 else
   echo "[sequential] running..." | tee -a "$MASTER_LOG"
@@ -116,6 +116,6 @@ else
   run_baseline_pair "next80" "$BASELINE_MODEL_NEXT80"
   run_baseline_pair "mo235" "$BASELINE_MODEL_MO235"
   run_ablation_fixed
-  "$PYTHON" scripts/collect_four_exp_metrics.py --stamp "$STAMP" --write-md "$ROOT_DIR/results/four_exp_table_${STAMP}.md" || true
+  "$PYTHON" scripts/legacy/collect_four_exp_metrics.py --stamp "$STAMP" --write-md "$ROOT_DIR/results/four_exp_table_${STAMP}.md" || true
   echo "All four experiments finished." | tee -a "$MASTER_LOG"
 fi

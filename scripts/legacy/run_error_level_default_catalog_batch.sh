@@ -4,20 +4,20 @@
 #   [2] 30B ablation: no programmatic symbolic checks
 #
 # Usage:
-#   nohup bash scripts/run_error_level_default_catalog_batch.sh > results/_default_catalog_batch_nohup.log 2>&1 &
+#   nohup bash scripts/legacy/run_error_level_default_catalog_batch.sh > results/_default_catalog_batch_nohup.log 2>&1 &
 #
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 STAMP="${STAMP:-$(date -u +%Y%m%d_%H%M%S)}"
 export STAMP
 echo "$STAMP" > "$ROOT/results/_default_catalog_batch_stamp.txt"
 
 echo "[batch] STAMP=$STAMP starting 235B main..."
-RUN_235B_ONLY=1 bash "$ROOT/scripts/run_error_level_30b_no_sym_and_235b_e2e.sh"
+RUN_235B_ONLY=1 bash "$ROOT/scripts/legacy/run_error_level_30b_no_sym_and_235b_e2e.sh"
 
 echo "[batch] STAMP=$STAMP starting 30B no-symbolic ablation..."
-RUN_30B_NO_SYM_ONLY=1 bash "$ROOT/scripts/run_error_level_30b_no_sym_and_235b_e2e.sh"
+RUN_30B_NO_SYM_ONLY=1 bash "$ROOT/scripts/legacy/run_error_level_30b_no_sym_and_235b_e2e.sh"
 
 SUMMARY="$ROOT/results/default_catalog_error_batch_${STAMP}.md"
 export ROOT STAMP SUMMARY

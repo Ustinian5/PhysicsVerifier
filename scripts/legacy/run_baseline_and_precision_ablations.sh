@@ -5,10 +5,10 @@
 #   3) Ablation: min diagnostic rule score = 4.0
 #
 # Usage:
-#   nohup bash scripts/run_baseline_and_precision_ablations.sh > results/_batch_baseline_ablations_nohup.log 2>&1 &
+#   nohup bash scripts/legacy/run_baseline_and_precision_ablations.sh > results/_batch_baseline_ablations_nohup.log 2>&1 &
 #
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 PYTHON="${PYTHON:-$ROOT/.venv/bin/python}"
 if [[ ! -x "$PYTHON" ]]; then
@@ -126,6 +126,6 @@ if [[ -x "$PYTHON" ]]; then
     echo ""
     echo "---"
     echo "<!-- auto tables batch-only $(date -u +%Y-%m-%dT%H:%M:%SZ) STAMP=$STAMP -->"
-    STAMP_BATCH="$STAMP" "$PYTHON" "$ROOT/scripts/emit_dual_chain_results_md.py"
+    STAMP_BATCH="$STAMP" "$PYTHON" "$ROOT/scripts/legacy/emit_dual_chain_results_md.py"
   } >> "$ROOT/results/dual_chain_experiment_tracking.md" || true
 fi

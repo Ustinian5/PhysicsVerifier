@@ -3,12 +3,12 @@
 # both using check model **qwen3-4b-instruct-2507**. Intended for `screen` / `tmux` / `nohup`.
 #
 # Usage (from repo root):
-#   bash scripts/run_dualchain_4b_error_level_e2e_and_baseline.sh
-#   PROGRESS_EVERY=10 CHECK_MODEL=qwen3-4b-instruct-2507 bash scripts/run_dualchain_4b_error_level_e2e_and_baseline.sh
-#   nohup bash scripts/run_dualchain_4b_error_level_e2e_and_baseline.sh > results/_dualchain_4b_error_only_nohup.log 2>&1 &
+#   bash scripts/legacy/run_dualchain_4b_error_level_e2e_and_baseline.sh
+#   PROGRESS_EVERY=10 CHECK_MODEL=qwen3-4b-instruct-2507 bash scripts/legacy/run_dualchain_4b_error_level_e2e_and_baseline.sh
+#   nohup bash scripts/legacy/run_dualchain_4b_error_level_e2e_and_baseline.sh > results/_dualchain_4b_error_only_nohup.log 2>&1 &
 #
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 PYTHON="${PYTHON:-$ROOT/.venv/bin/python}"
 if [[ ! -x "$PYTHON" ]]; then

@@ -9,7 +9,7 @@ set -euo pipefail
 #
 #   screen -S pv_e2e_exp_sym
 #   cd /home/jinjianhan/PhysicsVerifier
-#   bash scripts/run_e2e_with_experience_symbolic.sh
+#   bash scripts/legacy/run_e2e_with_experience_symbolic.sh
 #
 # Override any of the following with environment variables before invoking:
 #
@@ -31,7 +31,7 @@ set -euo pipefail
 #   ENABLE_QUALITY_AUDIT            1 to run quality audit during build
 #   NO_SYMBOLIC_CHECK               1 to pass --no-symbolic-check (semantic-only ablation)
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
 PYTHON="${PYTHON:-$ROOT_DIR/.venv/bin/python}"

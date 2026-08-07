@@ -6,10 +6,10 @@
 #   3) Ablation B: explicit --min-diagnostic-rule-score 4.0 (same numeric default as run 1)
 # For a strict top_n ablation, add a run with e.g. --unified-rule-top-n 4.
 #
-# See also: scripts/run_baseline_and_precision_ablations.sh (baseline + both ablations).
+# See also: scripts/legacy/run_baseline_and_precision_ablations.sh (baseline + both ablations).
 #
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 PYTHON="${PYTHON:-$ROOT/.venv/bin/python}"
 

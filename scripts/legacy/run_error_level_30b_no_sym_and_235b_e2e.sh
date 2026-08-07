@@ -11,15 +11,15 @@
 # Usage:
 #   screen -S pv_err_30b_235b
 #   cd /home/jinjianhan/PhysicsVerifier
-#   bash scripts/run_error_level_30b_no_sym_and_235b_e2e.sh
-#   ENV_FILE=/path/to/.env bash scripts/run_error_level_30b_no_sym_and_235b_e2e.sh
+#   bash scripts/legacy/run_error_level_30b_no_sym_and_235b_e2e.sh
+#   ENV_FILE=/path/to/.env bash scripts/legacy/run_error_level_30b_no_sym_and_235b_e2e.sh
 #
-#   PROGRESS_EVERY=10 SYMBOLIC_TOPIC_CHECK_LIMIT=40 bash scripts/run_error_level_30b_no_sym_and_235b_e2e.sh
-#   RUN_235B_ONLY=1 bash scripts/run_error_level_30b_no_sym_and_235b_e2e.sh
-#   RUN_30B_NO_SYM_ONLY=1 bash scripts/run_error_level_30b_no_sym_and_235b_e2e.sh
+#   PROGRESS_EVERY=10 SYMBOLIC_TOPIC_CHECK_LIMIT=40 bash scripts/legacy/run_error_level_30b_no_sym_and_235b_e2e.sh
+#   RUN_235B_ONLY=1 bash scripts/legacy/run_error_level_30b_no_sym_and_235b_e2e.sh
+#   RUN_30B_NO_SYM_ONLY=1 bash scripts/legacy/run_error_level_30b_no_sym_and_235b_e2e.sh
 #
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 PYTHON="${PYTHON:-$ROOT/.venv/bin/python}"

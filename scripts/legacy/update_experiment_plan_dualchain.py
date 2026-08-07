@@ -6,9 +6,9 @@ Markers in the doc (do not remove):
   <!-- AUTO:DUALCHAIN_4B_TABLES --> ... <!-- END:DUALCHAIN_4B_TABLES -->
 
 Usage:
-  python scripts/update_experiment_plan_dualchain.py --phase batch
-  STAMP_4B=... python scripts/update_experiment_plan_dualchain.py --phase fourb
-  python scripts/update_experiment_plan_dualchain.py --phase all
+  python scripts/legacy/update_experiment_plan_dualchain.py --phase batch
+  STAMP_4B=... python scripts/legacy/update_experiment_plan_dualchain.py --phase fourb
+  python scripts/legacy/update_experiment_plan_dualchain.py --phase all
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ import re
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 PLAN = ROOT / "results" / "dual_chain_experiment_tracking.md"
 STAMP_FILE = ROOT / "results" / "_batch_baseline_ablations_stamp.txt"
 STAMP_4B_FILE = ROOT / "results" / "_dualchain_check4b_stamp.txt"
@@ -88,7 +88,7 @@ def build_batch_tables(stamp_batch: str) -> str:
     now = datetime.datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     lines = [
         "",
-        f"_本段由 `scripts/update_experiment_plan_dualchain.py` 于 {now} 依据磁盘上的 `*_metrics.json` 刷新。_",
+        f"_本段由 `scripts/legacy/update_experiment_plan_dualchain.py` 于 {now} 依据磁盘上的 `*_metrics.json` 刷新。_",
         "",
         f"批次 `STAMP={stamp_batch}`：**语义 baseline**（无 `rule` 字段）+ **消融** `unified-rule-top-n 6` + **消融** `min-diagnostic-rule-score 4.0`。错误级匹配 **location**；题目级同 §11 上文。",
         "",
@@ -121,7 +121,7 @@ def build_fourb_tables(stamp_4b: str) -> str:
     now = datetime.datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     lines = [
         "",
-        f"_本段由 `scripts/update_experiment_plan_dualchain.py` 于 {now} 刷新。_",
+        f"_本段由 `scripts/legacy/update_experiment_plan_dualchain.py` 于 {now} 刷新。_",
         "",
         f"检查模型 **`qwen3-4b-instruct-2507`**（`STAMP={stamp_4b}`）：主流程 `e2e_main_check_4b_*` 与语义 baseline `baseline_check_4b_*`。",
         "",

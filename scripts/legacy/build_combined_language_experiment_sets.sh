@@ -11,13 +11,13 @@ set -euo pipefail
 #
 # Usage in screen:
 #   screen -S pv_build_sets
-#   bash scripts/build_combined_language_experiment_sets.sh
+#   bash scripts/legacy/build_combined_language_experiment_sets.sh
 #
 # Useful overrides:
-#   MAX_ROLLOUTS=50 TEST_N=100 EXPANSION_N=600 VAL_N=80 bash scripts/build_combined_language_experiment_sets.sh
-#   MAX_ROLLOUTS=0  bash scripts/build_combined_language_experiment_sets.sh   # full file
+#   MAX_ROLLOUTS=50 TEST_N=100 EXPANSION_N=600 VAL_N=80 bash scripts/legacy/build_combined_language_experiment_sets.sh
+#   MAX_ROLLOUTS=0  bash scripts/legacy/build_combined_language_experiment_sets.sh   # full file
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
 INPUT="${INPUT:-data/combined_language_only.json}"
@@ -57,7 +57,7 @@ python3 scripts/audit_combined_language_dataset.py \
   2>&1 | tee "$RESULTS_DIR/source_audit.log"
 
 echo "[2/4] Exporting mutually exclusive splits..."
-python3 scripts/export_combined_language_eval_slices.py \
+python3 scripts/legacy/export_combined_language_eval_slices.py \
   --input "$INPUT" \
   --outdir "$OUTDIR" \
   --seed "$SEED" \
