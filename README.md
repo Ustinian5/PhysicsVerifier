@@ -24,6 +24,7 @@ PhysicsVerifier 用于检查物理竞赛题的模型解答。系统根据题目�
 - 语义导航：`core/unified_semantic_matcher.py`
 - 检查主流程：`core/physics_rule_verifier.py`
 - 当前 development 基线：`catalogs/rules_unified_3000.json`（1123 条）
+- 增量规则治理：`scripts/prepare_incremental_update.py` / `scripts/finalize_incremental_update.py`（manifest v2 + 配置/来源/拓扑预注册门禁）
 - 历史运行时参考库：`catalogs/rules_unified_3000_runtime_backfilled.json`（4875 条，当前效果消融已否决）
 - 共享文档：[文档索引](docs/文档索引.md)
 - 目录职责与清理边界：[项目结构](docs/项目结构.md)

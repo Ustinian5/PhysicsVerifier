@@ -20,7 +20,7 @@
 
 ## unified_rules 生命周期
 
-主要入口是 `unified_rules_pipeline.py`。其余 `prepare_*`、`generalize_*`、`run_rule_embedding_clustering.py`、`build_unified_catalog.py`、`finalize_incremental_update.py` 和 `validate_*` 脚本分别承担候选准备、概括、聚类、构建、增量合并和验证。
+主要入口是 `unified_rules_pipeline.py`。增量流程由 `prepare_incremental_update.py` 生成 manifest v2、冻结六步运行配置和预注册预算，再由 `finalize_incremental_update.py` 重算候选差分，校验逐阶段父产物 SHA 链、确定性 formal/precluster 重放、API 完整性、蓝图 exact-once 覆盖、来源、generalized 与 catalog diff；纯逻辑比较集中在 `rule_framework/incremental_validation.py`。additive 不改变旧拓扑，`scoped_recluster` 仅能完整替换预声明 Topic。其余 `prepare_*`、`generalize_*`、`run_rule_embedding_clustering.py`、`build_unified_catalog.py` 和 `validate_*` 脚本分别承担候选准备、概括、聚类、构建和验证。
 
 审计类脚本使用 `audit_*` 命名；分析和对比工具使用 `analyze_*`、`compare_*`、`evaluate_*` 命名。它们默认不应覆盖正式 catalog。
 
