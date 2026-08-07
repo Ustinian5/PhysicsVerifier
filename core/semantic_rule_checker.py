@@ -37,6 +37,9 @@ except ImportError:
     openai = None
 
 
+SEMANTIC_RULE_CHECKER_PROMPT_VERSION = "semantic-rule-checker-applicability-v1"
+
+
 # ------------------------- 符号节点网络 (保持不变) -------------------------
 @dataclass
 class SymbolNode:
@@ -896,7 +899,14 @@ class SemanticRuleChecker:
         return any(re.search(pattern, text, flags=re.I) for pattern in cls._NEGATIVE_DIAGNOSTIC_PATTERNS)
 
     # ------------------------- 新的LLM驱动的规则检查 -------------------------
-    def _get_check_prompt(self, srd: str, raw_answer: str, context_summary: str, rule_id: str) -> tuple[str, str]:
+    def _get_check_prompt(
+        self,
+        srd: str,
+        raw_answer: str,
+        problem_text: str,
+        context_summary: str,
+        rule_id: str,
+    ) -> tuple[str, str]:
         system_prompt = (
             "You are an expert physics grader. Your task is to check a student's answer "
             "against a specific, formal rule and report any violations in a structured JSON format. "
@@ -905,10 +915,13 @@ class SemanticRuleChecker:
             "If no violations are found, output an empty array `[]`."
         )
         trimmed_answer = raw_answer.strip()
+        trimmed_problem = problem_text.strip()
         # 适当放宽截断上限，保留更多原始作答内容
         max_chars = 12000
         if len(trimmed_answer) > max_chars:
             trimmed_answer = trimmed_answer[:max_chars] + "\n...[truncated]"
+        if len(trimmed_problem) > max_chars:
+            trimmed_problem = trimmed_problem[:max_chars] + "\n...[truncated]"
         if self.rule_mode == "direct":
             rule_block = f"Rule Description:\n{srd.strip()}"
         else:
@@ -916,6 +929,11 @@ class SemanticRuleChecker:
 
         user_prompt = f"""
 {rule_block}
+
+The physics problem being answered (verbatim text):
+---
+{trimmed_problem}
+---
 
 The student's submission (verbatim text):
 ---
@@ -928,7 +946,11 @@ Structured extraction summary (JSON helpers, may be incomplete):
 Instructions:
 1. First rely on the raw text to understand the student's reasoning.
 2. Use the structured summary only as a helper to locate symbols, equations, and counts; it may be incomplete or noisy.
-3. Compare the student's work against the SRD step by step.
+3. Treat the SRD as a conditional diagnostic aid, not as a mandatory solution method or grading rubric:
+    - First verify that the rule's physical scenario and preconditions apply to this exact problem.
+    - Do NOT penalize an answer merely for omitting a derivation, method, quantity, or topic mentioned by the SRD.
+    - An alternative derivation is acceptable when it answers what the problem asks and is physically sound.
+    - Do not mention "SRD", "catalog", or "rule requirement" in the diagnostic message.
 4. Only flag a violation if all of the following are true:
     - You can quote at least one concrete sentence or formula from the student's text that clearly contradicts the rule.
     - That quote cannot be reasonably interpreted as correct, harmless, or unrelated to this rule.
@@ -1002,6 +1024,12 @@ Respond with only the JSON output (array or empty array).
                     system_prompt, user_prompt = self._get_check_prompt(
                         srd=srd,
                         raw_answer=answer_text,
+                        problem_text="\n".join(
+                            [
+                                str(sample.get("question") or ""),
+                                str(sample.get("context") or ""),
+                            ]
+                        ),
                         context_summary=context_summary,
                         rule_id=rule_id,
                     )
@@ -1009,6 +1037,12 @@ Respond with only the JSON output (array or empty array).
                     system_prompt, user_prompt = self._get_check_prompt(
                         srd=srd,
                         raw_answer=answer_text,
+                        problem_text="\n".join(
+                            [
+                                str(sample.get("question") or ""),
+                                str(sample.get("context") or ""),
+                            ]
+                        ),
                         context_summary="{}",
                         rule_id=rule_id,
                     )
