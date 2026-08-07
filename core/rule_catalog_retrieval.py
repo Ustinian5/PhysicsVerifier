@@ -677,6 +677,14 @@ def build_topic_candidates(catalog: Dict[str, Any]) -> List[Dict[str, Any]]:
     for domain in catalog.get("domains", []) or []:
         domain_name = norm_text(domain.get("name") or "Unknown")
         for topic in domain.get("topics", []) or []:
+            executable_rules = [
+                rule
+                for rule in topic_rule_leaves(topic)
+                if isinstance(rule, dict)
+                and norm_text(rule.get("rule_id") or rule.get("id") or "")
+            ]
+            if not executable_rules:
+                continue
             topic_name = norm_text(topic.get("name") or "Unknown")
             topic_obj = dict(topic)
             topic_obj.setdefault("domain", domain_name)

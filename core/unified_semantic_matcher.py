@@ -7,7 +7,12 @@ import os
 import re
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
-from core.rule_catalog_retrieval import norm_text, ordered_unique, score_rule_candidate
+from core.rule_catalog_retrieval import (
+    norm_text,
+    ordered_unique,
+    score_rule_candidate,
+    topic_rule_leaves,
+)
 
 try:
     import httpx
@@ -1424,7 +1429,13 @@ class UnifiedSemanticMatcher:
         for domain in catalog.get("domains", []) or []:
             if not isinstance(domain, dict):
                 continue
-            topics = [topic for topic in (domain.get("topics") or []) if isinstance(topic, dict)]
+            topics = [
+                topic
+                for topic in (domain.get("topics") or [])
+                if isinstance(topic, dict) and cls._topic_rule_objects(topic)
+            ]
+            if not topics:
+                continue
             topic_names = [norm_text(topic.get("name") or "") for topic in topics if norm_text(topic.get("name") or "")]
             domain_name = norm_text(domain.get("name") or "Unknown")
             domain_id = norm_text(domain.get("id") or domain.get("domain_id") or "")
@@ -1464,8 +1475,19 @@ class UnifiedSemanticMatcher:
     @classmethod
     def _topic_cluster_previews(cls, topic: Dict[str, Any]) -> List[Dict[str, Any]]:
         previews: List[Dict[str, Any]] = []
+        topic_rule_ids = {
+            norm_text(rule.get("rule_id") or rule.get("id") or "")
+            for rule in cls._topic_rule_objects(topic)
+        }
         for cluster in topic.get("scenario_clusters", []) or []:
             if not isinstance(cluster, dict):
+                continue
+            cluster_rule_ids = {
+                norm_text(rule_id)
+                for rule_id in (cluster.get("rule_ids") or [])
+                if norm_text(rule_id)
+            }
+            if not cluster_rule_ids.intersection(topic_rule_ids):
                 continue
             activation_conditions = []
             for group in cluster.get("rule_groups", []) or []:
@@ -1521,6 +1543,9 @@ class UnifiedSemanticMatcher:
             for topic in domain.get("topics", []) or []:
                 if not isinstance(topic, dict):
                     continue
+                executable_rules = cls._topic_rule_objects(topic)
+                if not executable_rules:
+                    continue
                 topic_name = norm_text(topic.get("name") or "Unknown")
                 topic_id = norm_text(topic.get("id") or topic.get("topic_id") or "")
                 if not topic_id:
@@ -1533,7 +1558,7 @@ class UnifiedSemanticMatcher:
                         "topic_id": topic_id,
                         "topic": topic_name,
                         "summary": norm_text(topic.get("summary") or ""),
-                        "rule_count": len(topic.get("rules") or []),
+                        "rule_count": len(executable_rules),
                         "retrieval_hints": cls._compact_retrieval_hints(topic),
                         "cluster_previews": cls._topic_cluster_previews(topic),
                         "topic_obj": topic,
@@ -1542,12 +1567,19 @@ class UnifiedSemanticMatcher:
         return out
 
     @staticmethod
-    def _build_rule_candidates(topic_match: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _topic_rule_objects(topic: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return [
+            rule
+            for rule in topic_rule_leaves(topic)
+            if isinstance(rule, dict)
+            and norm_text(rule.get("rule_id") or rule.get("id") or "")
+        ]
+
+    @classmethod
+    def _build_rule_candidates(cls, topic_match: Dict[str, Any]) -> List[Dict[str, Any]]:
         topic_obj = topic_match.get("topic_obj") if isinstance(topic_match.get("topic_obj"), dict) else {}
         out: List[Dict[str, Any]] = []
-        for rule in topic_obj.get("rules", []) or []:
-            if not isinstance(rule, dict):
-                continue
+        for rule in cls._topic_rule_objects(topic_obj):
             out.append(
                 {
                     "rule_id": norm_text(rule.get("rule_id") or ""),
@@ -1623,18 +1655,30 @@ class UnifiedSemanticMatcher:
         topic_obj = topic_match.get("topic_obj") if isinstance(topic_match.get("topic_obj"), dict) else {}
         topic_rules = {
             str(rule.get("rule_id") or ""): rule
-            for rule in (topic_obj.get("rules") or [])
-            if isinstance(rule, dict) and norm_text(rule.get("rule_id") or "")
+            for rule in cls._topic_rule_objects(topic_obj)
         }
         out: List[Dict[str, Any]] = []
         for cluster in topic_obj.get("scenario_clusters", []) or []:
             if not isinstance(cluster, dict):
                 continue
             navigation_role = cls._cluster_navigation_role(cluster)
-            cluster_rule_ids = [norm_text(item) for item in (cluster.get("rule_ids") or []) if norm_text(item)]
+            cluster_rule_ids = ordered_unique(
+                norm_text(item)
+                for item in (cluster.get("rule_ids") or [])
+                if norm_text(item) in topic_rules
+            )
+            if not cluster_rule_ids:
+                continue
             rule_groups = []
             for group in cluster.get("rule_groups", []) or []:
                 if not isinstance(group, dict):
+                    continue
+                group_rule_ids = ordered_unique(
+                    norm_text(item)
+                    for item in (group.get("rule_ids") or [])
+                    if norm_text(item) in cluster_rule_ids
+                )
+                if not group_rule_ids:
                     continue
                 rule_groups.append(
                     {
@@ -1642,7 +1686,7 @@ class UnifiedSemanticMatcher:
                         "name": norm_text(group.get("name") or ""),
                         "summary": norm_text(group.get("summary") or ""),
                         "activation_condition": norm_text(group.get("activation_condition") or ""),
-                        "rule_ids": [norm_text(item) for item in (group.get("rule_ids") or []) if norm_text(item)],
+                        "rule_ids": group_rule_ids,
                     }
                 )
             out.append(

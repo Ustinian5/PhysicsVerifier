@@ -1409,6 +1409,7 @@ class UnifiedSemanticMatcherTests(unittest.TestCase):
     def test_large_topic_pool_uses_shortlist_before_detailed_selection(self) -> None:
         topics = []
         for index in range(9):
+            rule_id = f"rule_{index}"
             topics.append(
                 {
                     "id": f"mechanics.topic_{index}",
@@ -1418,13 +1419,13 @@ class UnifiedSemanticMatcherTests(unittest.TestCase):
                         "scene_keywords": [f"scene {index}"],
                         "llm_discriminative_terms": [f"mechanism {index}"],
                     },
-                    "rules": [],
+                    "rules": [{"rule_id": rule_id}],
                     "scenario_clusters": [
                         {
                             "id": f"scenario_{index}",
                             "name": f"Scenario {index}",
                             "summary": f"Scenario summary {index}.",
-                            "rule_ids": [],
+                            "rule_ids": [rule_id],
                             "rule_groups": [],
                         }
                     ],
@@ -1638,12 +1639,13 @@ class UnifiedSemanticMatcherTests(unittest.TestCase):
             topics = []
             for topic_index in range(6):
                 topic_id = f"domain_{domain_index}.topic_{topic_index}"
+                rule_id = f"rule_{domain_index}_{topic_index}"
                 topics.append(
                     {
                         "id": topic_id,
                         "name": f"Topic {domain_index}-{topic_index}",
                         "summary": "A candidate mechanism.",
-                        "rules": [],
+                        "rules": [{"rule_id": rule_id}],
                         "scenario_clusters": [],
                     }
                 )
@@ -2237,14 +2239,21 @@ class UnifiedSemanticMatcherTests(unittest.TestCase):
                             "id": f"d{domain_index}.t{topic_index}",
                             "name": f"Topic {domain_index}-{topic_index}",
                             "summary": f"Topic {domain_index}-{topic_index} summary.",
-                            "rules": [],
+                            "rules": [
+                                {
+                                    "rule_id": f"rule_{domain_index}_{topic_index}_{cluster_index}",
+                                }
+                                for cluster_index in range(2)
+                            ],
                             "scenario_clusters": [
                                 {
                                     "id": f"cluster_{domain_index}_{topic_index}_{cluster_index}",
                                     "name": f"Cluster {domain_index}-{topic_index}-{cluster_index}",
                                     "summary": "A candidate scenario.",
                                     "rule_groups": [],
-                                    "rule_ids": [],
+                                    "rule_ids": [
+                                        f"rule_{domain_index}_{topic_index}_{cluster_index}"
+                                    ],
                                 }
                                 for cluster_index in range(2)
                             ],
@@ -2300,19 +2309,97 @@ class UnifiedSemanticMatcherTests(unittest.TestCase):
                 json.dumps(domain_response),
                 json.dumps(topic_response),
                 *[json.dumps(response) for response in cluster_responses],
+                '{"rules":[{"rule_id":"rule_0_0_0","applicable":true,"score":0.95}]}',
+                '{"rules":[{"rule_id":"rule_0_1_0","applicable":true,"score":0.94}]}',
+                '{"rules":[{"rule_id":"rule_1_0_0","applicable":true,"score":0.93}]}',
+                '{"rules":[{"rule_id":"rule_0_0_1","applicable":true,"score":0.92}]}',
             ]
         )
         matcher = UnifiedSemanticMatcher(model="fake-model", client=client)
 
-        result = matcher.select_tree_semantically(
-            {"question": "A broad multi-domain setup.", "context": "", "prediction": "A proposed solution."},
-            catalog,
-        )
+        sample = {
+            "question": "A broad multi-domain setup.",
+            "context": "",
+            "prediction": "A proposed solution.",
+        }
+        result = matcher.select_tree_semantically(sample, catalog)
 
         self.assertEqual(len(result["selected_domains"]), matcher.MAX_SELECTED_DOMAINS)
         self.assertEqual(len(result["selected_topics"]), matcher.MAX_SELECTED_TOPICS)
         self.assertEqual(len(result["selected_clusters"]), matcher.MAX_SELECTED_CLUSTERS)
-        self.assertEqual(len(client.requests), 5)
+        self.assertEqual(len(result["selected_rules"]), 4)
+        stages = result["navigation_trace"]["stages"]
+        self.assertEqual(stages["domain"]["chat_call_count"], 1)
+        self.assertEqual(stages["topic"]["chat_call_count"], 1)
+        self.assertEqual(stages["cluster"]["chat_call_count"], 3)
+        self.assertEqual(stages["rule"]["chat_call_count"], 4)
+
+    def test_runtime_navigation_filters_non_executable_topics_and_clusters(self) -> None:
+        catalog = {
+            "metadata": {"version": "2.0", "catalog_type": "unified_rules_v2"},
+            "domains": [
+                {
+                    "id": "empty_domain",
+                    "name": "Empty Domain",
+                    "topics": [
+                        {
+                            "id": "empty_domain.empty_topic",
+                            "name": "Empty Topic",
+                            "rules": [],
+                            "scenario_clusters": [],
+                        }
+                    ],
+                },
+                {
+                    "id": "mechanics",
+                    "name": "Mechanics",
+                    "topics": [
+                        {
+                            "id": "mechanics.empty_topic",
+                            "name": "Empty Topic",
+                            "rules": [],
+                            "scenario_clusters": [
+                                {"id": "empty", "rule_ids": []}
+                            ],
+                        },
+                        {
+                            "id": "mechanics.kinematics",
+                            "name": "Kinematics",
+                            "rules": [{"rule_id": "r1", "title": "Check motion"}],
+                            "scenario_clusters": [
+                                {"id": "empty", "rule_ids": []},
+                                {"id": "stale", "rule_ids": ["unknown"]},
+                                {
+                                    "id": "motion",
+                                    "rule_ids": ["r1", "unknown"],
+                                    "rule_groups": [
+                                        {"id": "valid", "rule_ids": ["r1"]},
+                                        {"id": "stale", "rule_ids": ["unknown"]},
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        }
+
+        matcher = UnifiedSemanticMatcher(model="fake-model", client=_FakeClient([]))
+        domains = matcher._build_domain_candidates(catalog)
+        self.assertEqual([item["domain"] for item in domains], ["Mechanics"])
+        topics = matcher._build_topic_candidates(catalog, ["Mechanics"])
+        self.assertEqual([item["topic"] for item in topics], ["Kinematics"])
+        self.assertEqual(
+            [item["cluster_id"] for item in topics[0]["cluster_previews"]],
+            ["motion"],
+        )
+        clusters = matcher._build_cluster_candidates(topics[0])
+        self.assertEqual([item["cluster_id"] for item in clusters], ["motion"])
+        self.assertEqual(clusters[0]["rule_ids"], ["r1"])
+        self.assertEqual(
+            [group["group_id"] for group in clusters[0]["rule_groups"]],
+            ["valid"],
+        )
 
     def test_large_rule_candidates_are_split_by_character_budget(self) -> None:
         rules = [

@@ -335,7 +335,7 @@ class RuleRuntimeMetadataTests(unittest.TestCase):
                             "name": "Gravitation and Kepler's Laws",
                             "includes": ["satellite orbital decay"],
                             "excludes": ["electric circuit"],
-                            "rules": [],
+                            "rules": [{"rule_id": "orbit_check"}],
                         }
                     ],
                 }
@@ -350,6 +350,26 @@ class RuleRuntimeMetadataTests(unittest.TestCase):
         self.assertIn("satellite orbital decay", hit["evidence"]["include_hits"])
         self.assertIn("electric circuit", excluded["evidence"]["exclude_hits"])
         self.assertGreater(hit["score"], excluded["score"])
+
+    def test_topic_candidates_exclude_topics_without_executable_rules(self) -> None:
+        catalog = {
+            "domains": [
+                {
+                    "name": "Mechanics",
+                    "topics": [
+                        {"name": "Empty", "rules": []},
+                        {
+                            "name": "Kinematics",
+                            "rules": [{"rule_id": "motion_check"}],
+                        },
+                    ],
+                }
+            ]
+        }
+
+        candidates = build_topic_candidates(catalog)
+
+        self.assertEqual([item["topic"] for item in candidates], ["Kinematics"])
 
     def test_rule_precision_fields_affect_retrieval_evidence(self) -> None:
         rule = {
