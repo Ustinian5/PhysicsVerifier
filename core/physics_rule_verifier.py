@@ -3,6 +3,7 @@
 实现类 `PhysicsRuleVerifier` 串联 `core/rule_catalog_retrieval.py`（候选主题/规则检索）、
 `core/semantic_rule_checker.py`（LLM+SRD 语义检查）、`rules/symbolic_checks.py` 与
 `symbolic/`（符号执行与目录）。"""
+import copy
 import json
 import datetime
 import inspect
@@ -44,6 +45,9 @@ class PhysicsRuleVerifier:
     # noisy "missing required symbol" signal does not cause unintended recall
     # regressions; users can opt-in to a stricter threshold via CLI.
     DEFAULT_QUOTE_REQUIRED_SYMBOL_RATIO = 0.0
+    # Fixed before P2 effect testing. It matches the historical prompt's
+    # conservative 80% publication requirement and is not sample-tuned.
+    CHECKER_MIN_CONFIDENCE = 0.8
 
     def __init__(
         self,
@@ -68,6 +72,8 @@ class PhysicsRuleVerifier:
         semantic_matcher: Optional[Any] = None,
         semantic_json_attempts: Optional[int] = None,
         semantic_output_adapter: Optional[str] = None,
+        checker_gate_mode: str = "legacy",
+        checker_json_attempts: Optional[int] = None,
         # Legacy kwargs (accepted for backward compatibility, ignored).
         enable_agentic_postcheck: Optional[bool] = None,
         agentic_max_checks_per_sample: Optional[int] = None,
@@ -144,6 +150,20 @@ class PhysicsRuleVerifier:
             self.semantic_json_attempts = int(semantic_json_attempts)
             if self.semantic_json_attempts < 1:
                 raise ValueError("semantic_json_attempts must be at least 1")
+        self.checker_gate_mode = str(checker_gate_mode or "legacy").strip().lower()
+        if self.checker_gate_mode not in {
+            "legacy",
+            "dual_evidence",
+            "dual_evidence_consistency",
+        }:
+            raise ValueError(
+                "checker_gate_mode must be 'legacy', 'dual_evidence', "
+                "or 'dual_evidence_consistency'"
+            )
+        self.checker_json_attempts = 1 if checker_json_attempts is None else int(checker_json_attempts)
+        if not 1 <= self.checker_json_attempts <= 5:
+            raise ValueError("checker_json_attempts must be between 1 and 5")
+        self.checker_min_confidence = float(self.CHECKER_MIN_CONFIDENCE)
         self.log_dir = Path(log_dir)
         self.results_dir = Path(results_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -185,6 +205,9 @@ class PhysicsRuleVerifier:
             rule_mode='srd', # We will inject SRDs dynamically
             rule_translations_path="rule_translations.json", # Dummy path, we'll overwrite
             enable_cache=self.enable_llm_cache,
+            checker_mode=self.checker_gate_mode,
+            checker_json_attempts=self.checker_json_attempts,
+            checker_min_confidence=self.checker_min_confidence,
         )
         # Clear initial translations as we will set them per request
         self.semantic_checker.rule_translations = {} 
@@ -257,9 +280,14 @@ class PhysicsRuleVerifier:
                 continue
             rid = str(d.get("rule") or "")
             record = record_by_rule.get(rid) if isinstance(record_by_rule.get(rid), dict) else {}
-            if str(record.get("retrieval_strategy") or "") == "semantic_tree_selection":
-                # The semantic tree has already made the applicability decision.
-                # Final quote/metadata/symbolic gates still run below.
+            if str(record.get("retrieval_strategy") or "") in {
+                "semantic_tree_selection",
+                "target_rule_binding",
+            }:
+                # The semantic tree or an explicitly declared controlled target
+                # binding has already selected this candidate. Final
+                # quote/metadata/symbolic gates still run below; target binding
+                # is not relabeled as semantic retrieval.
                 kept.append(d)
                 continue
             rule_score = float(record.get("score") or 0.0)
@@ -310,11 +338,25 @@ class PhysicsRuleVerifier:
         rule_record: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
         reasons: List[str] = []
+        if self.checker_gate_mode != "legacy":
+            checker_gate = (
+                diagnostic.get("checker_evidence_gate")
+                if isinstance(diagnostic.get("checker_evidence_gate"), dict)
+                else {}
+            )
+            if checker_gate.get("passed") is not True:
+                reasons.append("checker_evidence_gate_failed")
+            diagnostic_mode = str(diagnostic.get("checker_gate_mode") or "").strip().lower()
+            if diagnostic_mode != self.checker_gate_mode:
+                reasons.append("checker_gate_mode_mismatch")
         severity = str(diagnostic.get("severity") or "").strip().lower()
         allowed_severities = {"error", "warning"} if self.precision_mode == "balanced" else {"error"}
         if severity not in allowed_severities:
             reasons.append("severity_not_error")
-        if self.semantic_checker._is_negative_or_uncertain_diagnostic(diagnostic):
+        if (
+            self.checker_gate_mode == "legacy"
+            and self.semantic_checker._is_negative_or_uncertain_diagnostic(diagnostic)
+        ):
             reasons.append("negative_or_uncertain_diagnostic")
 
         evidence = diagnostic.get("evidence") if isinstance(diagnostic.get("evidence"), dict) else {}
@@ -324,20 +366,25 @@ class PhysicsRuleVerifier:
             reasons.append("missing_quote")
         if not bool(loc.get("locatable_valid")):
             reasons.append("unlocatable_quote")
+        if loc.get("span_ambiguous") is True:
+            reasons.append("ambiguous_quote_without_verified_span")
 
         publish_gate = rule_record.get("publish_gate") if isinstance(rule_record, dict) else None
         if isinstance(publish_gate, dict):
-            if not bool(publish_gate.get("publishable")):
+            if publish_gate.get("publishable") is not True:
                 reasons.extend(str(r) for r in (publish_gate.get("reasons") or []))
+                if not publish_gate.get("reasons"):
+                    reasons.append("rule_publish_gate_not_exact_true")
         else:
             reasons.append("missing_rule_publish_gate")
 
         rule = rule_record.get("rule") if isinstance(rule_record, dict) and isinstance(rule_record.get("rule"), dict) else {}
         precision = self._rule_precision_metadata(rule)
+        metadata_hard_gate = self.checker_gate_mode == "legacy"
         evidence_requirement_hits = self._match_text_list(precision["evidence_requirements"], quote)
-        if precision["evidence_requirements"] and not evidence_requirement_hits:
+        if metadata_hard_gate and precision["evidence_requirements"] and not evidence_requirement_hits:
             reasons.append("missing_required_evidence")
-        if self._match_text_list(precision["negative_conditions"], quote):
+        if metadata_hard_gate and self._match_text_list(precision["negative_conditions"], quote):
             reasons.append("quote_hits_negative_condition")
 
         recon = diagnostic.get("symbolic_reconciliation") if isinstance(diagnostic.get("symbolic_reconciliation"), dict) else {}
@@ -348,16 +395,27 @@ class PhysicsRuleVerifier:
             min_score = float(self.min_diagnostic_rule_score)
         score = float((rule_record or {}).get("score") or 0.0)
         topic_rank = int((rule_record or {}).get("topic_rank") or 0)
-        semantic_scale = str((publish_gate or {}).get("score_kind") or "") == "semantic_0_1"
-        inconclusive_bonus = 0.15 if semantic_scale else self.STRICT_RELEASE_INCONCLUSIVE_SCORE_BONUS
-        secondary_topic_bonus = 0.10 if semantic_scale else 1.0
+        score_kind = str((publish_gate or {}).get("score_kind") or "")
+        normalized_selection_scale = score_kind in {
+            "semantic_0_1",
+            "fixed_control_0_1",
+        }
+        inconclusive_bonus = (
+            0.15
+            if normalized_selection_scale
+            else self.STRICT_RELEASE_INCONCLUSIVE_SCORE_BONUS
+        )
+        secondary_topic_bonus = 0.10 if normalized_selection_scale else 1.0
         if symbolic_status in {"supported", "quote_overlap"}:
             # Either the canonical-missing primitive triggered (fail-as-supported)
             # or the diagnostic's quote sits on top of the canonical pattern;
             # both indicate the LLM critique is plausibly grounded.
             pass
         elif symbolic_status == "inconclusive":
-            if precision["symbolic_policy"] in {"require_fail", "suppress_on_inconclusive"}:
+            if metadata_hard_gate and precision["symbolic_policy"] in {
+                "require_fail",
+                "suppress_on_inconclusive",
+            }:
                 reasons.append("symbolic_inconclusive_suppressed")
             elif self.precision_mode == "strict" and score < (min_score + inconclusive_bonus):
                 reasons.append("symbolic_inconclusive_below_strict_score")
@@ -365,7 +423,11 @@ class PhysicsRuleVerifier:
                 min_score + inconclusive_bonus + secondary_topic_bonus
             ):
                 reasons.append("symbolic_inconclusive_secondary_topic_below_score")
-        elif precision["symbolic_policy"] == "require_fail" and diagnostic.get("symbolic_cross_checks"):
+        elif (
+            metadata_hard_gate
+            and precision["symbolic_policy"] == "require_fail"
+            and diagnostic.get("symbolic_cross_checks")
+        ):
             reasons.append("symbolic_fail_required")
 
         # Quote-level required-symbol overlap: if the rule's symbolic hint specifies which
@@ -390,6 +452,7 @@ class PhysicsRuleVerifier:
             "min_publish_score": min_score,
             "score_kind": str((publish_gate or {}).get("score_kind") or "lexical"),
             "symbolic_status": symbolic_status or "none",
+            "metadata_hard_gate_enabled": metadata_hard_gate,
             "evidence_requirement_hits": evidence_requirement_hits,
             "quote_symbol_hits": quote_symbol_hits,
             "quote_symbol_ratio": round(quote_symbol_ratio, 4),
@@ -1606,6 +1669,10 @@ JSON Output:
         experience_code_post_diagnostics: List[Dict[str, Any]] = []
         experience_post_diagnostics: List[Dict[str, Any]] = []
         candidate_diagnostics: List[Dict[str, Any]] = []
+        checker_decisions: List[Dict[str, Any]] = []
+        checker_failures: List[Dict[str, Any]] = []
+        checker_suppressed_diagnostics: List[Dict[str, Any]] = []
+        checker_status = "not_run"
 
         selected_rule_records: List[Dict[str, Any]] = []
         semantic_rule_records: List[Dict[str, Any]] = []
@@ -1692,11 +1759,11 @@ JSON Output:
 
             semantic_rule_records = [
                 item for item in selected_rule_records
-                if bool((item.get("publish_gate") or {}).get("publishable"))
+                if (item.get("publish_gate") or {}).get("publishable") is True
             ]
             for item in selected_rule_records:
                 gate = item.get("publish_gate") if isinstance(item.get("publish_gate"), dict) else {}
-                if gate and not bool(gate.get("publishable")):
+                if gate and gate.get("publishable") is not True:
                     suppressed_diagnostics.append(
                         {
                             "reason": "rule_publish_gate_precheck",
@@ -1720,8 +1787,13 @@ JSON Output:
                 self.semantic_checker.rule_translations = current_translations
                 print(f"Running unified v2 rule check with {len(rule_ids)} rules...")
                 result = self.semantic_checker.analyze(verification_sample)
-                diagnostics = result.get("diagnostics", [])
-                candidate_diagnostics = list(diagnostics)
+                diagnostics = list(result.get("diagnostics", []) or [])
+                candidate_diagnostics = copy.deepcopy(diagnostics)
+                checker_decisions = list(result.get("checker_decisions", []) or [])
+                checker_failures = list(result.get("checker_failures", []) or [])
+                checker_suppressed_diagnostics = list(result.get("checker_suppressed", []) or [])
+                checker_status = str(result.get("checker_status") or "complete")
+                suppressed_diagnostics.extend(checker_suppressed_diagnostics)
                 diagnostics, low_conf_suppressed = self._filter_low_confidence_unified_diagnostics(
                     diagnostics,
                     semantic_rule_records,
@@ -1731,6 +1803,7 @@ JSON Output:
             else:
                 self.semantic_checker.rules_to_check = []
                 self.semantic_checker.rule_translations = {}
+                checker_status = "complete_no_rules"
         else:
             # 1. Classify
             topic = self.classify_topic(question)
@@ -1760,11 +1833,26 @@ JSON Output:
                     # 3. Run Rule Check
                     print(f"Running rule check with {len(rule_ids)} rules...")
                     result = self.semantic_checker.analyze(verification_sample)
-                    diagnostics = result.get("diagnostics", [])
+                    diagnostics = list(result.get("diagnostics", []) or [])
+                    candidate_diagnostics = copy.deepcopy(diagnostics)
+                    checker_decisions = list(result.get("checker_decisions", []) or [])
+                    checker_failures = list(result.get("checker_failures", []) or [])
+                    checker_suppressed_diagnostics = list(result.get("checker_suppressed", []) or [])
+                    checker_status = str(result.get("checker_status") or "complete")
+                    suppressed_diagnostics.extend(checker_suppressed_diagnostics)
                     used_rules = rule_ids
                     verifier_used = "top_down_rule_based" if not self._unified_mode else "unified_rule_based"
             else:
                 print("Could not classify topic or no topic found.")
+
+            if checker_status == "not_run":
+                # A successful classification path can legitimately yield no
+                # executable rule (empty topic, missing rule IDs, or unusable
+                # translations). Keep that distinct from a Checker failure so
+                # coverage accounting does not turn it into a transport error.
+                self.semantic_checker.rules_to_check = []
+                self.semantic_checker.rule_translations = {}
+                checker_status = "complete_no_rules"
 
         # Build the lookup from rule id -> rule dict + topic for downstream
         # release-gate metadata. The symbolic check now runs deterministic
@@ -2147,6 +2235,12 @@ JSON Output:
                     # protect precision but keep the audit record above.
                     payload["publish_skipped"] = "non_locatable"
                     continue
+                if self.checker_gate_mode != "legacy":
+                    # Bottom-up code has answer-side evidence only. It cannot
+                    # satisfy the source-isolated problem-side applicability
+                    # proof required by the dual-evidence protocols.
+                    payload["publish_skipped"] = "missing_checker_double_evidence"
+                    continue
                 experience_post_diagnostics.append(
                     {
                         "severity": "warning",
@@ -2167,8 +2261,19 @@ JSON Output:
                     }
                 )
 
-            if experience_post_diagnostics:
+            if experience_post_diagnostics and self.checker_gate_mode == "legacy":
                 diagnostics.extend(experience_post_diagnostics)
+            elif experience_post_diagnostics:
+                for diagnostic in experience_post_diagnostics:
+                    suppressed_diagnostics.append(
+                        {
+                            "reason": "bottom_up_missing_checker_double_evidence",
+                            "rule_id": str(
+                                (diagnostic.get("experience_code") or {}).get("rule_id") or ""
+                            ),
+                            "original_diagnostic": diagnostic,
+                        }
+                    )
 
         return {
             "id": sample.get("id"),
@@ -2194,6 +2299,12 @@ JSON Output:
             "retrieved_topics": retrieved_topics_payload,
             "retrieved_clusters": retrieved_clusters_payload,
             "retrieved_rules": retrieved_rules_payload,
+            "checker_gate_mode": self.checker_gate_mode,
+            "checker_min_confidence": self.checker_min_confidence,
+            "checker_status": checker_status,
+            "checker_decisions": checker_decisions,
+            "checker_failures": checker_failures,
+            "checker_suppressed_diagnostics": checker_suppressed_diagnostics,
             "candidate_diagnostics": candidate_diagnostics,
             "diagnostics": diagnostics,
             "symbolic_post_diagnostics": list(experience_code_post_diagnostics),

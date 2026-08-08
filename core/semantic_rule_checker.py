@@ -17,6 +17,7 @@ import ast
 import re
 import json
 import hashlib
+import math
 import os
 import tempfile
 import datetime
@@ -37,7 +38,7 @@ except ImportError:
     openai = None
 
 
-SEMANTIC_RULE_CHECKER_PROMPT_VERSION = "semantic-rule-checker-applicability-v1"
+SEMANTIC_RULE_CHECKER_PROMPT_VERSION = "semantic-rule-checker-dual-evidence-v1"
 
 
 # ------------------------- 符号节点网络 (保持不变) -------------------------
@@ -173,6 +174,28 @@ def _load_rule_class(spec: str):
 
 # ------------------------- 主检查器实现 (重构) -------------------------
 class SemanticRuleChecker:
+    CHECKER_MODE_LEGACY = "legacy"
+    CHECKER_MODE_DUAL_EVIDENCE = "dual_evidence"
+    CHECKER_MODE_DUAL_EVIDENCE_CONSISTENCY = "dual_evidence_consistency"
+    CHECKER_MODES = frozenset(
+        {
+            CHECKER_MODE_LEGACY,
+            CHECKER_MODE_DUAL_EVIDENCE,
+            CHECKER_MODE_DUAL_EVIDENCE_CONSISTENCY,
+        }
+    )
+    DUAL_EVIDENCE_SCHEMA_VERSION = "semantic-rule-checker-dual-evidence-v1"
+    _DUAL_ROOT_STATUSES = frozenset({"violation", "no_violation", "abstain"})
+    _DUAL_SEVERITIES = frozenset({"error", "warning"})
+    _DUAL_EVIDENCE_SOURCES = frozenset({"question", "context", "prediction"})
+    _DUAL_CONSISTENCY_STATUSES = frozenset(
+        {
+            "confirmed_violation",
+            "self_corrected",
+            "equivalent_or_alternative",
+            "uncertain",
+        }
+    )
     _NEGATIVE_DIAGNOSTIC_PATTERNS = (
         r"\bno violation\b",
         r"\bnot triggered\b",
@@ -196,6 +219,32 @@ class SemanticRuleChecker:
         r"证据不足",
         r"条件不足",
     )
+    # These patterns are intentionally consistency-only. Adding them to the
+    # historical negative-diagnostic filter would silently change the legacy
+    # and dual-evidence arms, and scanning the student's quote would invert a
+    # real error such as an unsupported claim that a derivation is correct.
+    _CONSISTENCY_REASON_REJECTION_PATTERNS = (
+        r"\b(?:the\s+)?(?:derivation|expression|reasoning|solution|method|formulation)\s+"
+        r"(?:is|was|remains)\s+(?:physically\s+)?(?:correct|valid)\b",
+        r"\b(?:the\s+)?(?:quoted\s+)?(?:claim|derivation|expression|reasoning|solution|method|formulation)\s+"
+        r"(?:is|was|remains)\s+(?:physically\s+)?equivalent\b",
+        r"\b(?:the\s+)?(?:derivation|expression|reasoning|solution|method|formulation)\s+"
+        r"(?:is|was)\s+(?:a\s+)?valid alternative\b",
+        r"\b(?:the\s+)?(?:student|submission)\s+"
+        r"(?:later|subsequently|then|explicitly)\s+"
+        r"(?:corrected|withdrew|retracted)\b",
+        r"\b(?:the\s+)?(?:quoted\s+)?(?:claim|error|statement|assertion)\s+"
+        r"(?:was|has been)\s+(?:already\s+)?(?:corrected|withdrawn|retracted)\b",
+        r"(?:该|此)?(?:推导|表达|解法|方法)(?:是|为)(?:物理上)?(?:正确|等价)",
+        r"(?:该|此)?(?:推导|表达|解法|方法)(?:是|为)?有效的?替代(?:方案|解法|方法)?",
+        r"(?:学生|作答)(?:随后|之后|后来)(?:已经|已)?(?:修正|撤回|更正)",
+        r"(?:该|此)?(?:说法|错误|陈述)(?:已经|已)(?:明确)?(?:修正|撤回|更正)",
+    )
+    _CONSISTENCY_REASON_REFUTATION_SUFFIX = re.compile(
+        r"^\s*(?:itself\s+)?(?:is|was|would be|remains)?\s*"
+        r"(?:false|wrong|incorrect|rejected|not true|unsupported)\b",
+        flags=re.I,
+    )
 
     def __init__(self, llm_model: Optional[str] = None, max_llm_calls: int = 0, logger=None,
                  enable_cache: bool = True, llm_temperature: float = 0.1,
@@ -204,7 +253,10 @@ class SemanticRuleChecker:
                  rule_translations_path: str = "rule_translations.json",
                  llm_symbol_extraction: bool = False,
                  rule_mode: str = 'srd',
-                 use_symbol_graph: bool = True) -> None:
+                 use_symbol_graph: bool = True,
+                 checker_mode: str = "legacy",
+                 checker_json_attempts: int = 2,
+                 checker_min_confidence: float = 0.8) -> None:
         self.llm_model = llm_model
         self.max_llm_calls = int(max_llm_calls)
         self.logger = logger
@@ -215,6 +267,21 @@ class SemanticRuleChecker:
         self.llm_symbol_extraction = bool(llm_symbol_extraction)
         self.use_symbol_graph = bool(use_symbol_graph)
         self.rule_mode = rule_mode
+        self.checker_mode = str(checker_mode or self.CHECKER_MODE_LEGACY).strip().lower()
+        if self.checker_mode not in self.CHECKER_MODES:
+            raise ValueError(
+                "checker_mode must be one of: " + ", ".join(sorted(self.CHECKER_MODES))
+            )
+        if isinstance(checker_json_attempts, bool):
+            raise ValueError("checker_json_attempts must be an integer between 1 and 5")
+        self.checker_json_attempts = int(checker_json_attempts)
+        if not 1 <= self.checker_json_attempts <= 5:
+            raise ValueError("checker_json_attempts must be an integer between 1 and 5")
+        if isinstance(checker_min_confidence, bool):
+            raise ValueError("checker_min_confidence must be between 0.0 and 1.0")
+        self.checker_min_confidence = float(checker_min_confidence)
+        if not math.isfinite(self.checker_min_confidence) or not 0.0 <= self.checker_min_confidence <= 1.0:
+            raise ValueError("checker_min_confidence must be between 0.0 and 1.0")
         self.llm_trace_path = str(os.getenv("PHYSICSVERIFIER_LLM_TRACE_PATH") or "").strip()
         self.llm_trace_include_prompts = str(os.getenv("PHYSICSVERIFIER_LLM_TRACE_INCLUDE_PROMPTS") or "").strip().lower() in {"1", "true", "yes"}
         self._http_llm_enabled = False
@@ -327,6 +394,20 @@ class SemanticRuleChecker:
         except Exception:
             pass
 
+    def _cache_delete(self, namespace: str, payload: Any) -> None:
+        if not self.enable_cache:
+            return
+        key = f"{namespace}:{self._cache_key(payload)}"
+        if key not in self._cache:
+            return
+        self._cache.pop(key, None)
+        try:
+            with tempfile.NamedTemporaryFile("w", delete=False, dir=self._cache_path.parent, encoding="utf-8") as f:
+                json.dump(self._cache, f, ensure_ascii=False, indent=None)
+            os.replace(f.name, str(self._cache_path))
+        except Exception:
+            pass
+
     def _llm_available(self) -> bool:
         if self._llm is None and not self._http_llm_enabled:
             return False
@@ -373,14 +454,70 @@ class SemanticRuleChecker:
         except Exception:
             pass
 
-    def _llm_json(self, system_prompt: str, user_prompt: str, fallback=None, trace_meta: Optional[Dict[str, Any]] = None) -> Any:
+    def _llm_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        fallback=None,
+        trace_meta: Optional[Dict[str, Any]] = None,
+        return_meta: bool = False,
+        json_validator: Optional[Any] = None,
+    ) -> Any:
+        fallback_value = fallback if fallback is not None else []
+
+        def _result(
+            *,
+            ok: bool,
+            status: str,
+            data: Any,
+            errors: Optional[List[str]] = None,
+            cache_hit: bool = False,
+            attempt_count: int = 1,
+        ) -> Any:
+            if not return_meta:
+                return data
+            return {
+                "ok": bool(ok),
+                "status": status,
+                "data": data,
+                "errors": list(errors or []),
+                "cache_hit": bool(cache_hit),
+                "attempt_count": int(attempt_count),
+            }
+
         if not self._llm_available():
-            return fallback if fallback is not None else []
-        
-        payload = {"system": system_prompt, "user": user_prompt, "model": self.llm_model}
+            return _result(
+                ok=False,
+                status="transport_failure",
+                data=fallback_value,
+                errors=["llm_unavailable_or_budget_exhausted"],
+                attempt_count=0,
+            )
+
+        payload = {
+            "prompt_version": SEMANTIC_RULE_CHECKER_PROMPT_VERSION,
+            "checker_mode": self.checker_mode,
+            "system": system_prompt,
+            "user": user_prompt,
+            "model": self.llm_model,
+            "temperature": self.llm_temperature,
+            "max_output_tokens": self.llm_max_output_tokens,
+            "retry_policy": "generic_error_category_v1",
+        }
         cached = self._cache_get("llm_json", payload)
         if cached is not None:
-            return cached
+            cache_validation_errors = (
+                list(json_validator(cached) or []) if json_validator is not None else []
+            )
+            if not cache_validation_errors:
+                return _result(
+                    ok=True,
+                    status="valid_json",
+                    data=cached,
+                    cache_hit=True,
+                    attempt_count=0,
+                )
+            self._cache_delete("llm_json", payload)
 
         try:
             messages = [
@@ -407,6 +544,7 @@ class SemanticRuleChecker:
             trace_record = {
                 "ts": datetime.datetime.now().isoformat(),
                 "model": self.llm_model,
+                "checker_mode": self.checker_mode,
                 "trace_meta": trace_meta or {},
                 "raw_response": resp,
                 "raw_len": len(str(resp or "")),
@@ -419,35 +557,458 @@ class SemanticRuleChecker:
             # A regex search is kept as a fallback for models that might wrap the JSON in text.
             try:
                 data = json.loads(resp)
+                validation_errors = list(json_validator(data) or []) if json_validator is not None else []
+                if validation_errors:
+                    trace_record["parse_status"] = "schema_failure"
+                    trace_record["schema_errors"] = validation_errors
+                    self._append_llm_trace(trace_record)
+                    return _result(
+                        ok=False,
+                        status="schema_failure",
+                        data=fallback_value,
+                        errors=validation_errors,
+                    )
                 trace_record["parse_status"] = "json.loads_ok"
                 self._append_llm_trace(trace_record)
                 self._cache_set("llm_json", payload, data)
-                return data
-            except json.JSONDecodeError:
-                match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", resp)
+                return _result(ok=True, status="valid_json", data=data)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", str(resp or ""))
                 if match:
-                    data = json.loads(match.group(1))
-                    trace_record["parse_status"] = "regex_extract_ok"
-                    self._append_llm_trace(trace_record)
-                    self._cache_set("llm_json", payload, data)
-                    return data
+                    try:
+                        data = json.loads(match.group(1))
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        data = None
+                    else:
+                        validation_errors = (
+                            list(json_validator(data) or []) if json_validator is not None else []
+                        )
+                        if validation_errors:
+                            trace_record["parse_status"] = "schema_failure"
+                            trace_record["schema_errors"] = validation_errors
+                            self._append_llm_trace(trace_record)
+                            return _result(
+                                ok=False,
+                                status="schema_failure",
+                                data=fallback_value,
+                                errors=validation_errors,
+                            )
+                        trace_record["parse_status"] = "regex_extract_ok"
+                        self._append_llm_trace(trace_record)
+                        self._cache_set("llm_json", payload, data)
+                        return _result(ok=True, status="valid_json", data=data)
             
             trace_record["parse_status"] = "parse_failed"
             self._append_llm_trace(trace_record)
             self._log(f"LLM response could not be parsed as JSON: {resp}")
-            return fallback if fallback is not None else []
+            return _result(
+                ok=False,
+                status="parse_failure",
+                data=fallback_value,
+                errors=["response_is_not_valid_json"],
+            )
         except Exception as e:
             self._append_llm_trace(
                 {
                     "ts": datetime.datetime.now().isoformat(),
                     "model": self.llm_model,
+                    "checker_mode": self.checker_mode,
                     "trace_meta": trace_meta or {},
                     "parse_status": "exception",
                     "exception": f"{type(e).__name__}: {e}",
                 }
             )
             self._log(f"LLM call failed: {e}")
-            return fallback if fallback is not None else []
+            return _result(
+                ok=False,
+                status="transport_failure",
+                data=fallback_value,
+                errors=[f"{type(e).__name__}: {e}"],
+            )
+
+    def _request_json_object_text(self, system_prompt: str, user_prompt: str) -> str:
+        """Request one raw JSON-object response for the strict checker modes.
+
+        This deliberately does not share the legacy parser: a transport failure,
+        malformed JSON, and a schema failure must remain distinguishable from a
+        valid response whose ``diagnostics`` list is empty.
+        """
+        if not self._llm_available():
+            raise RuntimeError("LLM is unavailable or the call budget is exhausted")
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        # Count attempted calls, including failed transports, so a failing endpoint
+        # cannot bypass ``max_llm_calls`` through retries.
+        self._llm_calls_used += 1
+        if self._llm is not None:
+            response = self._llm.chat.completions.create(
+                model=self.llm_model,
+                messages=messages,
+                temperature=self.llm_temperature,
+                max_tokens=self.llm_max_output_tokens,
+                response_format={"type": "json_object"},
+                timeout=self.llm_timeout_sec,
+                **_openai_disable_thinking_kwargs(),
+            )
+            return str(response.choices[0].message.content or "")
+        return self._llm_json_http(messages)
+
+    @staticmethod
+    def _strict_json_object_pairs(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for key, value in pairs:
+            if key in out:
+                raise ValueError(f"duplicate JSON key: {key}")
+            out[key] = value
+        return out
+
+    @staticmethod
+    def _reject_nonfinite_json_constant(value: str) -> Any:
+        raise ValueError(f"non-finite JSON number: {value}")
+
+    @staticmethod
+    def _is_strict_number(value: Any) -> bool:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return False
+        try:
+            return math.isfinite(float(value))
+        except (OverflowError, TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _exact_key_errors(value: Dict[str, Any], expected: Set[str], path: str) -> List[str]:
+        actual = set(value.keys())
+        errors: List[str] = []
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        if missing:
+            errors.append(f"{path}:missing_keys:{','.join(missing)}")
+        if extra:
+            errors.append(f"{path}:unexpected_keys:{','.join(extra)}")
+        return errors
+
+    def _validate_dual_evidence_schema(
+        self,
+        payload: Any,
+        *,
+        expected_rule_id: str,
+    ) -> List[str]:
+        """Validate the exact, single-object dual-evidence wire schema."""
+        if not isinstance(payload, dict):
+            return ["root:expected_object"]
+
+        errors = self._exact_key_errors(
+            payload,
+            {"schema_version", "rule_id", "status", "applicability", "diagnostics"},
+            "root",
+        )
+        if payload.get("schema_version") != self.DUAL_EVIDENCE_SCHEMA_VERSION:
+            errors.append("root:invalid_schema_version")
+        if not isinstance(payload.get("rule_id"), str) or payload.get("rule_id") != expected_rule_id:
+            errors.append("root:rule_id_mismatch")
+        status = payload.get("status")
+        if not isinstance(status, str) or status not in self._DUAL_ROOT_STATUSES:
+            errors.append("root:invalid_status")
+
+        def _validate_confidence(value: Any, path: str) -> None:
+            if not self._is_strict_number(value) or not 0.0 <= float(value) <= 1.0:
+                errors.append(f"{path}:invalid_confidence")
+
+        def _validate_evidence_list(
+            value: Any,
+            path: str,
+            *,
+            allowed_sources: Set[str],
+        ) -> None:
+            if not isinstance(value, list):
+                errors.append(f"{path}:expected_list")
+                return
+            for index, evidence in enumerate(value):
+                item_path = f"{path}[{index}]"
+                if not isinstance(evidence, dict):
+                    errors.append(f"{item_path}:expected_object")
+                    continue
+                errors.extend(
+                    self._exact_key_errors(evidence, {"source", "quote", "location"}, item_path)
+                )
+                source = evidence.get("source")
+                if not isinstance(source, str) or source not in self._DUAL_EVIDENCE_SOURCES:
+                    errors.append(f"{item_path}:invalid_source")
+                elif source not in allowed_sources:
+                    errors.append(f"{item_path}:wrong_source_for_role")
+                quote = evidence.get("quote")
+                if not isinstance(quote, str) or not quote.strip():
+                    errors.append(f"{item_path}:invalid_quote")
+                location = evidence.get("location")
+                if not isinstance(location, dict):
+                    errors.append(f"{item_path}.location:expected_object")
+                    continue
+                errors.extend(
+                    self._exact_key_errors(location, {"start_char", "end_char"}, f"{item_path}.location")
+                )
+                for field_name in ("start_char", "end_char"):
+                    field_value = location.get(field_name)
+                    if not isinstance(field_value, int) or isinstance(field_value, bool):
+                        errors.append(f"{item_path}.location:{field_name}_must_be_integer")
+
+        applicability = payload.get("applicability")
+        if not isinstance(applicability, dict):
+            errors.append("applicability:expected_object")
+        else:
+            errors.extend(
+                self._exact_key_errors(
+                    applicability,
+                    {"applies", "confidence", "evidence"},
+                    "applicability",
+                )
+            )
+            if type(applicability.get("applies")) is not bool:
+                errors.append("applicability:applies_must_be_boolean")
+            _validate_confidence(applicability.get("confidence"), "applicability")
+            _validate_evidence_list(
+                applicability.get("evidence"),
+                "applicability.evidence",
+                allowed_sources={"question", "context"},
+            )
+
+        diagnostics = payload.get("diagnostics")
+        if not isinstance(diagnostics, list):
+            errors.append("diagnostics:expected_list")
+            diagnostics = []
+        elif status in {"no_violation", "abstain"} and diagnostics:
+            errors.append("diagnostics:must_be_empty_for_non_violation_status")
+        elif status == "violation" and not diagnostics:
+            errors.append("diagnostics:required_for_violation_status")
+
+        diagnostic_keys = {"severity", "symbol", "message", "violation"}
+        consistency_required = self.checker_mode == self.CHECKER_MODE_DUAL_EVIDENCE_CONSISTENCY
+        if consistency_required:
+            diagnostic_keys.add("consistency")
+
+        for index, diagnostic in enumerate(diagnostics):
+            path = f"diagnostics[{index}]"
+            if not isinstance(diagnostic, dict):
+                errors.append(f"{path}:expected_object")
+                continue
+            errors.extend(self._exact_key_errors(diagnostic, diagnostic_keys, path))
+            severity = diagnostic.get("severity")
+            if not isinstance(severity, str) or severity not in self._DUAL_SEVERITIES:
+                errors.append(f"{path}:invalid_severity")
+            symbol = diagnostic.get("symbol")
+            if symbol is not None and not isinstance(symbol, str):
+                errors.append(f"{path}:symbol_must_be_string_or_null")
+            message = diagnostic.get("message")
+            if not isinstance(message, str) or not message.strip():
+                errors.append(f"{path}:invalid_message")
+
+            violation = diagnostic.get("violation")
+            if not isinstance(violation, dict):
+                errors.append(f"{path}.violation:expected_object")
+            else:
+                errors.extend(
+                    self._exact_key_errors(
+                        violation,
+                        {"present", "confidence", "evidence"},
+                        f"{path}.violation",
+                    )
+                )
+                if type(violation.get("present")) is not bool:
+                    errors.append(f"{path}.violation:present_must_be_boolean")
+                _validate_confidence(violation.get("confidence"), f"{path}.violation")
+                _validate_evidence_list(
+                    violation.get("evidence"),
+                    f"{path}.violation.evidence",
+                    allowed_sources={"prediction"},
+                )
+
+            if consistency_required:
+                consistency = diagnostic.get("consistency")
+                if not isinstance(consistency, dict):
+                    errors.append(f"{path}.consistency:expected_object")
+                else:
+                    errors.extend(
+                        self._exact_key_errors(
+                            consistency,
+                            {"status", "confidence", "reason"},
+                            f"{path}.consistency",
+                        )
+                    )
+                    consistency_status = consistency.get("status")
+                    if (
+                        not isinstance(consistency_status, str)
+                        or consistency_status not in self._DUAL_CONSISTENCY_STATUSES
+                    ):
+                        errors.append(f"{path}.consistency:invalid_status")
+                    _validate_confidence(consistency.get("confidence"), f"{path}.consistency")
+                    reason = consistency.get("reason")
+                    if not isinstance(reason, str) or not reason.strip():
+                        errors.append(f"{path}.consistency:reason_must_be_nonempty_string")
+        return errors
+
+    def _call_dual_evidence_json_object(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        expected_rule_id: str,
+        trace_meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Return a validated object or an explicit transport/parse/schema failure."""
+        cache_payload = {
+            "prompt_version": SEMANTIC_RULE_CHECKER_PROMPT_VERSION,
+            "schema_version": self.DUAL_EVIDENCE_SCHEMA_VERSION,
+            "checker_mode": self.checker_mode,
+            "system": system_prompt,
+            "user": user_prompt,
+            "model": self.llm_model,
+            "temperature": self.llm_temperature,
+            "max_output_tokens": self.llm_max_output_tokens,
+            "retry_policy": "generic_error_category_v1",
+        }
+        cached = self._cache_get("dual_evidence_json_object", cache_payload)
+        if cached is not None:
+            cache_errors = self._validate_dual_evidence_schema(
+                cached,
+                expected_rule_id=expected_rule_id,
+            )
+            if not cache_errors:
+                return {
+                    "ok": True,
+                    "status": "valid_object",
+                    "data": cached,
+                    "attempt_count": 0,
+                    "attempts": [{"attempt": 0, "status": "cache_hit"}],
+                    "cache_hit": True,
+                }
+            self._cache_delete("dual_evidence_json_object", cache_payload)
+
+        attempts: List[Dict[str, Any]] = []
+        failure_status = "transport_failure"
+        failure_errors: List[str] = []
+        for attempt_index in range(1, self.checker_json_attempts + 1):
+            retry_category = ""
+            attempt_user_prompt = user_prompt
+            if attempt_index > 1:
+                previous_status = str((attempts[-1] if attempts else {}).get("status") or "")
+                if previous_status == "parse_failure":
+                    retry_category = "parse"
+                elif previous_status == "schema_failure":
+                    retry_category = "schema"
+                else:
+                    retry_category = "response"
+                attempt_user_prompt = (
+                    user_prompt
+                    + "\n\nRETRY INSTRUCTION: The previous response had a generic "
+                    + retry_category
+                    + " error. Re-evaluate independently and return exactly one JSON object "
+                    "matching the stated schema. Do not add prose or keys."
+                )
+            trace_record: Dict[str, Any] = {
+                "ts": datetime.datetime.now().isoformat(),
+                "model": self.llm_model,
+                "checker_mode": self.checker_mode,
+                "trace_meta": {**(trace_meta or {}), "attempt": attempt_index},
+                "retry_category": retry_category,
+            }
+            if self.llm_trace_include_prompts:
+                trace_record["system_prompt"] = system_prompt
+                trace_record["user_prompt"] = attempt_user_prompt
+            try:
+                raw_response = self._request_json_object_text(system_prompt, attempt_user_prompt)
+            except Exception as exc:
+                failure_status = "transport_failure"
+                failure_errors = [f"{type(exc).__name__}: {exc}"]
+                attempt_record = {
+                    "attempt": attempt_index,
+                    "status": failure_status,
+                    "errors": list(failure_errors),
+                    "retry_category": retry_category,
+                }
+                attempts.append(attempt_record)
+                trace_record.update(
+                    {
+                        "parse_status": failure_status,
+                        "exception": failure_errors[0],
+                    }
+                )
+                self._append_llm_trace(trace_record)
+                continue
+
+            trace_record["raw_response"] = raw_response
+            trace_record["raw_len"] = len(raw_response)
+            try:
+                parsed = json.loads(
+                    raw_response,
+                    object_pairs_hook=self._strict_json_object_pairs,
+                    parse_constant=self._reject_nonfinite_json_constant,
+                )
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                failure_status = "parse_failure"
+                failure_errors = [f"{type(exc).__name__}: {exc}"]
+                attempts.append(
+                    {
+                        "attempt": attempt_index,
+                        "status": failure_status,
+                        "errors": list(failure_errors),
+                        "retry_category": retry_category,
+                    }
+                )
+                trace_record["parse_status"] = failure_status
+                trace_record["parse_errors"] = list(failure_errors)
+                self._append_llm_trace(trace_record)
+                continue
+
+            schema_errors = self._validate_dual_evidence_schema(
+                parsed,
+                expected_rule_id=expected_rule_id,
+            )
+            if schema_errors:
+                failure_status = "schema_failure"
+                failure_errors = list(schema_errors)
+                attempts.append(
+                    {
+                        "attempt": attempt_index,
+                        "status": failure_status,
+                        "errors": list(schema_errors),
+                        "retry_category": retry_category,
+                    }
+                )
+                trace_record["parse_status"] = failure_status
+                trace_record["schema_errors"] = list(schema_errors)
+                self._append_llm_trace(trace_record)
+                continue
+
+            attempts.append(
+                {
+                    "attempt": attempt_index,
+                    "status": "valid_object",
+                    "retry_category": retry_category,
+                }
+            )
+            trace_record["parse_status"] = "valid_object"
+            self._append_llm_trace(trace_record)
+            self._cache_set("dual_evidence_json_object", cache_payload, parsed)
+            return {
+                "ok": True,
+                "status": "valid_object",
+                "data": parsed,
+                "attempt_count": attempt_index,
+                "attempts": attempts,
+                "cache_hit": False,
+            }
+
+        return {
+            "ok": False,
+            "status": failure_status,
+            "data": None,
+            "attempt_count": len(attempts),
+            "attempts": attempts,
+            "errors": failure_errors,
+            "cache_hit": False,
+        }
 
     # ------------------------- 符号/公式提取 (简化和增强) -------------------------
     _symbol_regex = re.compile(r"\\?([a-zA-Z][a-zA-Z0-9_]*)")
@@ -674,11 +1235,25 @@ class SemanticRuleChecker:
         src_norm, src_map = self._collapse_text_for_match(src)
         q_norm, _ = self._collapse_text_for_match(q)
         if src_norm and q_norm:
-            k = src_norm.find(q_norm)
-            if k >= 0:
+            normalized_positions: List[int] = []
+            search_from = 0
+            while True:
+                k = src_norm.find(q_norm, search_from)
+                if k < 0:
+                    break
+                normalized_positions.append(k)
+                search_from = k + max(1, len(q_norm))
+            if normalized_positions:
+                k = normalized_positions[0]
                 s = src_map[k]
                 e = src_map[min(len(src_map) - 1, k + len(q_norm) - 1)] + 1
-                return _pack(s, e, "normalized_substring", 0.7, False)
+                return _pack(
+                    s,
+                    e,
+                    "normalized_substring",
+                    0.7,
+                    len(normalized_positions) > 1,
+                )
 
         return {
             "start_char": -1,
@@ -805,21 +1380,39 @@ class SemanticRuleChecker:
         start = self._safe_int(loc_raw.get("start_char"))
         end = self._safe_int(loc_raw.get("end_char"))
         line_index = self._safe_int(loc_raw.get("line_index"))
-        paragraph_index_raw = self._safe_int(loc_raw.get("paragraph_index"))
-        span_valid = bool(start is not None and end is not None and start >= 0 and end > start)
+        source_text = str(answer_text or "")
+
+        def _equivalent_quote_slice(candidate: str, expected: str) -> bool:
+            if candidate == expected:
+                return True
+            candidate_norm, _ = self._collapse_text_for_match(candidate)
+            expected_norm, _ = self._collapse_text_for_match(expected)
+            return bool(candidate_norm and expected_norm and candidate_norm == expected_norm)
+
+        span_valid = bool(
+            quote
+            and start is not None
+            and end is not None
+            and start >= 0
+            and end > start
+            and end <= len(source_text)
+            and _equivalent_quote_slice(source_text[start:end], quote)
+        )
 
         loc_obj: Dict[str, Any] = {
             "start_char": int(start) if start is not None else -1,
             "end_char": int(end) if end is not None else -1,
             "line_index": int(line_index) if line_index is not None else -1,
             "span_valid": span_valid,
-            "locate_method": str(loc_raw.get("locate_method") or "model_provided"),
+            "span_ambiguous": False,
+            "span_repaired": False,
+            "locate_method": "model_span_verified" if span_valid else "model_span_invalid",
             "locate_confidence": float(loc_raw.get("locate_confidence") or (1.0 if span_valid else 0.0)),
-            "paragraph_index": int(paragraph_index_raw) if paragraph_index_raw is not None else -1,
-            "paragraph_start_char": int(self._safe_int(loc_raw.get("paragraph_start_char")) or -1),
-            "paragraph_end_char": int(self._safe_int(loc_raw.get("paragraph_end_char")) or -1),
-            "paragraph_valid": bool(paragraph_index_raw is not None and paragraph_index_raw >= 1),
-            "paragraph_source": str(loc_raw.get("paragraph_source") or "model_provided"),
+            "paragraph_index": -1,
+            "paragraph_start_char": -1,
+            "paragraph_end_char": -1,
+            "paragraph_valid": False,
+            "paragraph_source": "",
         }
 
         if quote and not span_valid:
@@ -830,45 +1423,287 @@ class SemanticRuleChecker:
                     "end_char": int(fallback.get("end_char", -1)),
                     "line_index": int(fallback.get("line_index", -1)),
                     "span_valid": True,
+                    "span_ambiguous": bool(fallback.get("span_ambiguous")),
+                    "span_repaired": True,
                     "locate_method": f"fallback_{fallback.get('locate_method') or 'quote_match'}",
                     "locate_confidence": float(fallback.get("locate_confidence") or 0.75),
                 }
 
         if bool(loc_obj.get("span_valid")) and int(loc_obj.get("line_index") or -1) <= 0:
-            s = int(loc_obj.get("start_char") or -1)
+            s_value = self._safe_int(loc_obj.get("start_char"))
+            s = int(s_value) if s_value is not None else -1
             if s >= 0:
                 loc_obj["line_index"] = int(str(answer_text).count("\n", 0, s) + 1)
 
-        if bool(loc_obj.get("span_valid")) and (not bool(loc_obj.get("paragraph_valid"))):
-            p = self._paragraph_from_offset(paragraphs, int(loc_obj.get("start_char") or -1))
+        if bool(loc_obj.get("span_valid")):
+            span_start_value = self._safe_int(loc_obj.get("start_char"))
+            span_end_value = self._safe_int(loc_obj.get("end_char"))
+            span_start = int(span_start_value) if span_start_value is not None else -1
+            span_end = int(span_end_value) if span_end_value is not None else -1
+            p = self._paragraph_from_offset(paragraphs, span_start)
             if p is not None:
                 ctx = self._expand_span_to_context_window(
                     answer_text,
-                    int(loc_obj.get("start_char") or -1),
-                    int(loc_obj.get("end_char") or -1),
+                    span_start,
+                    span_end,
                 )
                 loc_obj["paragraph_index"] = int(p.get("paragraph_index") or -1)
-                loc_obj["paragraph_start_char"] = int(ctx.get("start_char") or p.get("start_char") or -1)
-                loc_obj["paragraph_end_char"] = int(ctx.get("end_char") or p.get("end_char") or -1)
+                ctx_start = self._safe_int(ctx.get("start_char"))
+                ctx_end = self._safe_int(ctx.get("end_char"))
+                p_start = self._safe_int(p.get("start_char"))
+                p_end = self._safe_int(p.get("end_char"))
+                loc_obj["paragraph_start_char"] = int(
+                    ctx_start if ctx_start is not None and ctx_start >= 0 else (p_start if p_start is not None else -1)
+                )
+                loc_obj["paragraph_end_char"] = int(
+                    ctx_end if ctx_end is not None and ctx_end >= 0 else (p_end if p_end is not None else -1)
+                )
                 loc_obj["paragraph_valid"] = True
                 loc_obj["paragraph_source"] = "from_span_context"
 
-        if not bool(loc_obj.get("paragraph_valid")):
-            pidx = int(loc_obj.get("paragraph_index") or -1)
-            p2 = self._paragraph_by_index(paragraphs, pidx)
-            if p2 is not None:
-                loc_obj["paragraph_start_char"] = int(p2.get("start_char") or -1)
-                loc_obj["paragraph_end_char"] = int(p2.get("end_char") or -1)
-                loc_obj["paragraph_valid"] = True
-                if not str(loc_obj.get("paragraph_source") or "").strip():
-                    loc_obj["paragraph_source"] = "model_declared"
-
-        loc_obj["locatable_valid"] = bool(loc_obj.get("span_valid") or loc_obj.get("paragraph_valid"))
+        # A model-declared paragraph is never grounding by itself. Only a verified
+        # quote span can make a legacy diagnostic locatable, and an ambiguous
+        # fallback stays visible in trace while failing closed for publication.
+        loc_obj["locatable_valid"] = bool(
+            loc_obj.get("span_valid") and not loc_obj.get("span_ambiguous")
+        )
 
         evidence["quote"] = quote
         evidence["location"] = loc_obj
         out["evidence"] = evidence
         return out
+
+    @staticmethod
+    def _ordered_unique_strings(items: List[str]) -> List[str]:
+        seen: Set[str] = set()
+        out: List[str] = []
+        for item in items:
+            value = str(item or "").strip()
+            if value and value not in seen:
+                seen.add(value)
+                out.append(value)
+        return out
+
+    def _normalize_strict_source_evidence(
+        self,
+        evidence: Dict[str, Any],
+        *,
+        source_texts: Dict[str, str],
+        allowed_sources: Set[str],
+        role: str,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Verify a quote against exactly one declared source.
+
+        Model-provided offsets are accepted only when the exact source slice equals
+        the quote. Otherwise, offsets are repaired only for one unique exact match.
+        Multiple matches without a valid disambiguating span fail closed.
+        """
+        source = str(evidence.get("source") or "")
+        if source not in allowed_sources:
+            return None, f"{role}_evidence_wrong_source"
+        source_text = str(source_texts.get(source) or "")
+        quote = str(evidence.get("quote") or "").strip()
+        if not quote:
+            return None, f"{role}_evidence_missing_quote"
+
+        location = evidence.get("location") if isinstance(evidence.get("location"), dict) else {}
+        start = location.get("start_char")
+        end = location.get("end_char")
+        span_verified = bool(
+            isinstance(start, int)
+            and not isinstance(start, bool)
+            and isinstance(end, int)
+            and not isinstance(end, bool)
+            and 0 <= start < end <= len(source_text)
+            and source_text[start:end] == quote
+        )
+        repaired = False
+        if not span_verified:
+            matches = list(re.finditer(re.escape(quote), source_text))
+            if not matches:
+                return None, f"{role}_evidence_quote_not_found"
+            if len(matches) != 1:
+                return None, f"{role}_evidence_quote_ambiguous"
+            start = matches[0].start()
+            end = matches[0].end()
+            repaired = True
+
+        assert isinstance(start, int) and isinstance(end, int)
+        paragraphs = self._paragraph_ranges(source_text)
+        paragraph = self._paragraph_from_offset(paragraphs, start)
+        paragraph_index = int(paragraph.get("paragraph_index") or -1) if paragraph else -1
+        paragraph_start_value = self._safe_int(paragraph.get("start_char")) if paragraph else None
+        paragraph_end_value = self._safe_int(paragraph.get("end_char")) if paragraph else None
+        paragraph_start = int(paragraph_start_value) if paragraph_start_value is not None else -1
+        paragraph_end = int(paragraph_end_value) if paragraph_end_value is not None else -1
+        normalized = {
+            "source": source,
+            "quote": quote,
+            "location": {
+                "start_char": start,
+                "end_char": end,
+                "line_index": int(source_text.count("\n", 0, start) + 1),
+                "span_valid": True,
+                "span_ambiguous": False,
+                "span_repaired": repaired,
+                "locate_method": "unique_exact_repair" if repaired else "model_span_verified",
+                "locate_confidence": 1.0,
+                "paragraph_index": paragraph_index,
+                "paragraph_start_char": paragraph_start,
+                "paragraph_end_char": paragraph_end,
+                "paragraph_valid": paragraph is not None,
+                "paragraph_source": f"strict_{source}_span",
+                "locatable_valid": True,
+                "source": source,
+            },
+        }
+        return normalized, None
+
+    def _normalize_dual_evidence_response(
+        self,
+        payload: Dict[str, Any],
+        *,
+        expected_rule_id: str,
+        source_texts: Dict[str, str],
+    ) -> Dict[str, Any]:
+        applicability_raw = payload["applicability"]
+        valid_applicability_evidence: List[Dict[str, Any]] = []
+        applicability_evidence_errors: List[str] = []
+        for evidence in applicability_raw["evidence"]:
+            normalized, error = self._normalize_strict_source_evidence(
+                evidence,
+                source_texts=source_texts,
+                allowed_sources={"question", "context"},
+                role="applicability",
+            )
+            if normalized is not None:
+                valid_applicability_evidence.append(normalized)
+            if error:
+                applicability_evidence_errors.append(error)
+
+        normalized_applicability = {
+            "applies": applicability_raw["applies"],
+            "confidence": float(applicability_raw["confidence"]),
+            "evidence": valid_applicability_evidence,
+        }
+        base_gate_reasons = list(applicability_evidence_errors)
+        if applicability_raw["applies"] is not True:
+            base_gate_reasons.append("applicability_not_true")
+        if float(applicability_raw["confidence"]) < self.checker_min_confidence:
+            base_gate_reasons.append("applicability_below_confidence")
+        if not valid_applicability_evidence:
+            base_gate_reasons.append("missing_valid_applicability_evidence")
+
+        emitted: List[Dict[str, Any]] = []
+        suppressed: List[Dict[str, Any]] = []
+        for diagnostic_raw in payload["diagnostics"]:
+            violation_raw = diagnostic_raw["violation"]
+            valid_violation_evidence: List[Dict[str, Any]] = []
+            violation_evidence_errors: List[str] = []
+            for evidence in violation_raw["evidence"]:
+                normalized, error = self._normalize_strict_source_evidence(
+                    evidence,
+                    source_texts=source_texts,
+                    allowed_sources={"prediction"},
+                    role="violation",
+                )
+                if normalized is not None:
+                    valid_violation_evidence.append(normalized)
+                if error:
+                    violation_evidence_errors.append(error)
+
+            reasons = list(base_gate_reasons) + violation_evidence_errors
+            if payload["status"] != "violation":
+                reasons.append("response_status_not_violation")
+            if violation_raw["present"] is not True:
+                reasons.append("violation_not_true")
+            if float(violation_raw["confidence"]) < self.checker_min_confidence:
+                reasons.append("violation_below_confidence")
+            if not valid_violation_evidence:
+                reasons.append("missing_valid_violation_evidence")
+
+            consistency = diagnostic_raw.get("consistency")
+            if self.checker_mode == self.CHECKER_MODE_DUAL_EVIDENCE_CONSISTENCY:
+                consistency_status = str((consistency or {}).get("status") or "")
+                consistency_confidence = float((consistency or {}).get("confidence") or 0.0)
+                if consistency_status != "confirmed_violation":
+                    reasons.append("consistency_not_confirmed")
+                if consistency_confidence < self.checker_min_confidence:
+                    reasons.append("consistency_below_confidence")
+                if self._consistency_reason_rejects_confirmation(
+                    str((consistency or {}).get("reason") or "")
+                ):
+                    reasons.append("consistency_reason_contradicts_status")
+
+            normalized_violation = {
+                "present": violation_raw["present"],
+                "confidence": float(violation_raw["confidence"]),
+                "evidence": valid_violation_evidence,
+            }
+            legacy_evidence = valid_violation_evidence[0] if valid_violation_evidence else {}
+            candidate: Dict[str, Any] = {
+                "severity": diagnostic_raw["severity"],
+                "rule": expected_rule_id,
+                "symbol": diagnostic_raw["symbol"],
+                "message": diagnostic_raw["message"].strip(),
+                "evidence": legacy_evidence,
+                "applicability": normalized_applicability,
+                "violation": normalized_violation,
+                "checker_schema_version": self.DUAL_EVIDENCE_SCHEMA_VERSION,
+                "checker_gate_mode": self.checker_mode,
+            }
+            if consistency is not None:
+                candidate["consistency"] = {
+                    "status": consistency["status"],
+                    "confidence": float(consistency["confidence"]),
+                    "reason": consistency["reason"],
+                }
+            gate_reasons = self._ordered_unique_strings(reasons)
+            evidence_gate = {
+                "passed": bool(not gate_reasons),
+                "reasons": gate_reasons,
+                "applicability_evidence_count": len(valid_applicability_evidence),
+                "violation_evidence_count": len(valid_violation_evidence),
+                "applicability_confidence": float(applicability_raw["confidence"]),
+                "violation_confidence": float(violation_raw["confidence"]),
+                "min_confidence": self.checker_min_confidence,
+            }
+            candidate["checker_evidence_gate"] = evidence_gate
+            if evidence_gate["passed"] is True:
+                emitted.append(candidate)
+            else:
+                suppressed.append(
+                    {
+                        "reason": "checker_evidence_gate",
+                        "rule_id": expected_rule_id,
+                        "checker_gate_mode": self.checker_mode,
+                        "checker_evidence_gate": evidence_gate,
+                        "original_diagnostic": candidate,
+                    }
+                )
+
+        return {
+            "diagnostics": emitted,
+            "suppressed": suppressed,
+            "applicability": normalized_applicability,
+            "response_status": payload["status"],
+        }
+
+    @classmethod
+    def _consistency_reason_rejects_confirmation(cls, reason: str) -> bool:
+        text = str(reason or "").strip().lower()
+        if not text:
+            return False
+        for pattern in cls._CONSISTENCY_REASON_REJECTION_PATTERNS:
+            for match in re.finditer(pattern, text, flags=re.I):
+                # Do not suppress when the apparent affirmative phrase is the
+                # proposition being explicitly refuted (for example,
+                # "the derivation is correct is false").
+                suffix = text[match.end(): match.end() + 40]
+                if cls._CONSISTENCY_REASON_REFUTATION_SUFFIX.search(suffix):
+                    continue
+                return True
+        return False
 
     @classmethod
     def _is_negative_or_uncertain_diagnostic(cls, diagnostic: Dict[str, Any]) -> bool:
@@ -990,104 +1825,428 @@ Respond with only the JSON output (array or empty array).
 """
         return system_prompt, user_prompt
 
-    def analyze(self, sample: Dict[str, Any], dataset_key: Optional[str] = None, export_graph: bool = False) -> Dict[str, Any]:
-        # 使用完整回答，不再截断，让 LLM 看到全部作答
-        answer_text = str(sample.get("prediction", ""))
-        text_all = "\n".join([
-            sample.get("question", ""),
-            sample.get("context", ""),
-            sample.get("prediction", ""),
-        ])
+    def _get_dual_evidence_prompt(
+        self,
+        *,
+        srd: str,
+        raw_answer: str,
+        question_text: str,
+        context_text: str,
+        rule_id: str,
+    ) -> Tuple[str, str]:
+        """Build the source-separated prompt used by both strict checker modes."""
+        max_chars = 12000
 
-        answer_correct = self._answer_matches(sample)
+        def _trim(value: str) -> str:
+            # Preserve source coordinates exactly. Stripping leading whitespace
+            # would make model-provided offsets disagree with validation text.
+            text = str(value or "")
+            if len(text) > max_chars:
+                return text[:max_chars] + "\n...[truncated]"
+            return text
+
+        question = _trim(question_text)
+        context = _trim(context_text)
+        prediction = _trim(raw_answer)
+        if self.rule_mode == "direct":
+            rule_block = f"Rule Description:\n{srd.strip()}"
+        else:
+            rule_block = f"Conditional Rule Definition:\n---\n{srd.strip()}\n---"
+
+        diagnostic_example: Dict[str, Any] = {
+            "severity": "error",
+            "symbol": None,
+            "message": "Concise explanation of the concrete contradiction.",
+            "violation": {
+                "present": True,
+                "confidence": 0.95,
+                "evidence": [
+                    {
+                        "source": "prediction",
+                        "quote": "Exact quote from the student's submission.",
+                        "location": {"start_char": -1, "end_char": -1},
+                    }
+                ],
+            },
+        }
+        consistency_instructions = ""
+        if self.checker_mode == self.CHECKER_MODE_DUAL_EVIDENCE_CONSISTENCY:
+            diagnostic_example["consistency"] = {
+                "status": "confirmed_violation",
+                "confidence": 0.95,
+                "reason": "The quoted claim remains asserted and is not corrected or equivalent.",
+            }
+            consistency_instructions = """
+Consistency requirement for every diagnostic:
+- Use `confirmed_violation` only when the quoted claim is the student's current conclusion.
+- Use `self_corrected` when the student later withdraws or corrects it.
+- Use `equivalent_or_alternative` when the reasoning is physically equivalent or a valid alternative.
+- Use `uncertain` for a hypothetical, rejected example, ambiguity, or insufficient context.
+- Only `confirmed_violation` is publishable.
+"""
+
+        schema_example = {
+            "schema_version": self.DUAL_EVIDENCE_SCHEMA_VERSION,
+            "rule_id": rule_id,
+            "status": "violation",
+            "applicability": {
+                "applies": True,
+                "confidence": 0.95,
+                "evidence": [
+                    {
+                        "source": "question",
+                        "quote": "Exact quote from QUESTION or CONTEXT establishing applicability.",
+                        "location": {"start_char": -1, "end_char": -1},
+                    }
+                ],
+            },
+            "diagnostics": [diagnostic_example],
+        }
+        schema_json = json.dumps(schema_example, ensure_ascii=False, indent=2)
+        confidence_percent = int(round(self.checker_min_confidence * 100))
+        system_prompt = (
+            "You are a conservative physics rule checker. Return exactly one JSON object "
+            "matching the supplied schema. A bare array, prose, Markdown, unknown key, omitted "
+            "key, wrong type, or different rule_id is invalid. Never use a reference answer or "
+            "assume that the supplied rule is applicable."
+        )
+        user_prompt = f"""
+{rule_block}
+
+RULE_ID:
+{rule_id}
+
+QUESTION source (applicability evidence may quote only this field):
+---
+{question}
+---
+
+CONTEXT source (applicability evidence may quote only this field):
+---
+{context}
+---
+
+PREDICTION source (violation evidence may quote only this field):
+---
+{prediction}
+---
+
+Decision procedure:
+1. Determine whether this rule's physical scenario and preconditions apply to the QUESTION/CONTEXT.
+2. Applicability evidence must be an exact quote from QUESTION or CONTEXT. Never use PREDICTION as applicability evidence.
+3. A violation must be a concrete contradiction still asserted in PREDICTION. Never use QUESTION or CONTEXT as violation evidence.
+4. Omission of the rule's preferred method, a sound alternative derivation, or an equivalent formulation is not a violation.
+5. If applicability or violation confidence is below {confidence_percent}%, abstain or return no violation.
+6. If there is no publishable violation, set status to `no_violation` or `abstain` and diagnostics to an empty list.
+7. Evidence offsets are 0-based within the single declared source. Use -1 for both offsets when uncertain; the system repairs only a unique exact quote.
+8. Every listed key is required. Do not add keys. Use JSON booleans and numbers, not strings.
+{consistency_instructions}
+Exact JSON schema example:
+{schema_json}
+
+Return exactly one JSON object and nothing else.
+"""
+        return system_prompt, user_prompt
+
+    @staticmethod
+    def _validate_legacy_diagnostics_payload(
+        payload: Any,
+        *,
+        expected_rule_id: str,
+    ) -> Tuple[Optional[List[Any]], List[str]]:
+        """Apply the smallest safe contract without changing the legacy wire shape."""
+        if isinstance(payload, (dict, str)):
+            diagnostics: List[Any] = [payload]
+        elif isinstance(payload, list):
+            diagnostics = list(payload)
+        else:
+            return None, ["legacy_root:expected_object_array_or_string"]
+
+        errors: List[str] = []
+        for index, diagnostic in enumerate(diagnostics):
+            if not isinstance(diagnostic, (dict, str)):
+                errors.append(f"legacy_diagnostics[{index}]:expected_object_or_string")
+                continue
+            if isinstance(diagnostic, dict):
+                rule_id = diagnostic.get("rule")
+                if not isinstance(rule_id, str) or rule_id != expected_rule_id:
+                    errors.append(f"legacy_diagnostics[{index}]:rule_id_mismatch")
+        if errors:
+            return None, errors
+        return diagnostics, []
+
+    def analyze(self, sample: Dict[str, Any], dataset_key: Optional[str] = None, export_graph: bool = False) -> Dict[str, Any]:
+        question_text = str(sample.get("question") or "")
+        context_text = str(sample.get("context") or "")
+        answer_text = str(sample.get("prediction") or "")
+        text_all = "\n".join([question_text, context_text, answer_text])
+        dual_mode = self.checker_mode != self.CHECKER_MODE_LEGACY
+
+        # Strict modes must be independently safe when called outside
+        # PhysicsRuleVerifier: they never inspect or use the reference ``answer``.
+        answer_correct = False if dual_mode else self._answer_matches(sample)
 
         graph: Optional[SymbolGraph] = None
         context_summary: Optional[str] = None
-
         if self.use_symbol_graph and not answer_correct:
             parsed = self._extract_symbols_and_formulas(text_all)
             graph = self._build_symbol_graph(parsed["lines"], parsed["symbols"], parsed["formulas"])
-            context_summary = self._create_context_summary(graph, text_all)
-        
-        all_diagnostics: List[Dict[str, Any]] = []
+            # The mixed summary remains legacy-only. Strict prompts receive the
+            # three source fields separately and never receive this summary.
+            if not dual_mode:
+                context_summary = self._create_context_summary(graph, text_all)
 
-        if (not answer_correct) and self._llm_available() and self.rule_translations:
+        all_diagnostics: List[Dict[str, Any]] = []
+        checker_decisions: List[Dict[str, Any]] = []
+        checker_failures: List[Dict[str, Any]] = []
+        checker_suppressed: List[Dict[str, Any]] = []
+        legacy_ran = False
+
+        if not answer_correct:
             for rule_id in self.rules_to_check:
                 rule_info = self.rule_translations.get(rule_id)
-                if not rule_info or not rule_info.get("srd") or "failed" in rule_info["srd"].lower():
+                if not isinstance(rule_info, dict):
+                    failure = {
+                        "rule_id": str(rule_id or ""),
+                        "checker_gate_mode": self.checker_mode,
+                        "status": "configuration_failure",
+                        "errors": ["missing_or_invalid_rule_translation"],
+                        "attempt_count": 0,
+                        "attempts": [],
+                        "cache_hit": False,
+                    }
+                    if dual_mode:
+                        failure["checker_schema_version"] = self.DUAL_EVIDENCE_SCHEMA_VERSION
+                    checker_decisions.append(failure)
+                    checker_failures.append(failure)
+                    continue
+                srd = rule_info.get("srd")
+                if not isinstance(srd, str) or not srd.strip():
+                    failure = {
+                        "rule_id": str(rule_id or ""),
+                        "checker_gate_mode": self.checker_mode,
+                        "status": "configuration_failure",
+                        "errors": ["missing_or_empty_rule_definition"],
+                        "attempt_count": 0,
+                        "attempts": [],
+                        "cache_hit": False,
+                    }
+                    if dual_mode:
+                        failure["checker_schema_version"] = self.DUAL_EVIDENCE_SCHEMA_VERSION
+                    checker_decisions.append(failure)
+                    checker_failures.append(failure)
                     continue
 
-                srd = rule_info["srd"]
+                if not dual_mode:
+                    legacy_ran = True
+                    system_prompt, user_prompt = self._get_check_prompt(
+                        srd=srd,
+                        raw_answer=answer_text,
+                        problem_text="\n".join([question_text, context_text]),
+                        context_summary=context_summary if context_summary is not None else "{}",
+                        rule_id=rule_id,
+                    )
+                    call_result = self._llm_json(
+                        system_prompt,
+                        user_prompt,
+                        fallback=[],
+                        trace_meta={"sample_id": sample.get("id"), "rule_id": rule_id},
+                        return_meta=True,
+                        json_validator=lambda payload, expected=rule_id: (
+                            self._validate_legacy_diagnostics_payload(
+                                payload,
+                                expected_rule_id=expected,
+                            )[1]
+                        ),
+                    )
+                    common_legacy_decision = {
+                        "rule_id": rule_id,
+                        "checker_gate_mode": self.CHECKER_MODE_LEGACY,
+                        "attempt_count": int(call_result.get("attempt_count") or 0),
+                        "attempts": [
+                            {
+                                "attempt": int(call_result.get("attempt_count") or 0),
+                                "status": str(call_result.get("status") or "transport_failure"),
+                            }
+                        ],
+                        "cache_hit": bool(call_result.get("cache_hit")),
+                    }
+                    if call_result.get("ok") is not True:
+                        failure = {
+                            **common_legacy_decision,
+                            "status": str(call_result.get("status") or "transport_failure"),
+                            "errors": list(call_result.get("errors") or []),
+                        }
+                        checker_decisions.append(failure)
+                        checker_failures.append(failure)
+                        continue
 
-                # 若不使用符号图，则只提供原始回答文本，不提供结构化 JSON
-                if self.use_symbol_graph and context_summary is not None:
-                    system_prompt, user_prompt = self._get_check_prompt(
-                        srd=srd,
-                        raw_answer=answer_text,
-                        problem_text="\n".join(
-                            [
-                                str(sample.get("question") or ""),
-                                str(sample.get("context") or ""),
-                            ]
-                        ),
-                        context_summary=context_summary,
-                        rule_id=rule_id,
+                    diagnostics, legacy_schema_errors = self._validate_legacy_diagnostics_payload(
+                        call_result.get("data"),
+                        expected_rule_id=rule_id,
                     )
-                else:
-                    system_prompt, user_prompt = self._get_check_prompt(
-                        srd=srd,
-                        raw_answer=answer_text,
-                        problem_text="\n".join(
-                            [
-                                str(sample.get("question") or ""),
-                                str(sample.get("context") or ""),
-                            ]
-                        ),
-                        context_summary="{}",
-                        rule_id=rule_id,
+                    if legacy_schema_errors:
+                        failure = {
+                            **common_legacy_decision,
+                            "status": "schema_failure",
+                            "errors": legacy_schema_errors,
+                        }
+                        checker_decisions.append(failure)
+                        checker_failures.append(failure)
+                        continue
+                    assert diagnostics is not None
+
+                    normalized_diag: List[Any] = []
+                    for diagnostic in diagnostics:
+                        if isinstance(diagnostic, dict):
+                            if self._is_negative_or_uncertain_diagnostic(diagnostic):
+                                checker_suppressed.append(
+                                    {
+                                        "reason": "legacy_negative_or_uncertain_diagnostic",
+                                        "rule_id": rule_id,
+                                        "checker_gate_mode": self.CHECKER_MODE_LEGACY,
+                                        "original_diagnostic": diagnostic,
+                                    }
+                                )
+                                continue
+                            normalized_diag.append(
+                                self._normalize_diagnostic_location(diagnostic, answer_text)
+                            )
+                        else:
+                            normalized_diag.append(diagnostic)
+                    all_diagnostics.extend(normalized_diag)
+                    checker_decisions.append(
+                        {
+                            **common_legacy_decision,
+                            "status": "valid_with_diagnostics" if normalized_diag else "valid_empty",
+                            "published_diagnostic_count": len(normalized_diag),
+                        }
                     )
-                
-                diagnostics = self._llm_json(
+                    continue
+
+                system_prompt, user_prompt = self._get_dual_evidence_prompt(
+                    srd=srd,
+                    raw_answer=answer_text,
+                    question_text=question_text,
+                    context_text=context_text,
+                    rule_id=rule_id,
+                )
+                call_result = self._call_dual_evidence_json_object(
                     system_prompt,
                     user_prompt,
-                    fallback=[],
-                    trace_meta={
-                        "sample_id": sample.get("id"),
-                        "rule_id": rule_id,
+                    expected_rule_id=rule_id,
+                    trace_meta={"sample_id": sample.get("id"), "rule_id": rule_id},
+                )
+                common_decision = {
+                    "rule_id": rule_id,
+                    "checker_gate_mode": self.checker_mode,
+                    "checker_schema_version": self.DUAL_EVIDENCE_SCHEMA_VERSION,
+                    "attempt_count": int(call_result.get("attempt_count") or 0),
+                    "attempts": list(call_result.get("attempts") or []),
+                    "cache_hit": bool(call_result.get("cache_hit")),
+                }
+                if call_result.get("ok") is not True:
+                    failure = {
+                        **common_decision,
+                        "status": str(call_result.get("status") or "transport_failure"),
+                        "errors": list(call_result.get("errors") or []),
+                    }
+                    checker_decisions.append(failure)
+                    checker_failures.append(failure)
+                    continue
+
+                normalized = self._normalize_dual_evidence_response(
+                    call_result["data"],
+                    expected_rule_id=rule_id,
+                    source_texts={
+                        "question": question_text,
+                        "context": context_text,
+                        "prediction": answer_text,
                     },
                 )
-                if isinstance(diagnostics, dict):
-                    diagnostics = [diagnostics]
-                elif isinstance(diagnostics, str):
-                    diagnostics = [diagnostics]
-                elif diagnostics is None:
-                    diagnostics = []
+                emitted = list(normalized["diagnostics"])
+                suppressed = list(normalized["suppressed"])
+                all_diagnostics.extend(emitted)
+                checker_suppressed.extend(suppressed)
+                checker_decisions.append(
+                    {
+                        **common_decision,
+                        "status": "valid_with_diagnostics" if emitted else "valid_empty",
+                        "response_status": normalized["response_status"],
+                        "applicability": normalized["applicability"],
+                        "published_diagnostic_count": len(emitted),
+                        "suppressed_diagnostic_count": len(suppressed),
+                    }
+                )
 
-                normalized_diag: List[Any] = []
-                for d in diagnostics:
-                    if isinstance(d, dict):
-                        if self._is_negative_or_uncertain_diagnostic(d):
-                            continue
-                        normalized_diag.append(self._normalize_diagnostic_location(d, answer_text))
-                    else:
-                        normalized_diag.append(d)
-                all_diagnostics.extend(normalized_diag)
-
-        # 去重和计分
         seen = set()
-        unique_diagnostics = []
-        for d in all_diagnostics:
-            if isinstance(d, str):
-                key = (None, None, d)
-                payload = {"severity": "info", "rule": None, "symbol": None, "message": d}
+        unique_diagnostics: List[Dict[str, Any]] = []
+        for diagnostic in all_diagnostics:
+            if isinstance(diagnostic, str):
+                key = (None, None, diagnostic)
+                payload = {
+                    "severity": "info",
+                    "rule": None,
+                    "symbol": None,
+                    "message": diagnostic,
+                }
             else:
-                key = (d.get("rule"), d.get("symbol"), d.get("message"))
-                payload = d
-            if key not in seen:
-                unique_diagnostics.append(payload)
-                seen.add(key)
-        
-        score = sum(-1.0 if d.get("severity") == "error" else -0.5 for d in unique_diagnostics if d.get("severity") in ["error", "warning"])
+                key = (
+                    diagnostic.get("rule"),
+                    diagnostic.get("symbol"),
+                    diagnostic.get("message"),
+                )
+                payload = diagnostic
+            if key in seen:
+                if dual_mode:
+                    checker_suppressed.append(
+                        {
+                            "reason": "duplicate_checker_diagnostic",
+                            "rule_id": str(payload.get("rule") or ""),
+                            "checker_gate_mode": self.checker_mode,
+                            "original_diagnostic": payload,
+                        }
+                    )
+                continue
+            unique_diagnostics.append(payload)
+            seen.add(key)
+
+        score = sum(
+            -1.0 if diagnostic.get("severity") == "error" else -0.5
+            for diagnostic in unique_diagnostics
+            if diagnostic.get("severity") in ["error", "warning"]
+        )
+
+        if dual_mode:
+            successful_decisions = [
+                decision
+                for decision in checker_decisions
+                if str(decision.get("status") or "").startswith("valid_")
+            ]
+            if checker_failures and successful_decisions:
+                checker_status = "partial_failure"
+            elif checker_failures:
+                checker_status = "failed"
+            elif not successful_decisions:
+                checker_status = "not_run"
+            elif unique_diagnostics:
+                checker_status = "valid_with_diagnostics"
+            else:
+                checker_status = "valid_empty"
+        elif legacy_ran or checker_decisions:
+            successful_decisions = [
+                decision
+                for decision in checker_decisions
+                if str(decision.get("status") or "").startswith("valid_")
+            ]
+            if checker_failures and successful_decisions:
+                checker_status = "partial_failure"
+            elif checker_failures:
+                checker_status = "failed"
+            else:
+                checker_status = "valid_with_diagnostics" if unique_diagnostics else "valid_empty"
+        else:
+            checker_status = "not_run"
 
         out = {
             "id": sample.get("id"),
@@ -1095,6 +2254,11 @@ Respond with only the JSON output (array or empty array).
             "diagnostics": unique_diagnostics,
             "score": score,
             "answer_correct": answer_correct,
+            "checker_mode": self.checker_mode,
+            "checker_status": checker_status,
+            "checker_decisions": checker_decisions,
+            "checker_failures": checker_failures,
+            "checker_suppressed": checker_suppressed,
         }
         if export_graph and graph is not None:
             out["symbol_nodes"] = {k: vars(v) for k, v in graph.symbols.items()}

@@ -11,15 +11,46 @@ def _load_json(path: str) -> Any:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def _index_by_id(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+def _typed_id_key(value: Any) -> str:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError("sample IDs must be non-empty strings or integers")
+    if isinstance(value, str) and not value.strip():
+        raise ValueError("sample IDs must not be empty")
+    return f"{type(value).__name__}:{json.dumps(value, ensure_ascii=False, sort_keys=True)}"
+
+
+def _index_by_id(
+    items: List[Dict[str, Any]],
+    *,
+    label: str,
+) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}
-    for row in items:
+    for index, row in enumerate(items):
         if not isinstance(row, dict):
-            continue
-        sid = str(row.get("id") or "").strip()
-        if sid:
-            out[sid] = row
+            raise ValueError(f"{label}[{index}] must be a JSON object")
+        if "id" not in row:
+            raise ValueError(f"{label}[{index}] is missing id")
+        try:
+            sid = _typed_id_key(row.get("id"))
+        except ValueError as exc:
+            raise ValueError(f"invalid {label}[{index}].id: {exc}") from exc
+        if sid in out:
+            raise ValueError(f"duplicate typed sample ID in {label}: {row.get('id')!r}")
+        out[sid] = row
     return out
+
+
+def _result_identity(items: List[Dict[str, Any]]) -> Dict[str, str]:
+    identity: Dict[str, str] = {}
+    for field in ("checker_gate_mode", "replay_config_sha256"):
+        present = [str(row.get(field) or "").strip() for row in items]
+        nonempty = {value for value in present if value}
+        if len(nonempty) > 1:
+            raise ValueError(f"results mix multiple {field} values")
+        if nonempty and any(not value for value in present):
+            raise ValueError(f"results mix missing and populated {field} values")
+        identity[field] = next(iter(nonempty), "")
+    return identity
 
 
 def _safe_int(value: Any) -> Optional[int]:
@@ -346,14 +377,15 @@ def _collect_pred_findings(pred_item: Dict[str, Any], audit_item: Optional[Dict[
                 }
             )
 
-    if isinstance(audit_item, dict):
+    checker_mode = str(pred_item.get("checker_gate_mode") or "legacy").strip().lower()
+    if isinstance(audit_item, dict) and checker_mode == "legacy":
         checks = audit_item.get("experience_code_checks")
         checks = checks if isinstance(checks, list) else []
         for c in checks:
             if not isinstance(c, dict):
                 continue
             res = str(c.get("result") or "").strip().lower()
-            if res != "fail":
+            if res != "fail" or str(c.get("publish_skipped") or "").strip():
                 continue
             rule = str(c.get("rule") or "").strip()
             message = str(c.get("message") or "").strip()
@@ -398,6 +430,31 @@ def _collect_pred_findings(pred_item: Dict[str, Any], audit_item: Optional[Dict[
         seen.add(key)
         out.append(f)
     return out
+
+
+def _execution_failure_reason(pred_item: Any) -> str:
+    if not isinstance(pred_item, dict):
+        return "missing_result"
+    selection = str(pred_item.get("selection_strategy") or "").strip().lower()
+    if selection in {"semantic_error", "semantic_unavailable"} or str(
+        pred_item.get("semantic_selection_error") or ""
+    ).strip():
+        return "semantic_retrieval_failure"
+    checker_status = str(pred_item.get("checker_status") or "").strip().lower()
+    try:
+        checker_failure_count = int(pred_item.get("checker_failure_count") or 0)
+    except (TypeError, ValueError):
+        checker_failure_count = 1
+    raw_checker_failures = pred_item.get("checker_failures")
+    if isinstance(raw_checker_failures, list):
+        checker_failure_count = max(checker_failure_count, len(raw_checker_failures))
+    if checker_failure_count > 0 or checker_status in {
+        "failed",
+        "partial_failure",
+        "not_run",
+    }:
+        return "checker_failure"
+    return ""
 
 
 def _fill_missing_pred_locations(findings: List[Dict[str, Any]], answer_text: str) -> List[Dict[str, Any]]:
@@ -683,9 +740,18 @@ def main() -> None:
 
     if not isinstance(ds, list):
         raise SystemExit("Dataset file must be a JSON array.")
+    if not isinstance(pred, list):
+        raise SystemExit("Results file must be a JSON array.")
+    if not isinstance(audit, list):
+        raise SystemExit("Audit file must be a JSON array.")
 
-    pred_idx = _index_by_id(pred if isinstance(pred, list) else [])
-    audit_idx = _index_by_id(audit if isinstance(audit, list) else [])
+    try:
+        _index_by_id(ds, label="dataset")
+        pred_idx = _index_by_id(pred, label="results")
+        audit_idx = _index_by_id(audit, label="audit")
+        result_identity = _result_identity(pred)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     detail_rows: List[Dict[str, Any]] = []
     total_gt_errors = 0
@@ -700,19 +766,34 @@ def main() -> None:
     total_matched_pred_locatable = 0
     iou_values: List[float] = []
     false_positive_replay: List[Dict[str, Any]] = []
+    failure_by_stage: Dict[str, int] = {}
 
     for row in ds:
         if not isinstance(row, dict):
             continue
-        sid = str(row.get("id") or "").strip()
-        if not sid:
-            continue
+        raw_id = row.get("id")
+        sid_key = _typed_id_key(raw_id)
+        sid = str(raw_id)
 
         gt_entries = _extract_gt_entries(row, sid)
         loc_gt_entries = [x for x in gt_entries if bool(x.get("locatable_valid"))]
 
-        pred_item = pred_idx.get(sid, {})
-        audit_item = audit_idx.get(sid, {})
+        pred_item = pred_idx.get(sid_key)
+        failure_reason = _execution_failure_reason(pred_item)
+        if failure_reason:
+            failure_by_stage[failure_reason] = failure_by_stage.get(failure_reason, 0) + 1
+            detail_rows.append(
+                {
+                    "id": sid,
+                    "gt_error_count": len(gt_entries),
+                    "gt_locatable_error_count": len(loc_gt_entries),
+                    "scored": False,
+                    "execution_failure": failure_reason,
+                }
+            )
+            continue
+        assert isinstance(pred_item, dict)
+        audit_item = audit_idx.get(sid_key, {})
         findings = _collect_pred_findings(pred_item, audit_item)
         findings = _fill_missing_pred_locations(findings, answer_text=str(row.get("prediction") or ""))
 
@@ -820,12 +901,19 @@ def main() -> None:
                     }
                     for x in unmatched_pred_loc_items[:3]
                 ],
+                "scored": True,
+                "execution_failure": "",
             }
         )
 
     total_samples = len(detail_rows)
-    sample_triggered = sum(1 for r in detail_rows if r.get("pred_has_error") is True)
-    sample_location_hit = sum(1 for r in detail_rows if int(r.get("matched_location_error_count") or 0) > 0)
+    scored_samples = len([r for r in detail_rows if r.get("scored") is True])
+    sample_triggered = sum(1 for r in detail_rows if r.get("scored") is True and r.get("pred_has_error") is True)
+    sample_location_hit = sum(
+        1
+        for r in detail_rows
+        if r.get("scored") is True and int(r.get("matched_location_error_count") or 0) > 0
+    )
 
     recall = (matched_gt_errors / total_gt_errors) if total_gt_errors else 0.0
     precision = (total_matched_pred_locatable / total_pred_locatable) if total_pred_locatable else 0.0
@@ -836,6 +924,12 @@ def main() -> None:
             "level": "error",
             "match_mode": args.match_mode,
             "dataset_size": total_samples,
+            "scored_size": scored_samples,
+            "failed_size": sum(failure_by_stage.values()),
+            "coverage": (scored_samples / total_samples) if total_samples else 0.0,
+            "failure_by_stage": failure_by_stage,
+            "checker_gate_mode": result_identity["checker_gate_mode"],
+            "replay_config_sha256": result_identity["replay_config_sha256"],
             "total_gt_errors": total_gt_errors,
             "total_gt_locatable_errors": total_gt_locatable,
             "matched_gt_errors": matched_gt_errors,
@@ -845,8 +939,8 @@ def main() -> None:
             "f1": f1,
             "recall_location_only": (matched_gt_errors / total_gt_locatable) if total_gt_locatable else 0.0,
             "gt_location_valid_ratio": (total_gt_locatable / total_gt_errors) if total_gt_errors else 0.0,
-            "sample_trigger_ratio": (sample_triggered / total_samples) if total_samples else 0.0,
-            "sample_location_hit_ratio": (sample_location_hit / total_samples) if total_samples else 0.0,
+            "sample_trigger_ratio": (sample_triggered / scored_samples) if scored_samples else 0.0,
+            "sample_location_hit_ratio": (sample_location_hit / scored_samples) if scored_samples else 0.0,
             "pred_location_coverage": (total_pred_locatable / total_pred_findings) if total_pred_findings else 0.0,
             "location_match_pairs": total_location_matches,
             "location_paragraph_match_pairs": total_paragraph_matches,

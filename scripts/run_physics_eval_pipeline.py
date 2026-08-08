@@ -144,6 +144,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Forwarded to run_verifier.py as total structured JSON attempts per stage.",
     )
     parser.add_argument(
+        "--checker-gate-mode",
+        choices=["legacy", "dual_evidence", "dual_evidence_consistency"],
+        default="legacy",
+        help="Forwarded to run_verifier.py for controlled Checker ablations.",
+    )
+    parser.add_argument(
+        "--checker-json-attempts",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Forwarded to run_verifier.py as total structured Checker attempts per rule.",
+    )
+    parser.add_argument(
         "--min-diagnostic-rule-score",
         type=float,
         default=None,
@@ -203,6 +216,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = build_parser()
     command_argv = list(sys.argv) if argv is None else [str(Path(__file__)), *list(argv)]
     args = parser.parse_args(argv)
+
+    if not 1 <= args.checker_json_attempts <= 5:
+        parser.error("--checker-json-attempts must be between 1 and 5")
 
     try:
         args.python = resolve_python_executable(args.python)
@@ -309,6 +325,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "unified_rule_top_n": args.unified_rule_top_n,
         "semantic_output_adapter": args.semantic_output_adapter,
         "semantic_json_attempts": args.semantic_json_attempts,
+        "checker_gate_mode": args.checker_gate_mode,
+        "checker_json_attempts": args.checker_json_attempts,
         "min_diagnostic_rule_score": args.min_diagnostic_rule_score,
         "max_per_sample": args.max_per_sample,
         "max_per_paragraph": args.max_per_paragraph,
@@ -405,6 +423,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         vf_extra += f" --semantic-output-adapter {shlex.quote(args.semantic_output_adapter)}"
     if args.semantic_json_attempts is not None:
         vf_extra += f" --semantic-json-attempts {int(args.semantic_json_attempts)}"
+    vf_extra += f" --checker-gate-mode {shlex.quote(args.checker_gate_mode)}"
+    vf_extra += f" --checker-json-attempts {int(args.checker_json_attempts)}"
     if args.min_diagnostic_rule_score is not None:
         vf_extra += f" --min-diagnostic-rule-score {float(args.min_diagnostic_rule_score)}"
     vf_extra += f" --progress-interval {max(0, int(args.verifier_progress_interval))}"
@@ -432,7 +452,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             + symbolic_flag
             + (catalog_flag + " " if catalog_flag else "")
             + vf_extra,
-            allowed_returncodes=(0, 2),
+            allowed_returncodes=(0, 2, 4),
         )
         _require_output_files(
             [error_results, error_audit, error_traces],
@@ -453,7 +473,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             + symbolic_flag
             + (catalog_flag + " " if catalog_flag else "")
             + vf_extra,
-            allowed_returncodes=(0, 2),
+            allowed_returncodes=(0, 2, 4),
         )
         _require_output_files(
             [question_results, question_audit, question_traces],

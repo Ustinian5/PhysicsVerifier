@@ -21,6 +21,9 @@ PhysicsVerifier 用于检查物理竞赛题的模型解答。系统根据题目�
 
 - 运行检查：`scripts/run_verifier.py`
 - 效果测评主流程：`scripts/run_physics_eval_pipeline.py`
+- P3 规则级机制数据：`scripts/build_checker_mechanism_dataset.py`
+- P3 条件 Checker 门禁：`scripts/evaluate_checker_mechanism_gate.py`
+- P3 semantic retrieval 审计：`scripts/audit_checker_mechanism_semantic_retrieval.py`
 - 语义导航：`core/unified_semantic_matcher.py`
 - 检查主流程：`core/physics_rule_verifier.py`
 - 当前 development 基线：`catalogs/rules_unified_3000.json`（1123 条）
@@ -33,19 +36,17 @@ PhysicsVerifier 用于检查物理竞赛题的模型解答。系统根据题目�
 
 正式测评统一使用 `run_physics_eval_pipeline.py`。它强制 conda 解释器和 `unified_rules_v2` catalog，自动生成包含 Git、源码、数据、catalog、Prompt、输出及失败阶段指纹的 manifest；validation/final 启动时要求 clean worktree。受版本控制的冻结清单放在 [`experiments/manifests/`](experiments/README.md)。
 
-所有项目命令必须先进入对应的 conda 环境。
+所有 Python 命令统一通过 conda `physicsverifier` 环境执行，不直接使用本机 Python。
 
 ```bash
 conda env create -f environment.yml
-conda activate physicsverifier
-
-python scripts/run_verifier.py --help
+conda run -n physicsverifier python scripts/run_verifier.py --help
 ```
 
 只运行语义检索：
 
 ```bash
-python scripts/run_verifier.py \
+conda run -n physicsverifier python scripts/run_verifier.py \
   --retrieval-only \
   --continue-on-semantic-error \
   --unified-retrieval-mode semantic \
@@ -62,7 +63,7 @@ python scripts/run_verifier.py \
 ## 测试
 
 ```bash
-python -m unittest discover -s tests -p 'test_*.py'
+conda run -n physicsverifier python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-项目状态和下一步见[项目进展](docs/项目进展.md)，数据隔离、评测命令和当前结果见[效果测评](docs/效果测评.md)。
+当前 P3 主实验使用 honest target binding，估计目标规则已提供时的 Checker + release gate 性能。最终协议的单规则 Gemini 与三臂各一次 Qwen30B development smoke 已闭环，但正式 300 例与九格回放尚未运行，没有新效果结论。semantic retrieval 当前只做 secondary trace schema audit，尚不提供 production provenance。项目状态和下一步见[项目进展](docs/项目进展.md)，数据隔离、完整命令和当前结果见[效果测评](docs/效果测评.md)。

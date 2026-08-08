@@ -47,6 +47,10 @@ def _build_main_result(sample_result: Dict[str, Any]) -> Dict[str, Any]:
         "semantic_failed_stage": sample_result.get("semantic_failed_stage"),
         "terminal_stage": sample_result.get("terminal_stage"),
         "empty_reason": sample_result.get("empty_reason"),
+        "checker_gate_mode": sample_result.get("checker_gate_mode"),
+        "checker_min_confidence": sample_result.get("checker_min_confidence"),
+        "checker_status": sample_result.get("checker_status"),
+        "checker_failure_count": len(sample_result.get("checker_failures") or []),
         "diagnostics": diagnostics,
         "score": sample_result.get("score"),
     }
@@ -199,6 +203,8 @@ def _build_symbolic_audit(sample_result: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": sample_result.get("id"),
         "topic": sample_result.get("topic"),
+        "checker_gate_mode": sample_result.get("checker_gate_mode"),
+        "checker_status": sample_result.get("checker_status"),
         "candidate_diagnostic_count": len(sample_result.get("candidate_diagnostics") or []),
         "checked_diagnostics": checked,
         "symbolic_summary": summary,
@@ -386,6 +392,22 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--checker-gate-mode",
+        choices=["legacy", "dual_evidence", "dual_evidence_consistency"],
+        default="legacy",
+        help=(
+            "Semantic Checker publication protocol. legacy preserves the historical single-quote arm; "
+            "the two dual modes require source-isolated problem and prediction evidence."
+        ),
+    )
+    parser.add_argument(
+        "--checker-json-attempts",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Total structured Checker JSON attempts per selected rule (initial request included; N >= 1).",
+    )
+    parser.add_argument(
         "--topic-skip-prediction",
         action="store_true",
         help="Lexical diagnostics only: exclude prediction text from topic scoring.",
@@ -432,6 +454,8 @@ def main() -> None:
 
     if args.semantic_json_attempts is not None and args.semantic_json_attempts < 1:
         parser.error("--semantic-json-attempts must be at least 1")
+    if not 1 <= args.checker_json_attempts <= 5:
+        parser.error("--checker-json-attempts must be between 1 and 5")
     if args.checkpoint_every < 0:
         parser.error("--checkpoint-every must be non-negative")
     if args.unified_catalog and not Path(args.unified_catalog).is_file():
@@ -475,6 +499,8 @@ def main() -> None:
         semantic_min_publish_score=args.semantic_min_publish_score,
         semantic_json_attempts=args.semantic_json_attempts,
         semantic_output_adapter=args.semantic_output_adapter,
+        checker_gate_mode=args.checker_gate_mode,
+        checker_json_attempts=args.checker_json_attempts,
     )
 
     if args.retrieval_only:
@@ -577,6 +603,21 @@ def main() -> None:
             file=sys.stderr,
         )
         raise SystemExit(2)
+
+    checker_failures = [
+        item
+        for item in (raw_results or [])
+        if isinstance(item, dict) and bool(item.get("checker_failures"))
+    ]
+    if checker_failures:
+        failed = checker_failures[0]
+        print(
+            "Semantic Checker had transport/parse/schema failures; outputs were saved and "
+            "must be excluded from TN/FN scoring. "
+            f"sample={failed.get('id')!r}, status={failed.get('checker_status')!r}",
+            file=sys.stderr,
+        )
+        raise SystemExit(4)
 
     if args.retrieval_only and raw_results and not any(
         str(item.get("selection_strategy") or "") == "semantic_tree_selection"
