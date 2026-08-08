@@ -442,6 +442,7 @@ def _audit_trace_associations(
     records_by_key: Dict[str, Dict[int, Dict[str, Any]]] = {
         key: {} for key in expected
     }
+    response_ids: Set[str] = set()
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError as exc:
@@ -475,6 +476,33 @@ def _audit_trace_associations(
             raise MechanismEvaluationError(
                 f"{label} line {line_number} mode/model does not match its replay"
             )
+        parse_status = str(record.get("parse_status") or "")
+        actual_model = record.get("actual_model")
+        response_id = record.get("response_id")
+        if not isinstance(actual_model, str) or not isinstance(response_id, str):
+            raise MechanismEvaluationError(
+                f"{label} line {line_number} lacks provider response identity"
+            )
+        is_transport_failure = parse_status in {"exception", "transport_failure"}
+        if is_transport_failure:
+            if actual_model or response_id:
+                raise MechanismEvaluationError(
+                    f"{label} line {line_number} transport failure carries stale response identity"
+                )
+        else:
+            if actual_model != model:
+                raise MechanismEvaluationError(
+                    f"{label} line {line_number} actual response model does not match its replay"
+                )
+            if not response_id.strip():
+                raise MechanismEvaluationError(
+                    f"{label} line {line_number} lacks a provider response ID"
+                )
+            if response_id in response_ids:
+                raise MechanismEvaluationError(
+                    f"{label} contains a duplicate provider response ID"
+                )
+            response_ids.add(response_id)
         attempt = meta.get("attempt", 1 if arm == "legacy" else None)
         if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
             raise MechanismEvaluationError(
@@ -563,6 +591,8 @@ def _audit_trace_associations(
         "record_count": sum(counts.values()),
         "sample_count": sum(value > 0 for value in counts.values()),
         "raw_response_sample_count": sum(value > 0 for value in raw_counts.values()),
+        "provider_response_id_count": len(response_ids),
+        "provider_response_ids_sha256": _object_sha256(sorted(response_ids)),
         "per_sample_record_count_sha256": _object_sha256(
             [counts.get(key, 0) for key in expected]
         ),

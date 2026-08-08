@@ -65,7 +65,7 @@ conda run -n physicsverifier python scripts/run_checker_replay.py \
 
 三种模式必须使用独立 output（同时作为原子 checkpoint）/report/LLM trace。它们只共享冻结 retrieval；由于 Checker prompt/schema、Checker candidates 和 release gate 会随模式变化，三组是独立的 **Checker + release gate system arms**，不是 shared-candidate gate-only 消融。
 
-回放配置会绑定 frozen manifest、Git/source tree、conda Python/package set、API endpoint 摘要和传输参数。`--run-kind validation`/`final` 强制 clean worktree 且禁止 Checker cache，运行结束再次核验 source tree；raw-response trace 不保存 prompt。`--resume` 会校验 sidecar 与 trace 前缀，并显式审计崩溃后已写入但尚未 checkpoint 的 orphan trace。
+回放配置会绑定 frozen manifest、Git/source tree、conda Python/package set、API endpoint 摘要和传输参数。每次非 transport LLM 响应还必须记录供应商返回的 `actual_model` 和非空、格内唯一的 `response_id`；实际模型必须精确等于配置模型。`--run-kind validation`/`final` 强制 clean worktree 且禁止 Checker cache，运行结束再次核验 source tree；raw-response trace 不保存 prompt。`--resume` 会校验 sidecar 与 trace 前缀，并显式审计崩溃后已写入但尚未 checkpoint 的 orphan trace。
 
 三臂结束后冻结共同有效集：
 
@@ -83,7 +83,7 @@ conda run -n physicsverifier python scripts/build_checker_common_valid.py \
 
 Checker 传输/解析/schema 失败会保存状态并进入 evaluator coverage，不计为 TN/FN。非 `legacy` 下，bottom-up experience-code fail 仅保留为 audit，主诊断和 evaluator 都不将其当作预测。
 
-当前状态：**P2 工程已收口；P3 构造、target-binding 回放、门禁评估和 semantic trace schema 审计入口已经落地。正式 300 例生成与 Qwen30B 九格回放尚未运行，因而没有效果结论**。合并 P3 后全量回归为 365/365 通过。
+当前状态：**P2 工程已收口；P3 构造、target-binding 回放、门禁评估和 semantic trace schema 审计入口已经落地。正式 300 例生成与 Qwen30B 九格回放尚未运行，因而没有效果结论**。合并 P3 与响应身份门禁后全量回归为 368/368 通过。
 
 ## P3 规则级机制门禁
 
@@ -175,7 +175,7 @@ conda run -n physicsverifier python scripts/evaluate_checker_mechanism_gate.py \
 
 主实验的 estimand 是：**预注册目标规则已提供时，Checker + release gate 能否正确发布或抑制诊断**。它不包含 retrieval，不能被表述为端到端 verifier 效果。三臂均独立调用 Qwen30B：`legacy` 和 `dual_evidence` 是消融基线，只有 `dual_evidence_consistency` 是候选判门臂；三者共享同一冻结 target trace，但不共享 Checker 响应或候选诊断。
 
-正式矩阵为 60 规则 × 5 机制 × 3 臂 × 3 次独立重复，即 2700 个运行单元。每个格子关闭 cache，使用独立 output/report/raw-response trace，并固定 `--checker-json-attempts 3 --llm-temperature 0.1 --llm-max-output-tokens 2048 --precision-mode strict`。先从生成器输出冻结 replay manifest：
+正式矩阵为 60 规则 × 5 机制 × 3 臂 × 3 次独立重复，即 2700 个运行单元。每个格子关闭 cache，使用独立 output/report/raw-response trace，并固定 `--checker-json-attempts 3 --llm-temperature 0.1 --llm-max-output-tokens 2048 --precision-mode strict`。供应商实际返回模型必须精确为 `qwen3-30b-a3b-instruct-2507`，所有非 transport 响应必须具有非空且格内唯一的 `response_id`。先从生成器输出冻结 replay manifest：
 
 ```bash
 conda run -n physicsverifier python scripts/run_checker_replay.py \

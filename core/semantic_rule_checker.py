@@ -415,7 +415,7 @@ class SemanticRuleChecker:
             return True
         return self._llm_calls_used < self.max_llm_calls
 
-    def _llm_json_http(self, messages: List[Dict[str, str]]) -> str:
+    def _llm_json_http(self, messages: List[Dict[str, str]]) -> Dict[str, str]:
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is not set")
@@ -441,7 +441,11 @@ class SemanticRuleChecker:
         )
         with urllib.request.urlopen(req, timeout=self.llm_timeout_sec) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        return str(data["choices"][0]["message"]["content"] or "")
+        return {
+            "raw_response": str(data["choices"][0]["message"]["content"] or ""),
+            "actual_model": str(data.get("model") or "").strip(),
+            "response_id": str(data.get("id") or "").strip(),
+        }
 
     def _append_llm_trace(self, record: Dict[str, Any]) -> None:
         if not self.llm_trace_path:
@@ -519,6 +523,8 @@ class SemanticRuleChecker:
                 )
             self._cache_delete("llm_json", payload)
 
+        actual_model = ""
+        response_id = ""
         try:
             messages = [
                 {"role": "system", "content": system_prompt},
@@ -536,14 +542,21 @@ class SemanticRuleChecker:
                     timeout=self.llm_timeout_sec,
                     **_openai_disable_thinking_kwargs(),
                 )
+                actual_model = str(getattr(response, "model", "") or "").strip()
+                response_id = str(getattr(response, "id", "") or "").strip()
                 resp = response.choices[0].message.content
             else:
-                resp = self._llm_json_http(messages)
+                provider_response = self._llm_json_http(messages)
+                resp = provider_response["raw_response"]
+                actual_model = provider_response["actual_model"]
+                response_id = provider_response["response_id"]
             self._llm_calls_used += 1
 
             trace_record = {
                 "ts": datetime.datetime.now().isoformat(),
                 "model": self.llm_model,
+                "actual_model": actual_model,
+                "response_id": response_id,
                 "checker_mode": self.checker_mode,
                 "trace_meta": trace_meta or {},
                 "raw_response": resp,
@@ -612,6 +625,8 @@ class SemanticRuleChecker:
                 {
                     "ts": datetime.datetime.now().isoformat(),
                     "model": self.llm_model,
+                    "actual_model": actual_model,
+                    "response_id": response_id,
                     "checker_mode": self.checker_mode,
                     "trace_meta": trace_meta or {},
                     "parse_status": "exception",
@@ -626,7 +641,9 @@ class SemanticRuleChecker:
                 errors=[f"{type(e).__name__}: {e}"],
             )
 
-    def _request_json_object_text(self, system_prompt: str, user_prompt: str) -> str:
+    def _request_json_object_text(
+        self, system_prompt: str, user_prompt: str
+    ) -> Dict[str, str]:
         """Request one raw JSON-object response for the strict checker modes.
 
         This deliberately does not share the legacy parser: a transport failure,
@@ -653,7 +670,11 @@ class SemanticRuleChecker:
                 timeout=self.llm_timeout_sec,
                 **_openai_disable_thinking_kwargs(),
             )
-            return str(response.choices[0].message.content or "")
+            return {
+                "raw_response": str(response.choices[0].message.content or ""),
+                "actual_model": str(getattr(response, "model", "") or "").strip(),
+                "response_id": str(getattr(response, "id", "") or "").strip(),
+            }
         return self._llm_json_http(messages)
 
     @staticmethod
@@ -909,6 +930,8 @@ class SemanticRuleChecker:
             trace_record: Dict[str, Any] = {
                 "ts": datetime.datetime.now().isoformat(),
                 "model": self.llm_model,
+                "actual_model": "",
+                "response_id": "",
                 "checker_mode": self.checker_mode,
                 "trace_meta": {**(trace_meta or {}), "attempt": attempt_index},
                 "retry_category": retry_category,
@@ -917,7 +940,12 @@ class SemanticRuleChecker:
                 trace_record["system_prompt"] = system_prompt
                 trace_record["user_prompt"] = attempt_user_prompt
             try:
-                raw_response = self._request_json_object_text(system_prompt, attempt_user_prompt)
+                provider_response = self._request_json_object_text(
+                    system_prompt, attempt_user_prompt
+                )
+                raw_response = provider_response["raw_response"]
+                trace_record["actual_model"] = provider_response["actual_model"]
+                trace_record["response_id"] = provider_response["response_id"]
             except Exception as exc:
                 failure_status = "transport_failure"
                 failure_errors = [f"{type(exc).__name__}: {exc}"]

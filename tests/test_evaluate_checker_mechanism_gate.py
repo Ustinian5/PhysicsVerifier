@@ -314,6 +314,8 @@ class MechanismGateEvaluatorTests(unittest.TestCase):
                 ),
                 "raw_response": json.dumps({"run": prefix, "case": row["id"]}),
                 "model": "qwen3-30b-a3b-instruct-2507",
+                "actual_model": "qwen3-30b-a3b-instruct-2507",
+                "response_id": f"response::{prefix}::{row['id']}",
                 "checker_mode": arm,
                 "trace_meta": {
                     "sample_id": row["id"],
@@ -658,6 +660,70 @@ class MechanismGateEvaluatorTests(unittest.TestCase):
                 require_full_matrix=False,
             )
 
+    def test_trace_provider_response_identity_is_strict_and_unique(self) -> None:
+        result_path, report_path = self._write_run("legacy", 1)
+        accepted = evaluate_mechanism_gate(
+            dataset_path=self.dataset_path,
+            formal=False,
+            run_specs=[("legacy", 1, result_path, report_path)],
+            require_full_matrix=False,
+        )
+        association = accepted["cells"]["legacy::r1"]["llm_trace_association"]
+        self.assertEqual(
+            association["provider_response_id_count"], len(self.dataset)
+        )
+
+        mutations = (
+            (
+                "missing",
+                lambda records: records[0].pop("actual_model"),
+                "lacks provider response identity",
+            ),
+            (
+                "model-mismatch",
+                lambda records: records[0].__setitem__("actual_model", "other-model"),
+                "actual response model does not match",
+            ),
+            (
+                "missing-id",
+                lambda records: records[0].__setitem__("response_id", ""),
+                "lacks a provider response ID",
+            ),
+            (
+                "duplicate-id",
+                lambda records: records[1].__setitem__(
+                    "response_id", records[0]["response_id"]
+                ),
+                "duplicate provider response ID",
+            ),
+        )
+        for name, mutate, error in mutations:
+            with self.subTest(name=name):
+                result_path, report_path = self._write_run("dual_evidence", 1)
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+                trace_path = Path(report["configuration"]["llm_trace_path"])
+                records = [
+                    json.loads(line)
+                    for line in trace_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                mutate(records)
+                trace_path.write_text(
+                    "".join(json.dumps(row, sort_keys=True) + "\n" for row in records),
+                    encoding="utf-8",
+                )
+                report["llm_trace"] = _audit_llm_trace(trace_path)
+                self._write_json(report_path, report)
+                with self.assertRaisesRegex(MechanismEvaluationError, error):
+                    evaluate_mechanism_gate(
+                        dataset_path=self.dataset_path,
+                        formal=False,
+                        run_specs=[
+                            ("dual_evidence", 1, result_path, report_path)
+                        ],
+                        require_full_matrix=False,
+                    )
+
     def test_trace_attempt_sequence_and_status_must_match_decision(self) -> None:
         result_path, report_path = self._write_run("dual_evidence", 1)
         report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -690,7 +756,9 @@ class MechanismGateEvaluatorTests(unittest.TestCase):
             for line in trace_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
-        records.append(copy.deepcopy(records[0]))
+        duplicate_attempt = copy.deepcopy(records[0])
+        duplicate_attempt["response_id"] += "::duplicate-attempt"
+        records.append(duplicate_attempt)
         trace_path.write_text(
             "".join(json.dumps(row, sort_keys=True) + "\n" for row in records),
             encoding="utf-8",

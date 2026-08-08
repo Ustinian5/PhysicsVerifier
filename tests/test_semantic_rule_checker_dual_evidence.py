@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List
+from unittest import mock
 
 from core.semantic_rule_checker import SemanticRuleChecker
 
@@ -115,14 +117,20 @@ def _strict_checker(
     queue = list(responses)
     prompts: List[str] = []
 
-    def _request(_system_prompt: str, user_prompt: str) -> str:
+    def _request(_system_prompt: str, user_prompt: str) -> Dict[str, str]:
         prompts.append(user_prompt)
         item = queue.pop(0)
         if isinstance(item, BaseException):
             raise item
         if isinstance(item, str):
-            return item
-        return json.dumps(item, ensure_ascii=False)
+            raw_response = item
+        else:
+            raw_response = json.dumps(item, ensure_ascii=False)
+        return {
+            "raw_response": raw_response,
+            "actual_model": "fake-model",
+            "response_id": f"fake-response-{len(prompts)}",
+        }
 
     checker._request_json_object_text = _request  # type: ignore[method-assign]
     checker._test_prompts = prompts  # type: ignore[attr-defined]
@@ -316,15 +324,32 @@ class SemanticRuleCheckerDualEvidenceTest(unittest.TestCase):
             (_payload(rule_id="other_rule"), "schema"),
         ]:
             with self.subTest(expected_category=expected_category):
-                checker = _strict_checker([first_response, _payload()], attempts=2)
-                result = checker.analyze(_sample())
-                decision = result["checker_decisions"][0]
-                self.assertEqual(decision["attempt_count"], 2)
-                self.assertEqual(decision["attempts"][1]["retry_category"], expected_category)
-                retry_prompt = checker._test_prompts[1]  # type: ignore[attr-defined]
-                self.assertIn(f"generic {expected_category} error", retry_prompt)
-                self.assertNotIn("not-json", retry_prompt)
-                self.assertEqual(result["checker_status"], "valid_with_diagnostics")
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    checker = _strict_checker([first_response, _payload()], attempts=2)
+                    trace_path = Path(tmpdir) / "strict.trace.jsonl"
+                    checker.llm_trace_path = str(trace_path)
+                    result = checker.analyze(_sample())
+                    decision = result["checker_decisions"][0]
+                    self.assertEqual(decision["attempt_count"], 2)
+                    self.assertEqual(
+                        decision["attempts"][1]["retry_category"], expected_category
+                    )
+                    retry_prompt = checker._test_prompts[1]  # type: ignore[attr-defined]
+                    self.assertIn(f"generic {expected_category} error", retry_prompt)
+                    self.assertNotIn("not-json", retry_prompt)
+                    self.assertEqual(result["checker_status"], "valid_with_diagnostics")
+                    trace_records = [
+                        json.loads(line)
+                        for line in trace_path.read_text(encoding="utf-8").splitlines()
+                    ]
+                    self.assertEqual(
+                        [record["actual_model"] for record in trace_records],
+                        ["fake-model", "fake-model"],
+                    )
+                    self.assertEqual(
+                        [record["response_id"] for record in trace_records],
+                        ["fake-response-1", "fake-response-2"],
+                    )
 
     def test_valid_empty_is_distinct_from_parse_and_transport_failure(self) -> None:
         valid_empty = _strict_checker(
@@ -588,6 +613,8 @@ class SemanticRuleCheckerDualEvidenceTest(unittest.TestCase):
                 chat=SimpleNamespace(
                     completions=SimpleNamespace(
                         create=lambda **_kwargs: SimpleNamespace(
+                            id="response-legacy-1",
+                            model="fake-model",
                             choices=[SimpleNamespace(message=SimpleNamespace(content="[]"))]
                         )
                     )
@@ -621,6 +648,82 @@ class SemanticRuleCheckerDualEvidenceTest(unittest.TestCase):
             self.assertEqual([record["checker_mode"] for record in records], ["legacy", "legacy"])
             self.assertEqual(records[0]["parse_status"], "json.loads_ok")
             self.assertEqual(records[1]["parse_status"], "exception")
+            self.assertEqual(records[0]["actual_model"], "fake-model")
+            self.assertEqual(records[0]["response_id"], "response-legacy-1")
+            self.assertEqual(records[1]["actual_model"], "")
+            self.assertEqual(records[1]["response_id"], "")
+
+    def test_http_transport_preserves_provider_response_identity(self) -> None:
+        checker = SemanticRuleChecker(
+            llm_model=None,
+            rules=[RULE_ID],
+            enable_cache=False,
+            use_symbol_graph=False,
+        )
+        checker.llm_model = "fake-model"
+        payload = json.dumps(
+            {
+                "id": "response-http-1",
+                "model": "fake-model",
+                "choices": [{"message": {"content": "[]"}}],
+            }
+        ).encode("utf-8")
+
+        class _Response:
+            def __enter__(self) -> "_Response":
+                return self
+
+            def __exit__(self, *_args: Any) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return payload
+
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}), mock.patch(
+            "core.semantic_rule_checker.urllib.request.urlopen",
+            return_value=_Response(),
+        ):
+            response = checker._llm_json_http(
+                [{"role": "user", "content": "test"}]
+            )
+        self.assertEqual(
+            response,
+            {
+                "raw_response": "[]",
+                "actual_model": "fake-model",
+                "response_id": "response-http-1",
+            },
+        )
+
+    def test_strict_sdk_transport_preserves_provider_response_identity(self) -> None:
+        checker = SemanticRuleChecker(
+            llm_model=None,
+            rules=[RULE_ID],
+            enable_cache=False,
+            use_symbol_graph=False,
+        )
+        checker.llm_model = "fake-model"
+        checker._llm = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=lambda **_kwargs: SimpleNamespace(
+                        id="response-sdk-1",
+                        model="fake-model",
+                        choices=[
+                            SimpleNamespace(message=SimpleNamespace(content="{}"))
+                        ],
+                    )
+                )
+            )
+        )
+        self.assertEqual(
+            checker._request_json_object_text("system", "user"),
+            {
+                "raw_response": "{}",
+                "actual_model": "fake-model",
+                "response_id": "response-sdk-1",
+            },
+        )
 
 
 if __name__ == "__main__":
