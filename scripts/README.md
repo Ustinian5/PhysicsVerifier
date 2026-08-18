@@ -23,7 +23,7 @@
 
 `run_physics_eval_pipeline.py` 是正式实验入口：必须显式传入 `unified_rules_v2` catalog，可显式传入 `--checker-gate-mode` 和 `--checker-json-attempts`，默认复用当前 conda Python，自动关闭跨运行 LLM cache、逐题 checkpoint，并生成 `schema_version=1` 的实验 manifest。development 可记录 dirty 状态；validation/final 强制 clean worktree。冻结清单使用 `--manifest-output experiments/manifests/<run-id>.json`。
 
-本机脚本统一使用 conda `physicsverifier`；正式服务器使用已有 conda `physics`。两者都不直接使用系统 Python。
+本机脚本统一使用 conda `physicsverifier`，不直接使用系统 Python。个人计算资源的环境与命令不进入共享文档。
 
 ## P2 Checker 与受控回放
 
