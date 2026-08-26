@@ -209,9 +209,11 @@ __marimo__/
 
 # data
 data/
+/data
 
 # results
 results/
+/results
 
 # logs
 logs/

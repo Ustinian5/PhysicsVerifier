@@ -1,0 +1,6 @@
+fastapi
+pydantic
+pylatexenc
+requests
+torch
+uvicorn
