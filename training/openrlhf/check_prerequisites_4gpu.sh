@@ -28,6 +28,18 @@ check "8B config" test -f "${QWEN8B_MODEL_DIR}/config.json"
 warn "openrlhf import" "${PYTHON}" -c "import openrlhf"
 warn "vllm import" "${PYTHON}" -c "import vllm"
 warn "fabricmanager active" systemctl is-active nvidia-fabricmanager
+CONTRACT_ARGS=()
+if [[ -n "${OPENRLHF_ROOT:-}" ]]; then
+  CONTRACT_ARGS+=(--source-root "${OPENRLHF_ROOT}")
+fi
+if [[ -n "${OPENRLHF_EXPECTED_COMMIT:-}" ]]; then
+  CONTRACT_ARGS+=(--expected-commit "${OPENRLHF_EXPECTED_COMMIT}")
+fi
+if [[ "${OPENRLHF_REQUIRE_CLEAN:-0}" == "1" ]]; then
+  CONTRACT_ARGS+=(--require-clean)
+fi
+check "patched OpenRLHF contract" \
+  "${PYTHON}" "${ROOT}/training/openrlhf/openrlhf_contract.py" "${CONTRACT_ARGS[@]}"
 
 if [[ -n "${PHYSICSVERIFIER_OPENAI_BASE_URL:-}" ]]; then
   check "external verifier API env" bash -c '[[ -n "${PHYSICSVERIFIER_OPENAI_BASE_URL}" ]]'

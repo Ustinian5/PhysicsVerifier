@@ -50,7 +50,7 @@ def _parse_answer(answer: Any) -> List[str]:
     if answer is None:
         return []
     if isinstance(answer, list):
-        return [str(x) for x in answer if x]
+        return [str(x) for x in answer if x is not None and str(x).strip()]
     text = str(answer).strip()
     if not text:
         return []
@@ -62,6 +62,22 @@ def _parse_answer(answer: Any) -> List[str]:
         except Exception:
             pass
     return [text]
+
+
+def _first_present(record: Dict[str, Any], keys: Iterable[str]) -> Any:
+    """Return the first non-empty field while preserving valid falsy values such as 0."""
+    for key in keys:
+        if key not in record:
+            continue
+        value = record.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        if isinstance(value, (list, dict)) and not value:
+            continue
+        return value
+    return None
 
 
 def _iter_records(path: Path) -> Iterable[Dict[str, Any]]:
@@ -97,12 +113,9 @@ def _iter_records(path: Path) -> Iterable[Dict[str, Any]]:
 
 
 def _extract_qa(record: Dict[str, Any]) -> Optional[Tuple[str, List[str], str]]:
-    question = (
-        record.get("question")
-        or record.get("prompt")
-        or record.get("input")
-        or ""
-    )
+    question = _first_present(record, ("question", "prompt", "input"))
+    if question is None:
+        question = ""
     if isinstance(question, list):
         parts = []
         for msg in question:
@@ -113,17 +126,16 @@ def _extract_qa(record: Dict[str, Any]) -> Optional[Tuple[str, List[str], str]]:
     if not question:
         return None
 
-    answer = (
-        record.get("answer")
-        or record.get("reference_answer")
-        or record.get("label")
-        or record.get("ground_truth")
+    answer = _first_present(
+        record,
+        ("answer", "reference_answer", "label", "ground_truth"),
     )
     labels = _parse_answer(answer)
     if not labels:
         return None
 
-    sample_id = str(record.get("id") or record.get("sample_id") or record.get("rollout_id") or "")
+    sample_id_value = _first_present(record, ("id", "sample_id", "rollout_id"))
+    sample_id = "" if sample_id_value is None else str(sample_id_value)
     return question, labels, sample_id
 
 

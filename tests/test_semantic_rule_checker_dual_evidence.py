@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List
 from unittest import mock
 
-from core.semantic_rule_checker import SemanticRuleChecker
+from core.semantic_rule_checker import ProviderIdentityError, SemanticRuleChecker
 
 
 RULE_ID = "generic_rule"
@@ -724,6 +724,33 @@ class SemanticRuleCheckerDualEvidenceTest(unittest.TestCase):
                 "response_id": "response-sdk-1",
             },
         )
+
+    def test_required_provider_identity_rejects_wrong_model(self) -> None:
+        checker = SemanticRuleChecker(
+            llm_model=None,
+            rules=[RULE_ID],
+            enable_cache=False,
+            use_symbol_graph=False,
+            require_provider_identity=True,
+            expected_provider_model="expected-model",
+        )
+        checker.llm_model = "expected-model"
+        checker._llm = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=lambda **_kwargs: SimpleNamespace(
+                        id="response-sdk-2",
+                        model="wrong-model",
+                        choices=[
+                            SimpleNamespace(message=SimpleNamespace(content="{}"))
+                        ],
+                    )
+                )
+            )
+        )
+
+        with self.assertRaisesRegex(ProviderIdentityError, "provider model mismatch"):
+            checker._request_json_object_text("system", "user")
 
 
 if __name__ == "__main__":

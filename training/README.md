@@ -21,17 +21,25 @@ bash training/reward_server/verify_external_api.sh
 
 ## Verifier profile
 
-默认规则库为 `catalogs/rules_unified_3000_runtime_backfilled.json`，检索模式为 `semantic`。由于该库的 `norm_*` Rule ID 没有匹配的历史 `exp_*` manifest，默认关闭符号核查。
+Verifier reward 不再隐式选择规则库；启动时必须通过环境显式绑定 catalog。当前 development 基线是 `catalogs/rules_unified_3000.json`（1123 条），4875 条 runtime-backfilled 库只保留为已否决的历史消融。检索模式默认为 `semantic`，符号核查默认关闭。
 
 可通过以下环境变量显式覆盖：
 
 - `PHYSICSVERIFIER_UNIFIED_RULES`
 - `PHYSICSVERIFIER_UNIFIED_RETRIEVAL_MODE`
+- `PHYSICSVERIFIER_CHECKER_GATE_MODE`
+- `PHYSICSVERIFIER_CHECKER_JSON_ATTEMPTS`
+- `PHYSICSVERIFIER_SEMANTIC_JSON_ATTEMPTS`
 - `PHYSICSVERIFIER_SYMBOLIC_ENABLED`
 - `PHYSICSVERIFIER_SYMBOLIC_MANIFEST`
 - `PHYSICSVERIFIER_LLM_MODEL`
+- `PHYSICSVERIFIER_REQUIRE_PROVIDER_IDENTITY`
 
 根目录 `.env.example` 给出共享配置模板。
+
+## OpenRLHF engine contract
+
+四卡入口使用项目定制的 variance-filter 参数；官方 OpenRLHF 0.8.2 本身不包含这组扩展。训练会在分配 Ray/GPU 前运行 `openrlhf_contract.py`，校验所需参数与 `dynamic_filter.py` 接口，并把 OpenRLHF commit、dirty diff hash、规则库、训练数据和 Reward Server 身份写入运行目录。缺少外部补丁时流程会明确失败，不再静默使用不等价实现。
 
 ## 边界
 

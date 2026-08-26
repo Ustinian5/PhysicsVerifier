@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
-# Compare reward modes on a fixed heldout prompt slice.
+# Re-score one frozen rollout set under each reward mode.
 set -euo pipefail
 
 ROOT="${PHYSICS_ROOT:-/home/jinjianhan/PhysicsVerifier}"
 VENV="${VENV:-${ROOT}/.venv}"
-INPUT="${INPUT:-${ROOT}/data/rl/heldout_eval.jsonl}"
+PYTHON="${PYTHON:-${VENV}/bin/python}"
+INPUT="${INPUT:-${ROOT}/data/rl/baseline_rollout_scores.jsonl}"
 OUT_DIR="${OUT_DIR:-${ROOT}/results/reward_ablation}"
 MAX_SAMPLES="${MAX_SAMPLES:-32}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8770}"
 
 mkdir -p "${OUT_DIR}"
-MODES=(answer_only)
-if [[ -n "${PHYSICSVERIFIER_OPENAI_BASE_URL:-}" ]] || curl -sf http://127.0.0.1:8766/v1/models >/dev/null 2>&1; then
-  MODES+=(answer_low_verifier answer_full_verifier)
+if [[ ! -s "${INPUT}" ]]; then
+  echo "[error] frozen rollout file is missing or empty: ${INPUT}" >&2
+  echo "[error] reward ablation requires stored responses, not prompt-only heldout data" >&2
+  exit 2
 fi
+MODES=(answer_only answer_low_verifier answer_full_verifier)
 
 for mode in "${MODES[@]}"; do
   export PHYSICS_REWARD_MODE="${mode}"
@@ -25,7 +28,7 @@ for mode in "${MODES[@]}"; do
   fi
   bash "${ROOT}/training/reward_server/start_reward_server.sh"
   OUT_JSON="${OUT_DIR}/${mode}.json"
-  "${VENV}/bin/python" - <<PY
+  "${PYTHON}" - <<PY
 import json, os, requests
 from pathlib import Path
 
@@ -38,13 +41,20 @@ with Path("${INPUT}").open("r", encoding="utf-8") as f:
         if int("${MAX_SAMPLES}") and i >= int("${MAX_SAMPLES}"):
             break
         row = json.loads(line)
-        prompt = row.get("input") or row.get("prompt") or ""
+        prompt = row.get("input") if "input" in row else row.get("prompt")
         if isinstance(prompt, list):
-            prompt = " ".join(
-                str(m.get("content", "")) for m in prompt if isinstance(m, dict)
+            prompt = "\n".join(
+                f"{m.get('role', 'user')}: {m.get('content', '')}"
+                for m in prompt if isinstance(m, dict)
             )
-        label = row.get("label") or ""
-        query = f"{prompt}\\nassistant\\nplaceholder"
+        prompt = str(prompt or "")
+        response = row.get("response")
+        label = row.get("label")
+        if response is None or not str(response).strip():
+            raise ValueError(f"row {i} has no stored response")
+        if label is None or (isinstance(label, str) and not label.strip()):
+            raise ValueError(f"row {i} has no ground-truth label")
+        query = prompt + str(response)
         payload = {"query": [query], "prompts": [prompt], "labels": [label]}
         resp = requests.post("http://${HOST}:${PORT}/get_reward", json=payload, timeout=120)
         resp.raise_for_status()

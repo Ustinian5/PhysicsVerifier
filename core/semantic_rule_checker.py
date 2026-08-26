@@ -41,6 +41,10 @@ except ImportError:
 SEMANTIC_RULE_CHECKER_PROMPT_VERSION = "semantic-rule-checker-dual-evidence-v1"
 
 
+class ProviderIdentityError(RuntimeError):
+    """The endpoint response cannot be attributed to the requested model."""
+
+
 # ------------------------- 符号节点网络 (保持不变) -------------------------
 @dataclass
 class SymbolNode:
@@ -256,7 +260,9 @@ class SemanticRuleChecker:
                  use_symbol_graph: bool = True,
                  checker_mode: str = "legacy",
                  checker_json_attempts: int = 2,
-                 checker_min_confidence: float = 0.8) -> None:
+                 checker_min_confidence: float = 0.8,
+                 require_provider_identity: bool = False,
+                 expected_provider_model: Optional[str] = None) -> None:
         self.llm_model = llm_model
         self.max_llm_calls = int(max_llm_calls)
         self.logger = logger
@@ -282,6 +288,14 @@ class SemanticRuleChecker:
         self.checker_min_confidence = float(checker_min_confidence)
         if not math.isfinite(self.checker_min_confidence) or not 0.0 <= self.checker_min_confidence <= 1.0:
             raise ValueError("checker_min_confidence must be between 0.0 and 1.0")
+        self.require_provider_identity = bool(require_provider_identity)
+        self.expected_provider_model = str(
+            expected_provider_model or self.llm_model or ""
+        ).strip()
+        if self.require_provider_identity and not self.expected_provider_model:
+            raise ValueError(
+                "expected_provider_model or llm_model is required when provider identity is enforced"
+            )
         self.llm_trace_path = str(os.getenv("PHYSICSVERIFIER_LLM_TRACE_PATH") or "").strip()
         self.llm_trace_include_prompts = str(os.getenv("PHYSICSVERIFIER_LLM_TRACE_INCLUDE_PROMPTS") or "").strip().lower() in {"1", "true", "yes"}
         self._http_llm_enabled = False
@@ -309,6 +323,10 @@ class SemanticRuleChecker:
             self._log("Running in 'direct' rule mode. Using raw rule descriptions as prompts.")
 
         self.enable_cache = bool(enable_cache)
+        if self.require_provider_identity and self.enable_cache:
+            raise ValueError(
+                "LLM cache must be disabled when provider response identity is enforced"
+            )
         self._cache: Dict[str, Any] = {}
         try:
             base_dir = Path(__file__).parent
@@ -415,6 +433,21 @@ class SemanticRuleChecker:
             return True
         return self._llm_calls_used < self.max_llm_calls
 
+    def _validate_provider_response_identity(
+        self, actual_model: str, response_id: str
+    ) -> None:
+        if not self.require_provider_identity:
+            return
+        actual = str(actual_model or "").strip()
+        response = str(response_id or "").strip()
+        if actual != self.expected_provider_model:
+            raise ProviderIdentityError(
+                "provider model mismatch: "
+                f"expected {self.expected_provider_model!r}, received {actual or '<empty>'!r}"
+            )
+        if not response:
+            raise ProviderIdentityError("provider response id is empty")
+
     def _llm_json_http(self, messages: List[Dict[str, str]]) -> Dict[str, str]:
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
@@ -441,11 +474,12 @@ class SemanticRuleChecker:
         )
         with urllib.request.urlopen(req, timeout=self.llm_timeout_sec) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        return {
+        result = {
             "raw_response": str(data["choices"][0]["message"]["content"] or ""),
             "actual_model": str(data.get("model") or "").strip(),
             "response_id": str(data.get("id") or "").strip(),
         }
+        return result
 
     def _append_llm_trace(self, record: Dict[str, Any]) -> None:
         if not self.llm_trace_path:
@@ -551,6 +585,7 @@ class SemanticRuleChecker:
                 actual_model = provider_response["actual_model"]
                 response_id = provider_response["response_id"]
             self._llm_calls_used += 1
+            self._validate_provider_response_identity(actual_model, response_id)
 
             trace_record = {
                 "ts": datetime.datetime.now().isoformat(),
@@ -670,12 +705,20 @@ class SemanticRuleChecker:
                 timeout=self.llm_timeout_sec,
                 **_openai_disable_thinking_kwargs(),
             )
-            return {
+            result = {
                 "raw_response": str(response.choices[0].message.content or ""),
                 "actual_model": str(getattr(response, "model", "") or "").strip(),
                 "response_id": str(getattr(response, "id", "") or "").strip(),
             }
-        return self._llm_json_http(messages)
+            self._validate_provider_response_identity(
+                result["actual_model"], result["response_id"]
+            )
+            return result
+        result = self._llm_json_http(messages)
+        self._validate_provider_response_identity(
+            result["actual_model"], result["response_id"]
+        )
+        return result
 
     @staticmethod
     def _strict_json_object_pairs(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:

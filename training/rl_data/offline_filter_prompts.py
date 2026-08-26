@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import re
 from collections import Counter, defaultdict
@@ -177,7 +178,22 @@ def simulate_group_rewards(
 def _try_import_filter():
     import importlib.util
 
-    path = Path("/slow_share/jinjianhan/workspace/openrlhf_rl/OpenRLHF/openrlhf/trainer/ppo_utils/dynamic_filter.py")
+    configured = os.environ.get("OPENRLHF_DYNAMIC_FILTER_PATH", "").strip()
+    if configured:
+        path = Path(configured)
+    else:
+        openrlhf_root = Path(
+            os.environ.get(
+                "OPENRLHF_ROOT",
+                "/slow_share/jinjianhan/workspace/openrlhf_rl/OpenRLHF",
+            )
+        )
+        path = openrlhf_root / "openrlhf/trainer/ppo_utils/dynamic_filter.py"
+    if not path.is_file():
+        raise ImportError(
+            "OpenRLHF dynamic_filter.py not found; set OPENRLHF_DYNAMIC_FILTER_PATH "
+            f"or OPENRLHF_ROOT (resolved path: {path})"
+        )
     spec = importlib.util.spec_from_file_location("openrlhf_dynamic_filter", path)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load dynamic_filter from {path}")

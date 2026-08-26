@@ -74,6 +74,8 @@ class PhysicsRuleVerifier:
         semantic_output_adapter: Optional[str] = None,
         checker_gate_mode: str = "legacy",
         checker_json_attempts: Optional[int] = None,
+        require_provider_identity: bool = False,
+        expected_provider_model: Optional[str] = None,
         # Legacy kwargs (accepted for backward compatibility, ignored).
         enable_agentic_postcheck: Optional[bool] = None,
         agentic_max_checks_per_sample: Optional[int] = None,
@@ -208,6 +210,8 @@ class PhysicsRuleVerifier:
             checker_mode=self.checker_gate_mode,
             checker_json_attempts=self.checker_json_attempts,
             checker_min_confidence=self.checker_min_confidence,
+            require_provider_identity=require_provider_identity,
+            expected_provider_model=expected_provider_model,
         )
         # Clear initial translations as we will set them per request
         self.semantic_checker.rule_translations = {} 
@@ -222,6 +226,8 @@ class PhysicsRuleVerifier:
             matcher_kwargs: Dict[str, Any] = {
                 "model": str(self.llm_model or ""),
                 "max_selected_rules": self.unified_rule_top_n,
+                "require_provider_identity": require_provider_identity,
+                "expected_provider_model": expected_provider_model,
             }
             if self.semantic_output_adapter:
                 matcher_kwargs["structured_output_adapter"] = self.semantic_output_adapter

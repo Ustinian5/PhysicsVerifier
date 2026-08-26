@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_MAX_VERIFIER_FAIL_RATE_PERCENT = 0.25
 
 
 def _f(rows: list[dict[str, Any]], key: str) -> float | None:
@@ -103,8 +104,11 @@ def build_admission(
     *,
     target_steps: int = 10,
     train_rc: int | None = None,
+    max_verifier_fail_rate_percent: float = DEFAULT_MAX_VERIFIER_FAIL_RATE_PERCENT,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if not 0.0 <= float(max_verifier_fail_rate_percent) <= 100.0:
+        raise ValueError("max_verifier_fail_rate_percent must be between 0 and 100")
     csv_path = ckpt / "plots/training_metrics.csv"
     rows = _load_csv_rows(csv_path)
     reward_summary = _load_json(ckpt / "plots/reward_metrics_summary.json")
@@ -123,7 +127,8 @@ def build_admission(
         if total:
             reward_summary = {
                 "reward_acc_mean": sum(accs) / total,
-                "reward_verifier_trigger_rate": verifier_hits / total * 100.0,
+                "reward_verifier_trigger_rate": (verifier_hits + verifier_failed) / total * 100.0,
+                "reward_verifier_success_rate": verifier_hits / total * 100.0,
                 "reward_verifier_fail_rate": verifier_failed / total * 100.0,
                 "reward_samples": float(total),
             }
@@ -196,7 +201,11 @@ def build_admission(
     steps_ok = last_step_num >= int(target_steps) or len(rows) >= int(target_steps)
     filtering_ok = (effective_rate or 0) >= 5.0
     reward_not_collapsed = (pilot_reward or 0) > 0.05 or (float(acc_mean or 0) > 0.02)
-    verifier_fail_ok = (verifier_fail <= 0.25) if reward_summary else True
+    verifier_fail_ok = (
+        verifier_fail <= float(max_verifier_fail_rate_percent)
+        if reward_summary
+        else True
+    )
     if str(train_stage) == "bootstrap":
         verifier_fail_ok = True
 
@@ -252,6 +261,7 @@ def build_admission(
         },
         "gpu_utilization_snapshot": gpu_snap_list,
         "reward_summary": reward_summary,
+        "max_verifier_fail_rate_percent": float(max_verifier_fail_rate_percent),
         "filter_diagnostics": filter_diag,
         "filter_rule_comparison": {
             "legacy_mean_range_accept_rate": legacy_rate,
@@ -325,6 +335,11 @@ def main() -> int:
     parser.add_argument("--ckpt", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--target-steps", type=int, default=10)
+    parser.add_argument(
+        "--max-verifier-fail-rate-percent",
+        type=float,
+        default=DEFAULT_MAX_VERIFIER_FAIL_RATE_PERCENT,
+    )
     parser.add_argument("--train-rc", type=int, default=None)
     parser.add_argument("--cuda-ok", type=int, default=1)
     parser.add_argument("--fm-active", type=int, default=0)
@@ -364,6 +379,7 @@ def main() -> int:
         args.ckpt,
         target_steps=args.target_steps,
         train_rc=args.train_rc,
+        max_verifier_fail_rate_percent=args.max_verifier_fail_rate_percent,
         extra=extra,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)

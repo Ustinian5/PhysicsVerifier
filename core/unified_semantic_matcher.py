@@ -46,6 +46,10 @@ class SemanticSelectionError(RuntimeError):
         super().__init__(f"{self.stage}: {type(cause).__name__}: {cause}")
 
 
+class ProviderIdentityError(RuntimeError):
+    """The semantic endpoint response is not attributable to the requested model."""
+
+
 class UnifiedSemanticMatcher:
     MAX_SELECTED_DOMAINS = 2
     MAX_SELECTED_TOPICS = 3
@@ -100,6 +104,8 @@ class UnifiedSemanticMatcher:
         request_timeout: float | None = None,
         allow_json_object_fallback: bool | None = None,
         structured_output_adapter: str | None = None,
+        require_provider_identity: bool = False,
+        expected_provider_model: str | None = None,
     ) -> None:
         self.model = norm_text(model)
         self.temperature = float(temperature)
@@ -168,6 +174,12 @@ class UnifiedSemanticMatcher:
                 f"structured_output_adapter must be one of: {allowed}"
             )
         self.structured_output_adapter = configured_adapter
+        self.require_provider_identity = bool(require_provider_identity)
+        self.expected_provider_model = norm_text(expected_provider_model or self.model)
+        if self.require_provider_identity and not self.expected_provider_model:
+            raise ValueError(
+                "expected_provider_model or model is required when provider identity is enforced"
+            )
         self._json_schema_supported: Optional[bool] = None
         self._client = client
         self._trace_run_active = False
@@ -215,6 +227,8 @@ class UnifiedSemanticMatcher:
                 ),
                 "structured_output_adapter": self.structured_output_adapter,
                 "allow_json_object_fallback": self.allow_json_object_fallback,
+                "require_provider_identity": self.require_provider_identity,
+                "expected_provider_model": self.expected_provider_model,
                 "empty_navigation_recheck": self.json_retries > 0,
                 "max_provisional_rules_per_batch": self.MAX_PROVISIONAL_RULES_PER_BATCH,
             },
@@ -1157,6 +1171,21 @@ class UnifiedSemanticMatcher:
             return norm_text(response_format.get("type") or "")
         return "prompt_only"
 
+    def _validate_provider_response_identity(
+        self, actual_model: str, response_id: str
+    ) -> None:
+        if not self.require_provider_identity:
+            return
+        actual = norm_text(actual_model)
+        response = norm_text(response_id)
+        if actual != self.expected_provider_model:
+            raise ProviderIdentityError(
+                "provider model mismatch: "
+                f"expected {self.expected_provider_model!r}, received {actual or '<empty>'!r}"
+            )
+        if not response:
+            raise ProviderIdentityError("provider response id is empty")
+
     def _chat_json(
         self,
         *,
@@ -1295,11 +1324,16 @@ class UnifiedSemanticMatcher:
                 "response_format": response_format_type,
                 **self._raw_trace_fields(raw),
                 "finish_reason": finish_reason,
+                "actual_model": norm_text(getattr(response, "model", "") or ""),
+                "response_id": norm_text(getattr(response, "id", "") or ""),
             }
             if tool_call_count is not None:
                 attempt_trace["tool_call_count"] = tool_call_count
                 attempt_trace["tool_call_names"] = tool_call_names
             try:
+                self._validate_provider_response_identity(
+                    attempt_trace["actual_model"], attempt_trace["response_id"]
+                )
                 if payload_error:
                     raise RuntimeError(payload_error)
                 if norm_text(finish_reason).casefold() in {"length", "max_tokens"}:
@@ -1354,6 +1388,9 @@ class UnifiedSemanticMatcher:
             except RuntimeError as exc:
                 last_error = exc
                 attempt_trace["error"] = str(exc)
+                if isinstance(exc, ProviderIdentityError):
+                    stage_trace["api_attempts"].append(attempt_trace)
+                    raise
                 violation_kind = (
                     self._format_violation_kind(raw, finish_reason)
                     if response_schema is not None

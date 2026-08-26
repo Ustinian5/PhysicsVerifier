@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# GRPO training for Qwen3-8B physics RL via OpenRLHF on exactly 3 train GPUs
-# (+ 1 external judge GPU managed separately).
+# GRPO training for Qwen3-8B physics RL via OpenRLHF on the GPUs exposed by
+# CUDA_VISIBLE_DEVICES. A local judge GPU, when used, is managed separately.
 #
-# TRAIN_TOPOLOGY=colocate (default): 3 Actor + 3 vLLM TP1 Hybrid Engine
-# TRAIN_TOPOLOGY=split: 2 Actor + 1 vLLM TP1 (OOM/IPC fallback)
+# TRAIN_TOPOLOGY=colocate (default): all visible GPUs host Actor + vLLM engines
+# TRAIN_TOPOLOGY=split: one vLLM engine by default, remaining GPUs host Actor
 #
 # Uses an isolated Ray head (own GCS/dashboard/session). Never attaches to
 # another user's :8265 cluster and never runs global `ray stop --force`.
@@ -44,11 +44,19 @@ IFS=',' read -ra _GPU_ARR <<< "${CUDA_VISIBLE_DEVICES}"
 NUM_TRAIN_GPUS="${NUM_TRAIN_GPUS:-${#_GPU_ARR[@]}}"
 VLLM_TP="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
 TRAIN_TOPOLOGY="${TRAIN_TOPOLOGY:-colocate}"
+if [[ "${NUM_TRAIN_GPUS}" -lt 1 || "${VLLM_TP}" -lt 1 ]]; then
+  echo "[error] NUM_TRAIN_GPUS and VLLM_TENSOR_PARALLEL_SIZE must be positive" >&2
+  exit 1
+fi
 
 case "${TRAIN_TOPOLOGY}" in
   colocate)
-    ACTOR_GPUS="${ACTOR_GPUS:-3}"
-    VLLM_ENGINES="${VLLM_ENGINES:-3}"
+    if [[ $(( NUM_TRAIN_GPUS % VLLM_TP )) -ne 0 ]]; then
+      echo "[error] colocate requires train GPU count divisible by vLLM TP" >&2
+      exit 1
+    fi
+    ACTOR_GPUS="${ACTOR_GPUS:-${NUM_TRAIN_GPUS}}"
+    VLLM_ENGINES="${VLLM_ENGINES:-$(( NUM_TRAIN_GPUS / VLLM_TP ))}"
     VLLM_MEM_UTIL="${VLLM_GPU_MEMORY_UTILIZATION:-0.55}"
     COLLOCATE_ARGS=(--colocate_all_models --vllm_enable_sleep --deepspeed_enable_sleep)
     if [[ "${ACTOR_GPUS}" -ne $(( VLLM_ENGINES * VLLM_TP )) ]]; then
@@ -61,10 +69,14 @@ case "${TRAIN_TOPOLOGY}" in
     fi
     ;;
   split)
-    ACTOR_GPUS="${ACTOR_GPUS:-2}"
     VLLM_ENGINES="${VLLM_ENGINES:-1}"
+    ACTOR_GPUS="${ACTOR_GPUS:-$(( NUM_TRAIN_GPUS - VLLM_ENGINES * VLLM_TP ))}"
     VLLM_MEM_UTIL="${VLLM_GPU_MEMORY_UTILIZATION:-0.70}"
     COLLOCATE_ARGS=()
+    if [[ "${ACTOR_GPUS}" -lt 1 ]]; then
+      echo "[error] split topology leaves no GPU for the Actor" >&2
+      exit 1
+    fi
     if [[ $(( ACTOR_GPUS + VLLM_ENGINES * VLLM_TP )) -ne "${NUM_TRAIN_GPUS}" ]]; then
       echo "[error] split requires ACTOR_GPUS + VLLM_ENGINES*TP == ${NUM_TRAIN_GPUS}" >&2
       exit 1
@@ -77,6 +89,19 @@ case "${TRAIN_TOPOLOGY}" in
 esac
 
 mkdir -p "${SAVE_PATH}" "${SAVE_PATH}/ckpt" "${SAVE_PATH}/runs" "${SAVE_PATH}/plots" "${SAVE_PATH}/ray"
+
+OPENRLHF_CONTRACT="${SAVE_PATH}/openrlhf_contract.json"
+CONTRACT_ARGS=(--output "${OPENRLHF_CONTRACT}")
+if [[ -n "${OPENRLHF_ROOT:-}" ]]; then
+  CONTRACT_ARGS+=(--source-root "${OPENRLHF_ROOT}")
+fi
+if [[ -n "${OPENRLHF_EXPECTED_COMMIT:-}" ]]; then
+  CONTRACT_ARGS+=(--expected-commit "${OPENRLHF_EXPECTED_COMMIT}")
+fi
+if [[ "${OPENRLHF_REQUIRE_CLEAN:-0}" == "1" ]]; then
+  CONTRACT_ARGS+=(--require-clean)
+fi
+"${PYTHON}" "${ROOT}/training/openrlhf/openrlhf_contract.py" "${CONTRACT_ARGS[@]}"
 
 FLASH_ARGS=()
 ATTN_IMPL="${OPENRLHF_ATTN_IMPL:-sdpa}"
@@ -125,10 +150,43 @@ if [[ -s "${HELDOUT_DATA}" && "${PILOT_MAX_STEPS}" -le 0 ]]; then
 fi
 
 MANIFEST="${SAVE_PATH}/run_manifest.json"
-python3 - <<PY >"${MANIFEST}"
-import json, os, datetime
+"${PYTHON}" - <<PY >"${MANIFEST}"
+import datetime
+import json
+import os
+import sys
+import urllib.request
+from pathlib import Path
+
+root = Path("${ROOT}").resolve()
+if str(root) not in sys.path:
+  sys.path.insert(0, str(root))
+
+from training.openrlhf.openrlhf_contract import file_identity, git_identity
+
+with Path("${OPENRLHF_CONTRACT}").open("r", encoding="utf-8") as handle:
+  openrlhf_contract = json.load(handle)
+with urllib.request.urlopen("http://127.0.0.1:8770/health", timeout=10) as response:
+  reward_health = json.load(response)
+catalog = str(((reward_health.get("config") or {}).get("unified_rules") or "")).strip()
+catalog_path = Path(catalog)
+if catalog and not catalog_path.is_absolute():
+  catalog_path = root / catalog_path
+
+artifacts = {
+  "prompt_data": file_identity(Path("${PROMPT_DATA}")),
+  "heldout_data": file_identity(Path("${HELDOUT_DATA}")),
+  "reward_func": file_identity(Path("${REWARD_FUNC}")),
+  "reward_server": file_identity(root / "training/reward_server/physics_reward_server.py"),
+  "model_config": file_identity(Path("${MODEL_PATH}") / "config.json"),
+  "unified_rules": file_identity(catalog_path) if catalog else {"path": "", "exists": False},
+}
 print(json.dumps({
   "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+  "project_git": git_identity(root),
+  "openrlhf_contract": openrlhf_contract,
+  "reward_server_health": reward_health,
+  "artifacts": artifacts,
   "save_path": "${SAVE_PATH}",
   "model_path": "${MODEL_PATH}",
   "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
@@ -146,7 +204,10 @@ print(json.dumps({
   "dynamic_filter_max": float("${FILTER_MAX}"),
   "dynamic_filtering_mode": "${FILTER_MODE}",
   "dynamic_filtering_min_spread": float("${FILTER_MIN_SPREAD}"),
+  "dynamic_filtering_min_std": float("${FILTER_MIN_STD}"),
   "dynamic_filtering_max_gen_batches": int("${MAX_GEN_BATCHES}"),
+  "dynamic_filtering_max_candidate_samples": int("${MAX_CANDIDATE_SAMPLES}"),
+  "dynamic_filtering_budget_exhausted": "${FILTER_BUDGET_ACTION}",
   "n_samples_per_prompt": int("${N_SAMPLES_PER_PROMPT}"),
   "pilot_max_steps": int("${PILOT_MAX_STEPS}"),
   "train_stage": "${TRAIN_STAGE}",
@@ -398,7 +459,7 @@ else
   echo "[launch] Ray job submitted: ${JOB_ID} topology=${TRAIN_TOPOLOGY}"
 fi
 
-python3 - <<PY >"${STATUS_FILE}"
+"${PYTHON}" - <<PY >"${STATUS_FILE}"
 import json, datetime
 print(json.dumps({
   "created_at": datetime.datetime.utcnow().isoformat() + "Z",
@@ -493,7 +554,7 @@ if [[ "${PILOT_MAX_STEPS}" -gt 0 ]]; then
       fi
       if [[ "${TRAIN_TOPOLOGY}" == "colocate" ]] && detect_colocate_failure; then
         echo "[warn] colocate failure detected; signaling fallback to split" | tee -a "${SUBMIT_LOG}"
-        python3 - <<PY >"${SAVE_PATH}/fallback_request.json"
+        "${PYTHON}" - <<PY >"${SAVE_PATH}/fallback_request.json"
 import json, datetime
 print(json.dumps({
   "requested_topology": "split",

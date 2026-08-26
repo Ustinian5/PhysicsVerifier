@@ -43,9 +43,11 @@ pip_install "${PIP}" \
   2>&1 | tee "${LOG_DIR}/pip_torch.log" | tail -15
 
 echo "[deps] Installing OpenRLHF 0.8.2 (matches vLLM 0.8.5) ..."
-# Prefer local git checkout at v0.8.2 if present
+# Prefer the existing local checkout. Do not silently switch revisions: this
+# workflow requires a project-specific variance-filter extension whose exact
+# source identity is validated below.
 if [[ -d "${OPENRLHF_SRC}/.git" ]]; then
-  (cd "${OPENRLHF_SRC}" && git checkout -q v0.8.2 2>/dev/null || true)
+  echo "[deps] Preserving existing OpenRLHF checkout at $(git -C "${OPENRLHF_SRC}" rev-parse --short HEAD)"
   pip_install "${PIP}" -e "${OPENRLHF_SRC}" --no-deps 2>&1 | tee "${LOG_DIR}/pip_openrlhf.log" | tail -10
 else
   pip_install "${PIP}" "openrlhf==0.8.2" --no-deps 2>&1 | tee "${LOG_DIR}/pip_openrlhf.log" | tail -10
@@ -138,4 +140,15 @@ print("deepspeed", deepspeed.__version__)
 print("transformers", transformers.__version__)
 print("ray", ray.__version__)
 PY
+CONTRACT_ARGS=()
+if [[ -d "${OPENRLHF_SRC}/openrlhf" ]]; then
+  CONTRACT_ARGS+=(--source-root "${OPENRLHF_SRC}")
+fi
+if [[ -n "${OPENRLHF_EXPECTED_COMMIT:-}" ]]; then
+  CONTRACT_ARGS+=(--expected-commit "${OPENRLHF_EXPECTED_COMMIT}")
+fi
+if [[ "${OPENRLHF_REQUIRE_CLEAN:-0}" == "1" ]]; then
+  CONTRACT_ARGS+=(--require-clean)
+fi
+"${PYTHON}" "${ROOT}/training/openrlhf/openrlhf_contract.py" "${CONTRACT_ARGS[@]}"
 echo "[ok] OpenRLHF training env ready"

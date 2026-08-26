@@ -22,6 +22,8 @@ class _FakeChoice:
 class _FakeResponse:
     def __init__(self, content: str, finish_reason: str = "stop") -> None:
         self.choices = [_FakeChoice(content, finish_reason)]
+        self.model = "fake-model"
+        self.id = "fake-response-id"
 
 
 _FakeReply = str | tuple[str, str] | Exception
@@ -391,6 +393,21 @@ def _navigation_role_catalog() -> dict:
 
 
 class UnifiedSemanticMatcherTests(unittest.TestCase):
+    def test_required_provider_identity_rejects_wrong_model(self) -> None:
+        matcher = UnifiedSemanticMatcher(
+            model="expected-model",
+            client=_FakeClient(['{"items":[]}']),
+            json_retries=0,
+            require_provider_identity=True,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "provider model mismatch"):
+            matcher._chat_json(
+                system_prompt="system",
+                user_prompt="user",
+                list_key="items",
+            )
+
     def test_request_timeout_is_bounded_and_visible_in_trace(self) -> None:
         matcher = UnifiedSemanticMatcher(
             model="fake-model",

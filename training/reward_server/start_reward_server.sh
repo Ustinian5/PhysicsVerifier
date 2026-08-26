@@ -12,6 +12,14 @@ PID_FILE="${PID_FILE:-${ROOT}/logs/physics_reward_server.pid}"
 mkdir -p "$(dirname "$LOG")"
 
 cd "${ROOT}" || exit 1
+if [[ -f "${ROOT}/.env" ]]; then
+  set -a
+  # Project-owned dotenv files in this workflow use shell-compatible KEY=VALUE syntax.
+  # shellcheck disable=SC1091
+  source "${ROOT}/.env"
+  set +a
+fi
+export PHYSICS_ROOT="${ROOT}"
 export PYTHONPATH="${ROOT}:${PYTHONPATH:-}"
 export PHYSICS_REWARD_LAMBDA="${PHYSICS_REWARD_LAMBDA:-0.3}"
 export PHYSICS_REWARD_ERROR_CAP="${PHYSICS_REWARD_ERROR_CAP:-3}"
@@ -21,6 +29,16 @@ export PHYSICS_REWARD_W_ANSWER="${PHYSICS_REWARD_W_ANSWER:-1.0}"
 export PHYSICS_REWARD_W_FORMAT="${PHYSICS_REWARD_W_FORMAT:-0.05}"
 export PHYSICS_REWARD_W_VERIFIER="${PHYSICS_REWARD_W_VERIFIER:-0.1}"
 export PHYSICS_VERIFIER_SAMPLE_RATE="${PHYSICS_VERIFIER_SAMPLE_RATE:-1.0}"
+export PHYSICS_REWARD_VERIFIER_FAILURE_POLICY="${PHYSICS_REWARD_VERIFIER_FAILURE_POLICY:-raise}"
+export PHYSICSVERIFIER_CHECKER_GATE_MODE="${PHYSICSVERIFIER_CHECKER_GATE_MODE:-legacy}"
+export PHYSICSVERIFIER_CHECKER_JSON_ATTEMPTS="${PHYSICSVERIFIER_CHECKER_JSON_ATTEMPTS:-3}"
+export PHYSICSVERIFIER_SEMANTIC_JSON_ATTEMPTS="${PHYSICSVERIFIER_SEMANTIC_JSON_ATTEMPTS:-3}"
+export PHYSICSVERIFIER_UNIFIED_RULE_TOP_N="${PHYSICSVERIFIER_UNIFIED_RULE_TOP_N:-6}"
+export PHYSICSVERIFIER_PRECISION_MODE="${PHYSICSVERIFIER_PRECISION_MODE:-strict}"
+export PHYSICSVERIFIER_MAX_DIAGNOSTICS_PER_SAMPLE="${PHYSICSVERIFIER_MAX_DIAGNOSTICS_PER_SAMPLE:-12}"
+export PHYSICSVERIFIER_MAX_DIAGNOSTICS_PER_PARAGRAPH="${PHYSICSVERIFIER_MAX_DIAGNOSTICS_PER_PARAGRAPH:-2}"
+export PHYSICSVERIFIER_ENABLE_LLM_CACHE="${PHYSICSVERIFIER_ENABLE_LLM_CACHE:-0}"
+export PHYSICSVERIFIER_REQUIRE_PROVIDER_IDENTITY="${PHYSICSVERIFIER_REQUIRE_PROVIDER_IDENTITY:-1}"
 
 CONFIGURED_OPENAI_BASE_URL="${PHYSICSVERIFIER_OPENAI_BASE_URL:-${OPENAI_BASE_URL:-}}"
 if [[ -n "${PHYSICSVERIFIER_OPENAI_BASE_URL:-}" ]]; then
@@ -32,22 +50,67 @@ fi
 export OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
 export OPENAI_BASE_URL="${OPENAI_BASE_URL:-http://127.0.0.1:8766/v1}"
 export PHYSICSVERIFIER_LLM_MODEL="${PHYSICSVERIFIER_LLM_MODEL:-qwen3-30b-a3b}"
-export PHYSICSVERIFIER_UNIFIED_RULES="${PHYSICSVERIFIER_UNIFIED_RULES:-${ROOT}/catalogs/rules_unified_3000_runtime_backfilled.json}"
+export PHYSICSVERIFIER_UNIFIED_RULES="${PHYSICSVERIFIER_UNIFIED_RULES:-}"
 export PHYSICSVERIFIER_UNIFIED_RETRIEVAL_MODE="${PHYSICSVERIFIER_UNIFIED_RETRIEVAL_MODE:-semantic}"
 # The norm_* runtime catalog has no matching exp_* symbolic manifest.
 export PHYSICSVERIFIER_SYMBOLIC_ENABLED="${PHYSICSVERIFIER_SYMBOLIC_ENABLED:-0}"
+if [[ "${PHYSICS_REWARD_MODE}" != "answer_only" && -z "${PHYSICSVERIFIER_UNIFIED_RULES}" ]]; then
+  echo "[error] set PHYSICSVERIFIER_UNIFIED_RULES explicitly for verifier reward" >&2
+  exit 2
+fi
 
 if [[ -f "$PID_FILE" ]]; then
   old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
   if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
     if curl -sf "http://${HOST}:${PORT}/health" >/dev/null 2>&1; then
-      mode_file="$(dirname "$PID_FILE")/physics_reward_server.mode"
-      old_mode="$(cat "${mode_file}" 2>/dev/null || true)"
-      if [[ "${old_mode}" == "${PHYSICS_REWARD_MODE}" ]]; then
-        echo "[ok] reward server already running pid=$old_pid mode=${PHYSICS_REWARD_MODE}"
+      if curl -sf "http://${HOST}:${PORT}/health" | "${VENV}/bin/python" -c '
+import json, os, sys
+
+actual = (json.load(sys.stdin) or {}).get("config") or {}
+truthy = {"1", "true", "yes", "on"}
+expected = {
+    "reward_mode": os.environ["PHYSICS_REWARD_MODE"],
+    "lambda": float(os.environ["PHYSICS_REWARD_LAMBDA"]),
+    "error_cap": int(os.environ["PHYSICS_REWARD_ERROR_CAP"]),
+    "concurrency": int(os.environ["PHYSICS_REWARD_CONCURRENCY"]),
+    "w_answer": float(os.environ["PHYSICS_REWARD_W_ANSWER"]),
+    "w_format": float(os.environ["PHYSICS_REWARD_W_FORMAT"]),
+    "w_verifier": float(os.environ["PHYSICS_REWARD_W_VERIFIER"]),
+    "w_length": float(os.environ.get("PHYSICS_REWARD_W_LENGTH", "0")),
+    "verifier_sample_rate": float(os.environ["PHYSICS_VERIFIER_SAMPLE_RATE"]),
+    "verifier_failure_policy": os.environ["PHYSICS_REWARD_VERIFIER_FAILURE_POLICY"],
+    "unified_rules": os.environ["PHYSICSVERIFIER_UNIFIED_RULES"],
+    "retrieval_mode": os.environ["PHYSICSVERIFIER_UNIFIED_RETRIEVAL_MODE"],
+    "semantic_output_adapter": os.environ.get("PHYSICSVERIFIER_SEMANTIC_OUTPUT_ADAPTER", ""),
+    "llm_model": os.environ["PHYSICSVERIFIER_LLM_MODEL"],
+    "openai_base_url": os.environ["OPENAI_BASE_URL"],
+    "symbolic_enabled": os.environ.get("PHYSICSVERIFIER_SYMBOLIC_ENABLED", "0").lower() in truthy,
+    "checker_gate_mode": os.environ["PHYSICSVERIFIER_CHECKER_GATE_MODE"],
+    "checker_json_attempts": int(os.environ["PHYSICSVERIFIER_CHECKER_JSON_ATTEMPTS"]),
+    "semantic_json_attempts": int(os.environ["PHYSICSVERIFIER_SEMANTIC_JSON_ATTEMPTS"]),
+    "unified_rule_top_n": int(os.environ["PHYSICSVERIFIER_UNIFIED_RULE_TOP_N"]),
+    "precision_mode": os.environ["PHYSICSVERIFIER_PRECISION_MODE"],
+    "max_diagnostics_per_sample": int(os.environ["PHYSICSVERIFIER_MAX_DIAGNOSTICS_PER_SAMPLE"]),
+    "max_diagnostics_per_paragraph": int(os.environ["PHYSICSVERIFIER_MAX_DIAGNOSTICS_PER_PARAGRAPH"]),
+    "llm_cache_enabled": os.environ["PHYSICSVERIFIER_ENABLE_LLM_CACHE"].lower() in truthy,
+    "require_provider_identity": os.environ["PHYSICSVERIFIER_REQUIRE_PROVIDER_IDENTITY"].lower() in truthy,
+    "max_response_chars": int(os.environ.get("PHYSICS_REWARD_MAX_RESPONSE_CHARS", "12000")),
+    "metrics_log": os.environ.get(
+        "PHYSICS_REWARD_METRICS_LOG",
+        os.path.join(os.environ["PHYSICS_ROOT"], "logs/physics_reward_metrics.jsonl"),
+    ),
+}
+raise SystemExit(0 if actual == expected else 1)
+'; then
+        echo "[ok] reward server already running pid=$old_pid with matching config"
         exit 0
       fi
-      echo "[reward] mode changed (${old_mode} -> ${PHYSICS_REWARD_MODE}); restarting"
+      echo "[reward] running server config differs; restarting"
+      kill -TERM "$old_pid" 2>/dev/null || true
+      sleep 2
+      kill -9 "$old_pid" 2>/dev/null || true
+    else
+      echo "[reward] stale pid=${old_pid} is alive but health check failed; restarting"
       kill -TERM "$old_pid" 2>/dev/null || true
       sleep 2
       kill -9 "$old_pid" 2>/dev/null || true
@@ -55,8 +118,14 @@ if [[ -f "$PID_FILE" ]]; then
   fi
 fi
 
-if [[ -n "${CONFIGURED_OPENAI_BASE_URL}" ]]; then
-  echo "[reward] using external verifier API at ${OPENAI_BASE_URL}"
+if [[ "${PHYSICS_REWARD_MODE}" == "answer_only" ]]; then
+  echo "[reward] answer_only mode; skipping judge/API warmup"
+else
+  if [[ -n "${CONFIGURED_OPENAI_BASE_URL}" ]]; then
+    echo "[reward] using external verifier API at ${OPENAI_BASE_URL}"
+  else
+    echo "[reward] using local verifier API at ${OPENAI_BASE_URL}"
+  fi
   "${VENV}/bin/python" - <<'PY'
 import os, sys
 from openai import OpenAI
@@ -66,16 +135,10 @@ model = os.environ.get("PHYSICSVERIFIER_LLM_MODEL", "")
 client = OpenAI(base_url=base, api_key=key)
 models = [m.id for m in client.models.list().data]
 if model and model not in models:
-    print(f"[warn] configured model {model} not in remote list; available={models[:5]}", file=sys.stderr)
-print("[ok] external verifier API reachable")
+    print(f"[error] configured model {model} not in provider list; available={models[:5]}", file=sys.stderr)
+    raise SystemExit(2)
+print("[ok] verifier API and configured model are available")
 PY
-elif [[ "${PHYSICS_REWARD_MODE}" == "answer_only" ]]; then
-  echo "[reward] answer_only mode; skipping local judge/API warmup"
-else
-  curl -sf "${OPENAI_BASE_URL%/}/models" >/dev/null || {
-    echo "[error] local judge unavailable at ${OPENAI_BASE_URL}; set PHYSICSVERIFIER_OPENAI_BASE_URL or PHYSICS_REWARD_MODE=answer_only" >&2
-    exit 2
-  }
 fi
 
 nohup "${VENV}/bin/python" "${ROOT}/training/reward_server/physics_reward_server.py" \
