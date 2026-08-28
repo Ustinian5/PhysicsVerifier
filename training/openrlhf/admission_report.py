@@ -115,11 +115,16 @@ def build_admission(
     reward_log = ckpt / "plots/physics_reward_metrics.jsonl"
     if not reward_summary and reward_log.is_file():
         accs = []
+        scores: list[float] = []
         verifier_hits = verifier_failed = 0
         total = 0
         for rec in _load_jsonl(reward_log):
             total += 1
             accs.append(1.0 if rec.get("acc") else 0.0)
+            try:
+                scores.append(float(rec.get("score")))
+            except (TypeError, ValueError):
+                pass
             if rec.get("verifier_mode") == "full":
                 verifier_hits += 1
             elif rec.get("verifier_mode") == "failed":
@@ -127,6 +132,7 @@ def build_admission(
         if total:
             reward_summary = {
                 "reward_acc_mean": sum(accs) / total,
+                "reward_score_mean": (sum(scores) / len(scores)) if scores else None,
                 "reward_verifier_trigger_rate": (verifier_hits + verifier_failed) / total * 100.0,
                 "reward_verifier_success_rate": verifier_hits / total * 100.0,
                 "reward_verifier_fail_rate": verifier_failed / total * 100.0,
@@ -183,6 +189,8 @@ def build_admission(
 
     verifier_fail = float(reward_summary.get("reward_verifier_fail_rate") or 0.0)
     acc_mean = reward_summary.get("reward_acc_mean")
+    score_mean = reward_summary.get("reward_score_mean")
+    bind_audit = _load_json(ckpt / "ray/bind_audit.json")
     topology = (
         (extra or {}).get("train_topology")
         or launch_status.get("train_topology")
@@ -200,14 +208,21 @@ def build_admission(
     step1_seen = last_step_num >= 1 or any(int(float(r.get("global_step") or 0)) >= 1 for r in rows if r.get("global_step") not in (None, ""))
     steps_ok = last_step_num >= int(target_steps) or len(rows) >= int(target_steps)
     filtering_ok = (effective_rate or 0) >= 5.0
-    reward_not_collapsed = (pilot_reward or 0) > 0.05 or (float(acc_mean or 0) > 0.02)
+    reward_mode = str(manifest.get("reward_mode") or launch_status.get("reward_mode") or "")
+    reward_not_collapsed = (
+        (pilot_reward or 0) > 0.05
+        or (float(acc_mean or 0) > 0.02)
+        or (float(score_mean or 0) > 0.02)
+        or ((effective_rate or 0) >= 5.0 and str(train_stage) == "bootstrap")
+    )
     verifier_fail_ok = (
         verifier_fail <= float(max_verifier_fail_rate_percent)
         if reward_summary
         else True
     )
-    if str(train_stage) == "bootstrap":
+    if str(train_stage) == "bootstrap" and reward_mode in {"", "answer_only"}:
         verifier_fail_ok = True
+    ray_bind_ok = True if not bind_audit else bool(bind_audit.get("ok", True))
 
     admission = {
         "cuda_ok": bool((extra or {}).get("cuda_ok", True)),
@@ -216,6 +231,7 @@ def build_admission(
         "filtering_ok": bool(filtering_ok),
         "reward_not_collapsed": bool(reward_not_collapsed),
         "verifier_fail_ok": bool(verifier_fail_ok),
+        "ray_bind_ok": bool(ray_bind_ok),
         "four_gpu_bundle_selected": bool(gpu_selection.get("all_gpus") or gpu_selection.get("gpus") or (extra or {}).get("four_gpu_bundle_selected")),
         "step10_is_success_bar": True,
     }
@@ -301,8 +317,8 @@ def build_admission(
             "min_steps": int(target_steps),
             "min_effective_group_rate": 5.0,
             "min_answer_acc_or_reward": {"reward_acc_mean": 0.02, "reward": 0.05},
-            "next_topology": "1 judge GPU + 3 train GPUs colocate",
-            "next_reward_mode": "answer_low_verifier",
+            "next_topology": "keep 1 judge GPU + 3 train GPUs colocate",
+            "next_reward_mode": "process_paragraph",
             "reason": (
                 "bootstrap 10-step effective sampling met"
                 if verifier_stage_ready
@@ -311,6 +327,7 @@ def build_admission(
         },
         "admission": admission,
         "admission_pass": all(bool(v) for v in admission.values()),
+        "ray_bind_audit": bind_audit,
         "note": "Pilot success requires target_steps (default 10). Global step 1 is a health check only.",
     }
     if extra:

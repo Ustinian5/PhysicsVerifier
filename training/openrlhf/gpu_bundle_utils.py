@@ -83,6 +83,90 @@ def is_gpu_idle(
     )
 
 
+def select_train_judge_bundle(
+    *,
+    n_train: int = 6,
+    n_judge: int = 2,
+    free_mib: int = 75000,
+    util_max: float = 5.0,
+    allow_pids: set[int] | None = None,
+    prefer_judge: list[int] | None = None,
+) -> dict[str, Any]:
+    """Pick n_train strictly idle GPUs plus n_judge dedicated judge GPUs.
+
+    Judge GPUs may already host processes in allow_pids (e.g. a live vLLM).
+    prefer_judge is honored first so a loaded 30B replica is not migrated.
+    """
+    allow_pids = allow_pids or set()
+    prefer_judge = list(prefer_judge or [])
+    gpus = query_gpus()
+    ours: list[dict[str, Any]] = []
+    strict_idle: list[dict[str, Any]] = []
+    for g in gpus:
+        gpids = set(compute_pids_on_gpu(g["index"]))
+        foreign = gpids - allow_pids
+        if gpids and not foreign:
+            ours.append(g)
+        elif is_gpu_idle(g, free_mib=free_mib, util_max=util_max, allow_pids=None):
+            strict_idle.append(g)
+
+    pool: dict[int, dict[str, Any]] = {g["index"]: g for g in ours + strict_idle}
+    ours_idx = {g["index"] for g in ours}
+    judges: list[int] = []
+    for j in prefer_judge:
+        if j in pool and j not in judges:
+            judges.append(j)
+        if len(judges) >= n_judge:
+            break
+    if len(judges) < n_judge:
+        rest = [i for i in pool if i not in judges]
+        rest.sort(key=lambda i: (0 if i in ours_idx else 1, -i))
+        for i in rest:
+            judges.append(i)
+            if len(judges) >= n_judge:
+                break
+    if len(judges) < n_judge:
+        return {
+            "ok": False,
+            "idle_indices": [g["index"] for g in strict_idle],
+            "ours_indices": sorted(ours_idx),
+            "reason": f"need {n_judge} judge GPUs, found {len(judges)}",
+        }
+
+    judge_set = set(judges)
+    train_pool = [g for g in strict_idle if g["index"] not in judge_set]
+    if len(train_pool) < n_train:
+        return {
+            "ok": False,
+            "idle_indices": [g["index"] for g in train_pool],
+            "judge_gpus": judges,
+            "reason": f"need {n_train} idle train GPUs disjoint from judges {judges}, found {len(train_pool)}",
+        }
+
+    idxs = sorted(g["index"] for g in train_pool)
+    best_train: list[int] | None = None
+    for start in range(min(idxs), max(idxs) + 1):
+        cand = list(range(start, start + n_train))
+        if all(i in idxs for i in cand):
+            best_train = cand
+            break
+    if best_train is None:
+        by_free = sorted(train_pool, key=lambda g: (-g["mem_free_mib"], g["index"]))
+        best_train = sorted(g["index"] for g in by_free[:n_train])
+
+    by_idx = {g["index"]: g for g in gpus}
+    all_gpus = best_train + judges
+    return {
+        "ok": True,
+        "gpus": all_gpus,
+        "train_gpus": best_train,
+        "judge_gpus": judges,
+        "judge_gpu": judges[0],
+        "detail": [by_idx[i] for i in all_gpus if i in by_idx],
+        "reason": "selected",
+    }
+
+
 def select_four_gpu_bundle(
     *,
     free_mib: int = 75000,
@@ -115,7 +199,8 @@ def select_four_gpu_bundle(
 
     by_idx = {g["index"]: g for g in idle}
     bundle = [by_idx[i] for i in best]
-    judge = max(bundle, key=lambda g: (g["mem_free_mib"], -g["index"]))
+    # Prefer the highest-index GPU as judge so train CVD is often 0,1,2.
+    judge = max(bundle, key=lambda g: (g["mem_free_mib"], g["index"]))
     train = sorted((g["index"] for g in bundle if g["index"] != judge["index"]))
     return {
         "ok": True,
@@ -129,7 +214,57 @@ def select_four_gpu_bundle(
 
 def cmd_probe(args: argparse.Namespace) -> int:
     allow = {int(x) for x in args.allow_pids.split(",") if x.strip()} if args.allow_pids else set()
-    if args.bundle:
+    if args.train_only:
+        gpus = query_gpus()
+        idle = [
+            g
+            for g in gpus
+            if is_gpu_idle(g, free_mib=args.free_mib, util_max=args.util_max, allow_pids=allow)
+        ]
+        n_train = int(args.n_train)
+        if len(idle) < n_train:
+            result = {
+                "ok": False,
+                "idle_indices": [g["index"] for g in idle],
+                "train_gpus": [],
+                "judge_gpus": [],
+                "gpus": gpus,
+                "reason": (
+                    f"need {n_train} idle train-only GPUs with no foreign compute PIDs, "
+                    f"free>={args.free_mib}MiB, util<={args.util_max}%; found {len(idle)}"
+                ),
+            }
+        else:
+            idxs = sorted(g["index"] for g in idle)
+            best: list[int] | None = None
+            for start in range(min(idxs), max(idxs) + 1):
+                cand = list(range(start, start + n_train))
+                if all(i in idxs for i in cand):
+                    best = cand
+                    break
+            if best is None:
+                by_free = sorted(idle, key=lambda g: (-g["mem_free_mib"], g["index"]))
+                best = sorted(g["index"] for g in by_free[:n_train])
+            result = {
+                "ok": True,
+                "gpus": best,
+                "train_gpus": best,
+                "judge_gpus": [],
+                "idle_indices": idxs,
+                "detail": [g for g in idle if g["index"] in set(best)],
+                "reason": "selected_train_only",
+            }
+    elif args.bundle8:
+        prefer = [int(x) for x in args.prefer_judge.split(",") if x.strip()] if args.prefer_judge else [4, 7]
+        result = select_train_judge_bundle(
+            n_train=args.n_train,
+            n_judge=args.n_judge,
+            free_mib=args.free_mib,
+            util_max=args.util_max,
+            allow_pids=allow,
+            prefer_judge=prefer,
+        )
+    elif args.bundle:
         result = select_four_gpu_bundle(
             free_mib=args.free_mib, util_max=args.util_max, allow_pids=allow
         )
@@ -215,11 +350,16 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    pp = sub.add_parser("probe", help="Probe idle GPUs / select 4-GPU bundle")
+    pp = sub.add_parser("probe", help="Probe idle GPUs / select GPU bundle")
     pp.add_argument("--free-mib", type=int, default=75000)
     pp.add_argument("--util-max", type=float, default=5.0)
     pp.add_argument("--min-idle", type=int, default=4)
-    pp.add_argument("--bundle", action="store_true")
+    pp.add_argument("--bundle", action="store_true", help="select 3 train + 1 judge")
+    pp.add_argument("--bundle8", action="store_true", help="select N train + M judge (default 6+2)")
+    pp.add_argument("--train-only", action="store_true", help="select N strictly idle train GPUs, no judges")
+    pp.add_argument("--n-train", type=int, default=6)
+    pp.add_argument("--n-judge", type=int, default=2)
+    pp.add_argument("--prefer-judge", default="4,7")
     pp.add_argument("--allow-pids", default="")
     pp.add_argument("--pretty", action="store_true")
     pp.set_defaults(func=cmd_probe)

@@ -18,11 +18,13 @@ if [[ -f "${ENV_FILE}" ]]; then
 fi
 
 PYTHON="${PYTHON:-${TRAIN_VENV}/bin/python}"
-TRAIN_STAGE="${TRAIN_STAGE:-verifier}"
+TRAIN_STAGE="${TRAIN_STAGE:-bootstrap}"
 if [[ "${TRAIN_STAGE}" == "bootstrap" ]]; then
   PROMPT_DATA="${PROMPT_DATA:-${ROOT}/data/rl/bootstrap_curriculum.jsonl}"
-  export PHYSICS_REWARD_MODE="${PHYSICS_REWARD_MODE:-answer_only}"
-  export PHYSICS_REWARD_W_FORMAT="${PHYSICS_REWARD_W_FORMAT:-0}"
+  export PHYSICS_REWARD_MODE="${PHYSICS_REWARD_MODE:-process_paragraph}"
+  export PHYSICS_REWARD_W_FORMAT=0
+  export PHYSICS_REWARD_W_ANSWER=0
+  export PHYSICS_REWARD_VERIFIER_ON_WRONG="${PHYSICS_REWARD_VERIFIER_ON_WRONG:-1}"
 else
   PROMPT_DATA="${PROMPT_DATA:-${ROOT}/data/rl/openrlhf_prompts.jsonl}"
 fi
@@ -37,8 +39,11 @@ export PHYSICS_REWARD_URL="${RM_URL}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2}"
 export PYTHONUNBUFFERED=1
-export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+# Single-node: always bind Ray to loopback. Ignore LAN MASTER_ADDR overrides.
+export MASTER_ADDR="127.0.0.1"
+export RAY_BIND_IP="${RAY_BIND_IP:-127.0.0.1}"
 export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
+export RAY_USAGE_STATS_ENABLED="${RAY_USAGE_STATS_ENABLED:-0}"
 
 IFS=',' read -ra _GPU_ARR <<< "${CUDA_VISIBLE_DEVICES}"
 NUM_TRAIN_GPUS="${NUM_TRAIN_GPUS:-${#_GPU_ARR[@]}}"
@@ -105,9 +110,13 @@ fi
 
 FLASH_ARGS=()
 ATTN_IMPL="${OPENRLHF_ATTN_IMPL:-sdpa}"
-GENERATE_MAX_LEN="${GENERATE_MAX_LEN:-2048}"
+if [[ "${TRAIN_STAGE}" == "bootstrap" ]]; then
+  GENERATE_MAX_LEN="${GENERATE_MAX_LEN:-512}"
+else
+  GENERATE_MAX_LEN="${GENERATE_MAX_LEN:-2048}"
+fi
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-4}"
-ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-2}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
 SAVE_STEPS="${SAVE_STEPS:-20}"
 MICRO_ROLLOUT_BS="${MICRO_ROLLOUT_BATCH_SIZE:-1}"
@@ -130,10 +139,19 @@ ALLOW_DIRECT_LAUNCH="${ALLOW_DIRECT_LAUNCH:-1}"
 # Isolated Ray ports / session (do not collide with shared :8265 or default worker 10002-19999).
 RAY_GCS_PORT="${RAY_GCS_PORT:-26379}"
 RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-28265}"
-RAY_CLIENT_PORT="${RAY_CLIENT_PORT:-26380}"
+# Ray[client] defaults to :10001 if this flag is omitted. Keep an isolated loopback port.
+if [[ "${RAY_CLIENT_PORT:-0}" -le 0 ]]; then
+  RAY_CLIENT_PORT=26380
+fi
 RAY_MIN_WORKER_PORT="${RAY_MIN_WORKER_PORT:-26381}"
 RAY_MAX_WORKER_PORT="${RAY_MAX_WORKER_PORT:-27380}"
-# AF_UNIX socket paths must be <=107 bytes; keep Ray tempdir short.
+export RAY_GCS_PORT
+# Prevent Ray from rewriting --node-ip-address 127.0.0.1 to the LAN IP.
+export RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER="${RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER:-0}"
+export RAY_BIND_IP="${RAY_BIND_IP:-127.0.0.1}"
+# AF_UNIX socket paths must be <=107 bytes; keep a short /tmp symlink to slow_share.
+# shellcheck disable=SC1091
+source "${ROOT}/training/openrlhf/setup_slow_share_tmp.sh"
 RAY_TMPDIR="${RAY_TMPDIR:-/tmp/orhf8b_ray_${RAY_GCS_PORT}}"
 RAY_HEAD_PID_FILE="${RAY_HEAD_PID_FILE:-${SAVE_PATH}/ray/ray_head.pid}"
 RAY_ADDRESS_FILE="${RAY_ADDRESS_FILE:-${SAVE_PATH}/ray/ray_address.txt}"
@@ -145,8 +163,15 @@ if [[ "${PILOT_MAX_STEPS}" -le 0 && -d "${SAVE_PATH}/ckpt/_actor" && -s "${SAVE_
 fi
 
 EVAL_ARGS=()
-if [[ -s "${HELDOUT_DATA}" && "${PILOT_MAX_STEPS}" -le 0 ]]; then
-  EVAL_ARGS=(--eval_dataset "${HELDOUT_DATA}" --eval_n_samples_per_prompt 2 --eval_steps 10)
+# Full-run eval of process_paragraph is extremely expensive (each sample can take
+# minutes of judge time). Default off; set ENABLE_EVAL=1 to turn on a tiny eval.
+ENABLE_EVAL="${ENABLE_EVAL:-0}"
+if [[ "${ENABLE_EVAL}" == "1" && -s "${HELDOUT_DATA}" && "${PILOT_MAX_STEPS}" -le 0 ]]; then
+  EVAL_ARGS=(
+    --eval_dataset "${HELDOUT_DATA}"
+    --eval_n_samples_per_prompt "${EVAL_N_SAMPLES_PER_PROMPT:-1}"
+    --eval_steps "${EVAL_STEPS:-50}"
+  )
 fi
 
 MANIFEST="${SAVE_PATH}/run_manifest.json"
@@ -214,6 +239,11 @@ print(json.dumps({
   "prompt_data": "${PROMPT_DATA}",
   "reward_url": "${RM_URL}",
   "reward_mode": os.environ.get("PHYSICS_REWARD_MODE", ""),
+  "process_only_reward": os.environ.get("PHYSICS_REWARD_MODE", "") == "process_paragraph",
+  "w_answer": os.environ.get("PHYSICS_REWARD_W_ANSWER", ""),
+  "w_format": os.environ.get("PHYSICS_REWARD_W_FORMAT", ""),
+  "ray_tmpdir": "${RAY_TMPDIR}",
+  "tmpdir": os.environ.get("TMPDIR", ""),
   "ray_gcs_port": int("${RAY_GCS_PORT}"),
   "ray_dashboard_port": int("${RAY_DASHBOARD_PORT}"),
 }, ensure_ascii=False, indent=2))
@@ -255,8 +285,12 @@ RUNTIME_ENV_JSON="{
     \"OPENRLHF_ATTN_IMPL\": \"${ATTN_IMPL}\",
     \"PYTORCH_CUDA_ALLOC_CONF\": \"${ALLOC_CONF_JSON}\",
     \"PHYSICS_REWARD_MODE\": \"${PHYSICS_REWARD_MODE:-}\",
+    \"PHYSICS_REWARD_W_ANSWER\": \"${PHYSICS_REWARD_W_ANSWER:-}\",
     \"PHYSICS_REWARD_W_FORMAT\": \"${PHYSICS_REWARD_W_FORMAT:-}\",
-    \"PHYSICS_REWARD_METRICS_LOG\": \"${PHYSICS_REWARD_METRICS_LOG:-}\"
+    \"PHYSICS_REWARD_TIMEOUT\": \"${PHYSICS_REWARD_TIMEOUT:-1800}\",
+    \"PHYSICS_REWARD_METRICS_LOG\": \"${PHYSICS_REWARD_METRICS_LOG:-}\",
+    \"TMPDIR\": \"${TMPDIR:-}\",
+    \"RAY_TMPDIR\": \"${RAY_TMPDIR:-}\"
   }
 }"
 
@@ -348,10 +382,12 @@ stop_own_ray() {
 start_isolated_ray_head() {
   stop_own_ray
   mkdir -p "${RAY_TMPDIR}"
-  echo "[ray] starting isolated head gcs=${RAY_GCS_PORT} dashboard=${RAY_DASHBOARD_PORT}"
-  # ray start --head forks a daemon; capture parent pid of the CLI invocation.
-  RAY_TMPDIR="${RAY_TMPDIR}" nohup ray start --head \
-    --node-ip-address "${MASTER_ADDR}" \
+  echo "[ray] starting isolated head gcs=${RAY_GCS_PORT} dashboard=${RAY_DASHBOARD_PORT} client=${RAY_CLIENT_PORT} bind=127.0.0.1"
+  TMPDIR="${TMPDIR:-}" TEMP="${TEMP:-${TMPDIR:-}}" TMP="${TMP:-${TMPDIR:-}}" \
+  RAY_TMPDIR="${RAY_TMPDIR}" \
+  RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=0 \
+  nohup ray start --head \
+    --node-ip-address 127.0.0.1 \
     --port "${RAY_GCS_PORT}" \
     --dashboard-host=127.0.0.1 \
     --dashboard-port "${RAY_DASHBOARD_PORT}" \
@@ -385,6 +421,21 @@ start_isolated_ray_head() {
   printf '127.0.0.1:%s\n' "${RAY_GCS_PORT}" >"${RAY_ADDRESS_FILE}"
   export RAY_ADDRESS="127.0.0.1:${RAY_GCS_PORT}"
   echo "[ray] ready RAY_ADDRESS=${RAY_ADDRESS}"
+  local audit_out="${SAVE_PATH}/ray/bind_audit.json"
+  local audit_args=(
+    --gcs-port "${RAY_GCS_PORT}"
+    --dashboard-port "${RAY_DASHBOARD_PORT}"
+    --min-worker-port "${RAY_MIN_WORKER_PORT}"
+    --max-worker-port "${RAY_MAX_WORKER_PORT}"
+    --client-port "${RAY_CLIENT_PORT}"
+    --out "${audit_out}"
+  )
+  if ! "${PYTHON}" "${ROOT}/training/openrlhf/audit_ray_bind.py" "${audit_args[@]}"; then
+    echo "[error] Ray bind audit failed; refusing public/LAN listeners. see ${audit_out}" >&2
+    stop_own_ray
+    return 1
+  fi
+  echo "[ray] bind audit ok ${audit_out}"
 }
 
 launch_mode=""
@@ -439,8 +490,15 @@ if [[ -z "${JOB_ID}" ]]; then
     OPENRLHF_ATTN_IMPL="${ATTN_IMPL}" \
     PYTORCH_CUDA_ALLOC_CONF="${ALLOC_CONF_JSON}" \
     PHYSICS_REWARD_MODE="${PHYSICS_REWARD_MODE:-}" \
-    PHYSICS_REWARD_W_FORMAT="${PHYSICS_REWARD_W_FORMAT:-}" \
+    PHYSICS_REWARD_W_ANSWER="${PHYSICS_REWARD_W_ANSWER:-0}" \
+    PHYSICS_REWARD_W_FORMAT="${PHYSICS_REWARD_W_FORMAT:-0}" \
+    PHYSICS_REWARD_TIMEOUT="${PHYSICS_REWARD_TIMEOUT:-1800}" \
     PHYSICS_REWARD_METRICS_LOG="${PHYSICS_REWARD_METRICS_LOG:-}" \
+    TMPDIR="${TMPDIR:-}" \
+    TEMP="${TEMP:-${TMPDIR:-}}" \
+    TMP="${TMP:-${TMPDIR:-}}" \
+    RAY_TMPDIR="${RAY_TMPDIR:-}" \
+    RAY_ENABLE_WINDOWS_OR_OSX_CLUSTER=0 \
     "${PYTHON}" "${TRAIN_ARGS[@]}" \
     >"${DIRECT_LOG}" 2>&1 &
   TRAIN_PID=$!

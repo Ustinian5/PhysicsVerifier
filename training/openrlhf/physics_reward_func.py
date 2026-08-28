@@ -17,7 +17,7 @@ import requests
 import torch
 
 REWARD_URL = os.environ.get("PHYSICS_REWARD_URL", "http://127.0.0.1:8770/get_reward")
-TIMEOUT = float(os.environ.get("PHYSICS_REWARD_TIMEOUT", "600"))
+TIMEOUT = float(os.environ.get("PHYSICS_REWARD_TIMEOUT", "1800"))
 if not math.isfinite(TIMEOUT) or TIMEOUT <= 0.0:
     raise ValueError("PHYSICS_REWARD_TIMEOUT must be a finite positive number")
 

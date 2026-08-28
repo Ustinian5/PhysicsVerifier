@@ -1340,9 +1340,9 @@ class SemanticRuleChecker:
         if not src:
             return []
 
-        target_len = 220
-        min_len = 120
-        max_len = 360
+        target_len = int(os.getenv("PHYSICS_REWARD_PARA_TARGET") or os.getenv("PHYSICSVERIFIER_PARA_TARGET") or 220)
+        min_len = int(os.getenv("PHYSICS_REWARD_PARA_MIN") or os.getenv("PHYSICSVERIFIER_PARA_MIN") or 120)
+        max_len = int(os.getenv("PHYSICS_REWARD_PARA_MAX") or os.getenv("PHYSICSVERIFIER_PARA_MAX") or 360)
         n = len(src)
         boundary_set = {0, n}
         for m in re.finditer(r"[。！？!?；;](?:\s+|$)|\n+", src):

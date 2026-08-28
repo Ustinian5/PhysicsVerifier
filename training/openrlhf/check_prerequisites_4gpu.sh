@@ -21,7 +21,10 @@ warn() { local n="$1"; shift; if "$@" >/dev/null 2>&1; then echo "[ok] $n"; else
 check "CUDA usable" bash "${ROOT}/training/openrlhf/ensure_cuda_ready.sh"
 check "reward server /health" curl -sf http://127.0.0.1:8770/health
 check "reward server /get_reward" bash -c 'curl -sf -X POST http://127.0.0.1:8770/get_reward -H "Content-Type: application/json" -d "{\"query\":[\"a\"],\"prompts\":[\"\"],\"labels\":[\"b\"]}" | grep -q rewards'
-check "train prompts" test -s "${ROOT}/data/rl/openrlhf_prompts.jsonl"
+check "train prompts" test -s "${PROMPT_DATA:-${ROOT}/data/rl/openrlhf_prompts.jsonl}"
+if [[ "${TRAIN_STAGE:-}" == "bootstrap" || "${PHYSICS_REWARD_MODE:-}" == "process_paragraph" ]]; then
+  check "bootstrap curriculum" test -s "${ROOT}/data/rl/bootstrap_curriculum.jsonl"
+fi
 check "4 visible GPUs" bash -c '[[ $(nvidia-smi -L | wc -l) -ge 4 ]]'
 check "8B model dir" test -d "${QWEN8B_MODEL_DIR}"
 check "8B config" test -f "${QWEN8B_MODEL_DIR}/config.json"

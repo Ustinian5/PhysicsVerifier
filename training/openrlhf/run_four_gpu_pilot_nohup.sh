@@ -32,11 +32,16 @@ nohup bash -c "
   export TRAIN_TOPOLOGY='${TRAIN_TOPOLOGY:-colocate}'
   export ACTOR_GPUS='${ACTOR_GPUS:-}'
   export VLLM_ENGINES='${VLLM_ENGINES:-}'
-  export PHYSICS_REWARD_MODE='${PHYSICS_REWARD_MODE:-answer_only}'
-  export PHYSICS_REWARD_W_FORMAT='${PHYSICS_REWARD_W_FORMAT:-0}'
+  export PHYSICS_REWARD_MODE='${PHYSICS_REWARD_MODE:-process_paragraph}'
+  export PHYSICS_REWARD_VERIFIER_ON_WRONG='${PHYSICS_REWARD_VERIFIER_ON_WRONG:-1}'
+  export PHYSICS_REWARD_W_FORMAT=0
+  export PHYSICS_REWARD_W_ANSWER=0
+  export RAY_GCS_PORT='${RAY_GCS_PORT:-26379}'
+  source '${ROOT}/training/openrlhf/setup_slow_share_tmp.sh'
+  export JUDGE_CUDA_DEVICE='${JUDGE_CUDA_DEVICE:-3}'
   export QWEN8B_RL_CKPT='${CKPT}'
   export PILOT_MAX_STEPS='${PILOT_MAX_STEPS:-10}'
-  export GENERATE_MAX_LEN='${GENERATE_MAX_LEN:-1024}'
+  export GENERATE_MAX_LEN='${GENERATE_MAX_LEN:-512}'
   export ROLLOUT_BATCH_SIZE='${ROLLOUT_BATCH_SIZE:-3}'
   export N_SAMPLES_PER_PROMPT='${N_SAMPLES_PER_PROMPT:-8}'
   export TRAIN_BATCH_SIZE='${TRAIN_BATCH_SIZE:-24}'
@@ -58,4 +63,4 @@ nohup bash -c "
 " >>"${LOG_FILE}" 2>&1 &
 echo $! >"${PID_FILE}"
 echo "[launch] four_gpu_pilot10 pid=$(cat "${PID_FILE}") log=${LOG_FILE} ckpt=${CKPT}"
-echo "[launch] stage=${TRAIN_STAGE:-bootstrap} topology=${TRAIN_TOPOLOGY:-colocate} reward_mode=${PHYSICS_REWARD_MODE:-answer_only} train_gpus=${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+echo "[launch] stage=${TRAIN_STAGE:-bootstrap} topology=${TRAIN_TOPOLOGY:-colocate} reward_mode=${PHYSICS_REWARD_MODE:-process_paragraph} train_gpus=${CUDA_VISIBLE_DEVICES:-0,1,2} judge=${JUDGE_CUDA_DEVICE:-3}"
