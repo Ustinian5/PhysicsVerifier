@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import atexit
 import json
+import shutil
+import tempfile
 import unittest
 import uuid
 from pathlib import Path
 
 from scripts.compare_unified_catalogs import _console_json, compare_catalogs
 
-TMP_ROOT = Path("results/test_tmp")
-TMP_ROOT.mkdir(parents=True, exist_ok=True)
+TMP_ROOT = Path(tempfile.mkdtemp(prefix="physicsverifier_compare_tests_"))
+atexit.register(shutil.rmtree, TMP_ROOT, ignore_errors=True)
 
 
 def _case_dir() -> Path:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import atexit
 import json
+import shutil
 import tempfile
 import unittest
 import uuid
@@ -26,8 +28,8 @@ from rule_framework.incremental_validation import (
 )
 
 
-TMP_ROOT = Path("results/test_tmp")
-TMP_ROOT.mkdir(parents=True, exist_ok=True)
+TMP_ROOT = Path(tempfile.mkdtemp(prefix="physicsverifier_cluster_proposal_tests_"))
+atexit.register(shutil.rmtree, TMP_ROOT, ignore_errors=True)
 
 
 def _case_dir() -> Path:
