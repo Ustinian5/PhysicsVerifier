@@ -11,6 +11,7 @@ from scripts.run_retrieval_comparison import (
     validate_batch_inputs, sha256_file, ASTRA, TERRA,
     OVERLOAD_BACKOFF_SECONDS,
     run_ancestry, evidence_path, exclusive_run_lock,
+    run_recovery,
 )
 
 
@@ -81,6 +82,101 @@ def check_tree_bridge_preserves_prompt_and_schema_without_sampling_parameters(tm
 
 
 class RetrievalComparisonTests(unittest.TestCase):
+    def test_automatic_passes_finish_other_jobs_and_replay_exact_prefixes(self):
+        import os
+        import httpx
+        from collections import Counter
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from scripts.run_retrieval_checker import read_frozen_jobs
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs = root / "inputs.json"
+            rows = [{"id": sid, "question": "q", "prediction": "p"} for sid in ("flaky", "healthy", "wrong_channel")]
+            write_json(inputs, rows)
+            args = SimpleNamespace(output=root / "run", drain_transient=True, env_file=root / "missing.env", catalog=Path(__file__).resolve().parents[1] / "catalogs/rules_unified_3000.json", input=inputs, limit=0, max_requests=32, max_input_tokens=600000, max_output_tokens=96000, response_tokens=20, max_seconds=1800, request_timeout=900, max_read_chars=500000, phase="retrieval_batch", api_model=TERRA, reasoning_effort="medium", arms=[2], workers=3, overload_backoff=False, retry_transient_from=None, relocate_root=[], batch_max_requests=100, batch_max_input_tokens=10000000, batch_max_output_tokens=100000, platform_quota_floor=500000, selection_manifest=None, continue_pending=False, replay_prefix=False)
+            calls = Counter()
+            order = []
+            bodies = []
+            clock = [1900000000.0]
+            def respond(request):
+                body = json.loads(request.content)
+                sid, step = body["input"]["id"], body["input"]["step"]
+                calls[(sid, step)] += 1
+                order.append((sid, step))
+                bodies.append(body)
+                if sid == "flaky" and step == 2 and calls[(sid, step)] == 1:
+                    return httpx.Response(500, json={"error": {"message": "当前模型繁忙"}})
+                model = "unverified_alias" if sid == "wrong_channel" and step == 2 and calls[(sid, step)] == 1 else TERRA
+                return httpx.Response(200, json={"id": "response", "model": model, "reasoning": {"effort": "medium"}, "usage": {"input_tokens": 10, "output_tokens": 5}})
+            def tree(sample, catalog, transport):
+                for step in (1, 2):
+                    transport.responses(input={"id": sample["id"], "step": step})
+                return {"status": "completed", "selected_rules": []}
+            client_class = httpx.Client
+            with patch.dict(os.environ, {"ASTRA_BASE_URL": "https://unit-test.invalid/v1", "ASTRA_API_KEY": "never-printed"}), patch("scripts.run_retrieval_comparison.validate_batch_inputs", return_value={}), patch("scripts.run_retrieval_comparison.platform_quota_probe", return_value={"total_available": 1000000, "unlimited_quota": False}), patch("scripts.run_retrieval_comparison.run_tree", side_effect=tree), patch("scripts.run_retrieval_comparison.httpx.Client", side_effect=lambda **kw: client_class(transport=httpx.MockTransport(respond), **kw)), patch("scripts.run_retrieval_comparison.time.time", side_effect=lambda: clock[0]), patch("scripts.run_retrieval_comparison.time.sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+                result = run_recovery(args)
+            self.assertEqual((result["experiment_completed"], result["experiment_failed"]), (3, 0))
+            self.assertEqual(sum(calls.values()), 8)
+            for sid in ("flaky", "healthy", "wrong_channel"):
+                self.assertEqual(calls[(sid, 1)], 1)
+            self.assertEqual(calls[("healthy", 2)], 1)
+            self.assertLess(order.index(("healthy", 2)), max(i for i, key in enumerate(order) if key == ("flaky", 2)))
+            for sid in ("flaky", "wrong_channel"):
+                duplicate_bodies = [b for b in bodies if b["input"] == {"id": sid, "step": 2}]
+                self.assertEqual(duplicate_bodies[0], duplicate_bodies[1])
+            budget = json.loads((args.output / "budget.json").read_text())
+            self.assertEqual(budget["requests_started"], 8)
+            self.assertEqual(budget["requests_without_usage"], 1)
+            jobs = read_frozen_jobs(list(reversed(run_ancestry(args.output))), inputs, args.catalog, rows, [2])
+            self.assertEqual({j["result"]["status"] for j in jobs.values()}, {"completed"})
+            self.assertEqual(json.loads((root / "run/progress.json").read_text())["current_run"], str(args.output.resolve()))
+
+    def test_batch_ceiling_increase_is_explicit_and_does_not_change_task_limits(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = {"sample_ids": ["case"], "batch_limits": {"requests": 10, "input_tokens": 1000, "output_tokens": 100}, "limits": {"requests": 32}}
+            write_json(root / "manifest.json", config)
+            job = root / "arm2" / hashlib.sha256(b"case").hexdigest()[:16]
+            write_json(job / "result.json", {"status": "failed", "model": ASTRA})
+            write_json(job / "request_001.json", {"http_status": 408})
+            changed = {**config, "batch_limits": {"requests": 20, "input_tokens": 2000, "output_tokens": 200}}
+            with self.assertRaisesRegex(ValueError, "batch_limits"):
+                transient_retry_jobs(root, changed, [2])
+            self.assertEqual(len(transient_retry_jobs(root, changed, [2], allow_budget_increase=True)), 1)
+            with self.assertRaisesRegex(ValueError, "limits"):
+                transient_retry_jobs(root, {**changed, "limits": {"requests": 64}}, [2], allow_budget_increase=True)
+            with self.assertRaisesRegex(ValueError, "batch_limits"):
+                transient_retry_jobs(root, {**changed, "batch_limits": {**changed["batch_limits"], "requests": 1}}, [2], allow_budget_increase=True)
+
+    def test_shared_budget_honors_retry_after_before_another_job_starts(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            clock = [100.0]
+            budget = BatchBudget(directory, {"requests": 10, "input_tokens": 1000, "output_tokens": 1000}, defer_transient=True)
+            ticket = budget.reserve(20, 20)
+            budget.settle(ticket, {"http_status": 429, "response": {"error": {"message": "当前模型繁忙"}}, "started_unix": 100, "elapsed_seconds": 1, "retry_after": "15"})
+            with patch("scripts.run_retrieval_comparison.time.time", side_effect=lambda: clock[0]), patch("scripts.run_retrieval_comparison.time.sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+                budget.reserve(20, 20)
+            self.assertEqual(clock[0], 116)
+            self.assertFalse(budget.stopped)
+
+    def test_deadline_prevents_new_requests_and_recovery_does_not_bypass_stops(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            budget = BatchBudget(root, {"requests": 10, "input_tokens": 1000, "output_tokens": 1000}, deadline_unix=1, quota_probe=lambda: self.fail("No network after deadline"))
+            with self.assertRaisesRegex(BatchBudgetExceeded, "execution_deadline_reached"):
+                budget.reserve(20, 20)
+            self.assertEqual(budget.requests, 0)
+            for reason in ("platform_quota_low", "provider_auth_quota_or_rate_limit", "execution_deadline_reached", "operator_stop_requested", "batch_request_or_token_budget_exceeded"):
+                state = {"budget_stop_reason": reason}
+                with patch("scripts.run_retrieval_comparison.run_experiment", return_value=state) as run:
+                    self.assertEqual(run_recovery(SimpleNamespace(output=root, drain_transient=True)), state)
+                    run.assert_called_once()
+
     def simulate_overload(self, root, responses, *, successful_prefix=0, task_requests=32, batch_requests=100):
         """Exercise real transport/budget code with a virtual clock and HTTP server."""
         import httpx

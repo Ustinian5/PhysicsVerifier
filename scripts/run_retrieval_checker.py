@@ -82,7 +82,7 @@ def read_frozen_jobs(runs, input_path, catalog_path, rows, arms):
                 links = retry.get("jobs", []) if retry else []
                 link = next((item for item in links if (str(item.get("sample_id")), item.get("arm")) == (sid, arm)), {})
                 if previous:
-                    if previous["result"].get("status") != "failed" or link.get("result_sha256") != previous["attempts"][-1]["sha256"]:
+                    if previous["attempts"][-1]["status"] != "failed" or link.get("result_sha256") != previous["attempts"][-1]["sha256"]:
                         raise ValueError("Only a linked failed attempt can be superseded")
                 elif retry and link.get("new_pending") is not True:
                     raise ValueError("Retry has no original result in the supplied runs")

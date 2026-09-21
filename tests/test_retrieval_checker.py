@@ -111,6 +111,12 @@ class RetrievalCheckerTests(unittest.TestCase):
         write_json(retry / "manifest.json", retry_manifest)
         jobs = read_frozen_jobs([source, retry], inputs, self.catalog_path, [self.sample], [2])
         self.assertEqual(jobs[("case", 2)]["result"]["status"], "retry_pending")
+        later = self.root / "later"
+        retry_manifest = json.loads((retry / "manifest.json").read_text())
+        write_json(later / "manifest.json", {**retry_manifest, "retry_of": {**retry_manifest["retry_of"], "source": str(retry), "manifest_sha256": sha256_file(retry / "manifest.json")}})
+        write_json(later / "arm2" / job_key("case") / "result.json", {**result, "status": "completed"})
+        jobs = read_frozen_jobs([source, retry, later], inputs, self.catalog_path, [self.sample], [2])
+        self.assertEqual([item["status"] for item in jobs[("case", 2)]["attempts"]], ["failed", "completed"])
         write_json(retry / "arm2" / job_key("case") / "result.json", {**result, "status": "completed"})
         jobs = read_frozen_jobs([source, retry], inputs, self.catalog_path, [self.sample], [2])
         self.assertEqual([item["status"] for item in jobs[("case", 2)]["attempts"]], ["failed", "completed"])

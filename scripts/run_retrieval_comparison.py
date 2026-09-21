@@ -268,6 +268,32 @@ class BatchBudgetExceeded(RuntimeError):
     pass
 
 
+class NoRetryableJobs(ValueError):
+    pass
+
+
+def rejected_provider_identity(record):
+    error = str(record.get("error", ""))
+    return record.get("http_status") == 200 and (
+        error == "Provider model identity mismatch" or error.startswith("Provider did not confirm ")
+    )
+
+
+def retry_after_deadline(record):
+    header = record.get("retry_after")
+    if not header:
+        return 0.0
+    try:
+        delay = float(header)
+        return record.get("started_unix", time.time()) + record.get("elapsed_seconds", 0) + max(0, delay) if math.isfinite(delay) else 0.0
+    except ValueError:
+        from email.utils import parsedate_to_datetime
+        try:
+            return parsedate_to_datetime(header).timestamp()
+        except (ValueError, TypeError, OverflowError):
+            return 0.0
+
+
 def upstream_overloaded(record):
     """Recognize the gateway's explicit capacity errors, never generic 429s."""
     data = record.get("response")
@@ -291,10 +317,12 @@ def retryable_transport_failure(record):
 class BatchBudget:
     """Account across workers/resumes; missing usage retains its reservation."""
 
-    def __init__(self, output, limits, quota_probe=None, quota_floor=500000, prior_runs=(), retry_overload=False, stop_file=None):
+    def __init__(self, output, limits, quota_probe=None, quota_floor=500000, prior_runs=(), retry_overload=False, stop_file=None, defer_transient=False, deadline_unix=None):
         self.output, self.limits = Path(output), limits
         self.quota_probe, self.quota_floor = quota_probe, quota_floor
-        self.retry_overload = retry_overload
+        self.retry_overload = retry_overload or defer_transient
+        self.defer_transient = defer_transient
+        self.deadline_unix = deadline_unix
         self.stop_file = Path(stop_file) if stop_file else None
         self.lock = threading.Lock()
         self.stopped = ""
@@ -303,6 +331,7 @@ class BatchBudget:
         self.platform_quota = None
         self.quota_error = None
         self.next_quota_check = 0.0
+        self.retry_after_until = 0.0
         paths = {p.resolve() for run in (self.output, *prior_runs) for p in Path(run).glob("arm*/*/request_*.json")}
         for path in paths:
             record = json.loads(path.read_text())
@@ -325,9 +354,15 @@ class BatchBudget:
             self._save()
 
     def reserve(self, incoming, outgoing):
+        while time.time() < self.retry_after_until:
+            if self.stopped or (self.stop_file and self.stop_file.exists()) or (self.deadline_unix and time.time() >= self.deadline_unix):
+                break
+            time.sleep(min(5, max(0, self.retry_after_until - time.time())))
         with self.lock:
             if self.stop_file and self.stop_file.exists():
                 self.stopped = self.stopped or "operator_stop_requested"
+            if self.deadline_unix and time.time() >= self.deadline_unix:
+                self.stopped = self.stopped or "execution_deadline_reached"
             if not self.stopped and self.quota_probe and time.time() >= self.next_quota_check:
                 try:
                     self.platform_quota = self.quota_probe()
@@ -370,6 +405,8 @@ class BatchBudget:
                 self.stopped = self.stopped or "reported_usage_exceeds_batch_budget"
             if record.get("http_status") in {401, 402, 403, 429} and not (self.retry_overload and upstream_overloaded(record)):
                 self.stopped = self.stopped or "provider_auth_quota_or_rate_limit"
+            if self.defer_transient and retryable_transport_failure(record):
+                self.retry_after_until = max(self.retry_after_until, retry_after_deadline(record))
             self._save()
 
 
@@ -402,7 +439,7 @@ def validate_batch_inputs(input_path, selection_manifest, rows, catalog):
 
 
 class Transport:
-    def __init__(self, *, base, key, output, limits, model, reasoning_effort=None, batch_budget=None, replay_source=None, overload_backoff=(), path_relocations=()):
+    def __init__(self, *, base, key, output, limits, model, reasoning_effort=None, batch_budget=None, replay_source=None, overload_backoff=(), path_relocations=(), retry_provider_mismatch=False):
         self.base = base.rstrip("/")
         self.key = key
         self.output = Path(output)
@@ -432,7 +469,7 @@ class Transport:
                 record = json.loads(path.read_text())
                 if interrupted and any(record.get(key) != interrupted.get(key) for key in ("request", "endpoint")):
                     raise ValueError("Overload retry does not match the exact request")
-                if retryable_transport_failure(record):
+                if retryable_transport_failure(record) or (retry_provider_mismatch and rejected_provider_identity(record)):
                     interrupted = record
                     continue
                 if record.get("http_status") != 200 or not record.get("response"):
@@ -573,6 +610,7 @@ class Transport:
             write_json(path, record)
             if self.batch_budget:
                 self.batch_budget.settle(ticket, record)
+                print(f"{self.output.parent.name}/{self.output.name}: request {self.requests} HTTP {record.get('http_status', 'transport_error')}, {record['elapsed_seconds']:.1f}s", flush=True)
 
     def responses(self, **kwargs):
         body = {**kwargs, "model": self.model, "reasoning": {"effort": self.reasoning_effort}, "max_output_tokens": self.limits["per_response"], "store": False}
@@ -670,14 +708,18 @@ def run_ancestry(source, path_relocations=()):
             raise ValueError("Parent run manifest hash mismatch")
 
 
-def transient_retry_jobs(source, config, arms, *, include_pending=False, path_relocations=()):
+def transient_retry_jobs(source, config, arms, *, include_pending=False, path_relocations=(), retry_provider_mismatch=False, allow_budget_increase=False):
     """Select recorded transport failures without repeating successful jobs."""
     original = json.loads((source / "manifest.json").read_text())
     if api_identity(original) != api_identity(config):
         raise ValueError("Retry protocol differs: API model or reasoning effort")
-    for key in ("input_sha256", "catalog_sha256", "matcher_sha256", "prompt_sha256", "limits", "max_read_chars", "endpoint_sha256", "vector_method", "phase", "tools", "batch_limits"):
+    for key in ("input_sha256", "catalog_sha256", "matcher_sha256", "prompt_sha256", "limits", "max_read_chars", "endpoint_sha256", "vector_method", "phase", "tools"):
         if original.get(key) != config.get(key):
             raise ValueError("Retry protocol differs: " + key)
+    if original.get("batch_limits") != config.get("batch_limits"):
+        before, after = original.get("batch_limits") or {}, config.get("batch_limits") or {}
+        if not allow_budget_increase or set(before) != set(after) or any(after[k] < before[k] for k in before):
+            raise ValueError("Retry protocol differs: batch_limits")
     jobs = {}
     path_relocations = inherited_relocations(source, path_relocations)
     ancestors = run_ancestry(source, path_relocations)
@@ -708,15 +750,61 @@ def transient_retry_jobs(source, config, arms, *, include_pending=False, path_re
             last = json.loads(requests[-1].read_text())
             status = last.get("http_status")
             paused = "BatchBudgetExceeded" in (str(result.get("error_type", "")) + str(result.get("error", "")))
-            if status not in {401, 402, 403, 429} and not retryable_transport_failure(last) and not paused:
+            identity_retry = retry_provider_mismatch and rejected_provider_identity(last)
+            if status not in {401, 402, 403, 429} and not retryable_transport_failure(last) and not paused and not identity_retry:
                 continue
             expected = QWEN if arm == 1 else api_identity(config)[0]
             if result.get("model") != expected:
                 raise ValueError("Retry would change the model")
             jobs[(sid, arm)] = {"sample_id": sid, "arm": arm, "source_run": str(source_run), "result_sha256": sha256_file(result_path), "failed_request_sha256": sha256_file(requests[-1]), "http_status": status, "reason": result.get("error") or last.get("error")}
     if not jobs:
-        raise ValueError("No completed transient failure is eligible for retry")
+        raise NoRetryableJobs("No completed transient failure is eligible for retry")
     return jobs
+
+
+def run_recovery(args):
+    """Drain fair passes of unfinished jobs, keeping every attempt hash linked."""
+    root = args.output
+    args.progress_output = root
+    args.stop_file = root / "STOP"
+    round_number = 1
+    idle_rounds = 0
+    while True:
+        state = run_experiment(args)
+        if not args.drain_transient or state["budget_stop_reason"]:
+            return state
+        source = args.output
+        config = json.loads((source / "manifest.json").read_text())
+        try:
+            jobs = transient_retry_jobs(source, config, args.arms, include_pending=True, retry_provider_mismatch=True)
+        except NoRetryableJobs:
+            if state["experiment_failed"] or state["experiment_pending"]:
+                state["state"] = "finished_with_nonretryable_failures"
+                write_json(root / "progress.json", state)
+            return state
+        # Only accepted responses count as progress. A rejected model response
+        # is discarded, never normalized or used as a successful prefix.
+        responses = [json.loads(p.read_text()) for p in source.glob("arm*/*/request_*.json")]
+        made_progress = any(r.get("http_status") == 200 and not r.get("error") for r in responses)
+        idle_rounds = 0 if made_progress else idle_rounds + 1
+        delay = 5 if made_progress else min(300, 15 * 2 ** min(idle_rounds, 5))
+        delay = max([delay] + [retry_after_deadline(record) - time.time() for record in responses])
+        print(f"Round {round_number}: {state['experiment_completed']}/{state['experiment_tasks']} completed; {len(jobs)} technical/pending jobs will resume after {delay:.0f}s", flush=True)
+        deadline = time.time() + delay
+        while time.time() < deadline:
+            state.update(state="waiting_for_retry_round", resume_after_unix=deadline, retryable_jobs=len(jobs), updated_unix=time.time())
+            if args.stop_file.exists():
+                state.update(state="stopped_operator", budget_stop_reason="operator_stop_requested")
+            if getattr(args, "deadline_unix", None) and time.time() >= args.deadline_unix:
+                state.update(state="stopped_deadline", budget_stop_reason="execution_deadline_reached")
+            write_json(root / "progress.json", state)
+            if state["budget_stop_reason"]:
+                return state
+            time.sleep(min(5, max(0, deadline - time.time())))
+        round_number += 1
+        args.retry_transient_from = source
+        args.output = root / f"round_{round_number:03d}"
+        args.continue_pending = args.replay_prefix = True
 
 
 def main():
@@ -731,7 +819,7 @@ def main():
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--phase", choices=["development", "retrieval_batch", "formal"], default="development")
     parser.add_argument("--selection-manifest", type=Path, help="Frozen 50-input manifest required for retrieval_batch")
-    parser.add_argument("--workers", type=int, choices=[1, 2, 3], default=1)
+    parser.add_argument("--workers", type=int, choices=[1, 2, 3, 6], default=1)
     parser.add_argument("--overload-backoff", action="store_true", help="Single worker only: retry explicit overloads, 408/502/503/504 and transient transport errors after 5/10/15 minutes, at most three retries per request")
     parser.add_argument("--batch-max-requests", type=int, default=3000)
     parser.add_argument("--batch-max-input-tokens", type=int, default=30000000)
@@ -750,6 +838,8 @@ def main():
     parser.add_argument("--relocate-root", nargs=2, action="append", default=[], metavar=("OLD", "NEW"), help="Resolve copied evidence under a new absolute project root; keep original files and hashes unchanged")
     parser.add_argument("--lock-file", type=Path, help="Shared advisory lock for all attempts on this host")
     parser.add_argument("--notify-on-exit", action="store_true", help="Request a macOS desktop notification when the runner finishes or stops")
+    parser.add_argument("--drain-transient", action="store_true", help="API batch: defer failed jobs, automatically resume technical failures in subsequent passes, discard and retry rejected provider identities; retain per-task limits and quota protection")
+    parser.add_argument("--deadline-unix", type=float, help="Stop new requests at this UTC Unix time; allow in-flight requests to finish and save")
     args = parser.parse_args()
     args.reasoning_effort = args.reasoning_effort or ("medium" if args.api_model == TERRA else "max")
     if args.phase == "formal":
@@ -760,6 +850,8 @@ def main():
         parser.error("Continuation flags require --retry-transient-from")
     if args.overload_backoff and (args.phase != "retrieval_batch" or args.workers != 1 or 1 in args.arms):
         parser.error("Overload backoff requires retrieval_batch, one worker and API arms only")
+    if args.drain_transient and (args.overload_backoff or args.phase != "retrieval_batch" or 1 in args.arms):
+        parser.error("Drain mode requires retrieval_batch and API arms without inline overload backoff")
     if args.phase == "retrieval_batch" and not args.selection_manifest:
         parser.error("retrieval_batch requires --selection-manifest")
     with exclusive_run_lock(args.lock_file or args.output / "active.lock"):
@@ -767,7 +859,7 @@ def main():
         pid_file = args.output / "runner.pid"
         pid_file.write_text(str(os.getpid()) + "\n")
         try:
-            run_experiment(args)
+            run_recovery(args)
         finally:
             pid_file.unlink(missing_ok=True)
             if args.notify_on_exit and sys.platform == "darwin":
@@ -796,6 +888,8 @@ def run_experiment(args):
     config["workers"] = args.workers
     config["overload_retry_policy"] = {"enabled": args.overload_backoff, "delays_seconds": list(OVERLOAD_BACKOFF_SECONDS) if args.overload_backoff else [], "scope": "per_request_consecutive_failures", "retryable_http_statuses": [408, 502, 503, 504], "explicit_overload_statuses": [429, 500, 503], "retry_transient_transport_errors": True, "waiting_excluded_from_task_seconds": True, "all_attempts_count_toward_request_and_batch_budgets": True, "exhaustion": "stop_batch", "unrecognized_auth_quota_rate_limit": "stop_batch"}
     config["stage"] = "retrieval_only_no_checker_or_physics_scoring"
+    config["recovery_policy"] = {"enabled": args.drain_transient, "mode": "defer_technical_failures_to_next_pass", "retry_rejected_provider_identity_without_accepting_it": args.drain_transient, "successful_jobs_never_repeated": True, "successful_prefix_replayed_exactly": True, "quota_and_per_task_limits_unchanged": True}
+    config["execution_deadline_unix"] = getattr(args, "deadline_unix", None)
     relocations = inherited_relocations(args.retry_transient_from, args.relocate_root) if args.retry_transient_from else args.relocate_root
     # Validate even unused mappings before any request. Host paths are operational
     # metadata, not part of model input or the frozen retrieval protocol.
@@ -808,12 +902,15 @@ def run_experiment(args):
         config["frozen_inputs"] = validate_batch_inputs(args.input, args.selection_manifest, rows, catalog)
         config["batch_limits"] = batch_limits
         config["platform_quota_floor"] = args.platform_quota_floor
-        config["quota_probe_policy"] = {"minimum_interval_seconds": 60, "error_backoff_seconds": 300, "query_error": "warn_only", "inference_auth_quota_rate_limit_error": "stop_unless_explicit_overload_backoff" if args.overload_backoff else "stop"}
+        config["quota_probe_policy"] = {"minimum_interval_seconds": 60, "error_backoff_seconds": 300, "query_error": "warn_only", "inference_auth_quota_rate_limit_error": "defer_explicit_overload_stop_other_auth_quota_rate_limit" if args.drain_transient else "stop_unless_explicit_overload_backoff" if args.overload_backoff else "stop"}
         config["tools"] = {"shared": ["bm25", "sparse_tfidf", "substring", "list_rules", "read_rules", "submit_rules"], "arm3_extra": "read_tree", "dense_embeddings": False, "arbitrary_code_execution": False}
         config["source_tree"] = fingerprint_source_tree(ROOT)
-    retries = transient_retry_jobs(args.retry_transient_from, config, args.arms, include_pending=args.continue_pending, path_relocations=relocations) if args.retry_transient_from else None
+    retries = transient_retry_jobs(args.retry_transient_from, config, args.arms, include_pending=args.continue_pending, path_relocations=relocations, retry_provider_mismatch=args.drain_transient, allow_budget_increase=args.drain_transient) if args.retry_transient_from else None
     if retries is not None:
         config["retry_of"] = {"source": str(args.retry_transient_from.resolve()), "manifest_sha256": sha256_file(args.retry_transient_from / "manifest.json"), "jobs": list(retries.values()), "include_pending": args.continue_pending, "replay_prefix": args.replay_prefix}
+        previous_limits = json.loads((args.retry_transient_from / "manifest.json").read_text()).get("batch_limits")
+        if previous_limits != config.get("batch_limits"):
+            config["retry_of"]["previous_batch_limits"] = previous_limits
     signature = digest(config)
     args.output.mkdir(parents=True, exist_ok=True)
     manifest = args.output / "manifest.json"
@@ -824,7 +921,7 @@ def run_experiment(args):
     api_base = os.getenv("ASTRA_BASE_URL", os.getenv("OPENAI_BASE_URL", ""))
     api_key = os.getenv("ASTRA_API_KEY", os.getenv("OPENAI_API_KEY", ""))
     ancestors = run_ancestry(args.retry_transient_from, relocations) if args.retry_transient_from else []
-    budget = BatchBudget(args.output, batch_limits, quota_probe=lambda: platform_quota_probe(api_base, api_key), quota_floor=args.platform_quota_floor, prior_runs=ancestors, retry_overload=args.overload_backoff, stop_file=args.output / "STOP") if args.phase == "retrieval_batch" and any(a != 1 for a in args.arms) else None
+    budget = BatchBudget(args.output, batch_limits, quota_probe=lambda: platform_quota_probe(api_base, api_key), quota_floor=args.platform_quota_floor, prior_runs=ancestors, retry_overload=args.overload_backoff, stop_file=args.stop_file, defer_transient=args.drain_transient, deadline_unix=getattr(args, "deadline_unix", None)) if args.phase == "retrieval_batch" and any(a != 1 for a in args.arms) else None
     jobs = []
     for position, row in enumerate(rows):
         order = config["arm_order"]
@@ -854,7 +951,7 @@ def run_experiment(args):
         replay_source = None
         if args.replay_prefix and retries[(str(row["id"]), arm)].get("source_run"):
             replay_source = Path(retries[(str(row["id"]), arm)]["source_run"]) / f"arm{arm}" / job.name
-        transport = Transport(base=base, key=key, output=job, limits=limits, model=model, reasoning_effort=args.reasoning_effort, batch_budget=budget if arm != 1 else None, replay_source=replay_source, overload_backoff=OVERLOAD_BACKOFF_SECONDS if args.overload_backoff else (), path_relocations=relocations)
+        transport = Transport(base=base, key=key, output=job, limits=limits, model=model, reasoning_effort=args.reasoning_effort, batch_budget=budget if arm != 1 else None, replay_source=replay_source, overload_backoff=OVERLOAD_BACKOFF_SECONDS if args.overload_backoff else (), path_relocations=relocations, retry_provider_mismatch=args.drain_transient)
         print(f"{row['id']} arm{arm}: start", flush=True)
         try:
             result = run_tree(sample, catalog, transport) if arm in (1, 2) else run_autonomous(sample, catalog, transport, tree=arm == 3, output=job, max_chars=args.max_read_chars)
@@ -879,6 +976,8 @@ def run_experiment(args):
             state = state.replace("_budget", "_upstream")
         if budget and budget.stopped == "operator_stop_requested" and state in {"stopping_budget", "stopped_budget"}:
             state = state.replace("_budget", "_operator")
+        if budget and budget.stopped == "execution_deadline_reached" and state in {"stopping_budget", "stopped_budget"}:
+            state = state.replace("_budget", "_deadline")
         completed = [json.loads(p.read_text()) for p in args.output.glob("arm*/*/result.json")]
         inherited = {}
         if args.retry_transient_from:
@@ -901,7 +1000,11 @@ def run_experiment(args):
                     waiting.append({"job": str(path.parent.relative_to(args.output)), **status["events"][-1]})
             if waiting:
                 state = "waiting_for_capacity"
-        write_json(args.output / "progress.json", {"updated_unix": time.time(), "phase": args.phase, "stage": config["stage"], "state": state, "waiting_for_capacity": waiting, "planned_tasks": len(jobs), "recorded_tasks": len(completed), "unrecorded_tasks": len(jobs) - len(completed), "experiment_tasks": len(rows) * len(config["arm_order"]), "experiment_completed": sum(r["status"] == "completed" for r in effective.values()), "inherited_completed": sum(r["status"] == "completed" for r in inherited.values()), "arms": per_arm, "budget_stop_reason": budget.stopped if budget else "", "configuration_sha256": signature})
+        report = {"updated_unix": time.time(), "phase": args.phase, "stage": config["stage"], "state": state, "current_run": str(args.output.resolve()), "waiting_for_capacity": waiting, "planned_tasks": len(jobs), "recorded_tasks": len(completed), "unrecorded_tasks": len(jobs) - len(completed), "experiment_tasks": len(rows) * len(config["arm_order"]), "experiment_completed": sum(r["status"] == "completed" for r in effective.values()), "experiment_failed": sum(r["status"] == "failed" for r in effective.values()), "experiment_pending": len(rows) * len(config["arm_order"]) - len(effective), "inherited_completed": sum(r["status"] == "completed" for r in inherited.values()), "arms": per_arm, "budget_stop_reason": budget.stopped if budget else "", "configuration_sha256": signature}
+        write_json(args.output / "progress.json", report)
+        if args.progress_output != args.output:
+            write_json(args.progress_output / "progress.json", report)
+        return report
 
     progress("running")
     queue = iter(pending)
@@ -910,6 +1013,8 @@ def run_experiment(args):
         while True:
             if budget and budget.stop_file.exists():
                 budget.stop("operator_stop_requested")
+            if budget and budget.deadline_unix and time.time() >= budget.deadline_unix:
+                budget.stop("execution_deadline_reached")
             while len(active) < args.workers and not (budget and budget.stopped):
                 next_job = next(queue, None)
                 if next_job is None:
@@ -921,8 +1026,9 @@ def run_experiment(args):
             for future in done:
                 future.result()
             progress("stopping_budget" if budget and budget.stopped else "running")
-    progress("stopped_budget" if budget and budget.stopped else "finished")
+    final = progress("stopped_budget" if budget and budget.stopped else "finished")
     print("Runner stopped: " + (budget.stopped if budget and budget.stopped else "queue finished; inspect progress.json for effective completions"), flush=True)
+    return final
 
 
 if __name__ == "__main__":
