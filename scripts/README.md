@@ -20,7 +20,9 @@
 
 `run_physics_eval_pipeline.py` 要求显式传入规则库，使用当前 conda 解释器；`validation/final` 要求 clean worktree。运行配置与输出身份按 [实验清单](../experiments/README.md)保存。
 
-API 先行时使用 `run_retrieval_comparison.py --phase retrieval_batch --input … --selection-manifest … --output … --arms 2 3 4 --workers 3`。脚本校验冻结输入的 SHA、50 个 ID 和模型输入字段，保存工具配置及源码哈希；各题独立会话，成功记录续跑时跳过。并发共用请求/token 预算，检查组内平台当前令牌额度；额度不足或遇到账户/限流错误时停止新请求、保留断点。GT 复核和 Qwen 不阻塞检索采集，但仍是最终计分的前提。旧中断记录必须先核对，不能覆盖重跑。
+API 先行时使用 `run_retrieval_comparison.py --phase retrieval_batch --input … --selection-manifest … --output … --arms 2 3 4 --workers 3`。脚本校验冻结输入的 SHA、50 个 ID 和模型输入字段，保存工具配置及源码哈希；各题独立会话，成功记录续跑时跳过。并发共用请求/token 预算，额度查询最多每分钟一次，短暂查询故障最多沿用 5 分钟内的已知余额；低额度或模型接口的账户/限流错误会停止新请求。GT 复核和 Qwen 不阻塞检索采集，但仍是最终计分的前提。
+
+接续预算/网络中断时使用新的结果子目录，追加 `--retry-transient-from 原运行目录 --continue-pending --replay-prefix`。原始失败保留；在全部关联记录中跳过已成功项，未启动任务继续执行。已收到的成功响应只在完整请求逐项相同时重放以恢复运行状态，不重复付费；实际新请求、重放数量和历史用量分开记录，全批预算累计计算。没有明确完成状态的在途请求仍须先核对，不能覆盖重跑。
 
 ## Checker 回放
 

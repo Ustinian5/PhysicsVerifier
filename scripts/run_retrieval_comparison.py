@@ -220,7 +220,7 @@ class BatchBudgetExceeded(RuntimeError):
 class BatchBudget:
     """Account across workers/resumes; missing usage retains its reservation."""
 
-    def __init__(self, output, limits, quota_probe=None, quota_floor=500000):
+    def __init__(self, output, limits, quota_probe=None, quota_floor=500000, prior_runs=()):
         self.output, self.limits = Path(output), limits
         self.quota_probe, self.quota_floor = quota_probe, quota_floor
         self.lock = threading.Lock()
@@ -228,7 +228,10 @@ class BatchBudget:
         self.requests = self.input_tokens = self.output_tokens = self.unknown_usage = 0
         self.reservations = {}
         self.platform_quota = None
-        for path in self.output.glob("arm*/*/request_*.json"):
+        self.quota_error = None
+        self.next_quota_check = 0.0
+        paths = {p.resolve() for run in (self.output, *prior_runs) for p in Path(run).glob("arm*/*/request_*.json")}
+        for path in paths:
             record = json.loads(path.read_text())
             body = record["request"]
             usage = (record.get("response") or {}).get("usage") or {}
@@ -241,7 +244,7 @@ class BatchBudget:
             self.unknown_usage += not known
 
     def _save(self):
-        write_json(self.output / "budget.json", {"updated_unix": time.time(), "limits": self.limits, "requests_started": self.requests, "accounted_input_tokens": self.input_tokens, "accounted_output_tokens": self.output_tokens, "requests_without_usage": self.unknown_usage, "in_flight": len(self.reservations), "reserved_input_tokens": sum(v[0] for v in self.reservations.values()), "reserved_output_tokens": sum(v[1] for v in self.reservations.values()), "platform_quota": self.platform_quota, "platform_quota_floor": self.quota_floor, "stop_reason": self.stopped, "unknown_usage_policy": "retain pre-request reservation; never count unknown usage as zero"})
+        write_json(self.output / "budget.json", {"updated_unix": time.time(), "limits": self.limits, "requests_started": self.requests, "accounted_input_tokens": self.input_tokens, "accounted_output_tokens": self.output_tokens, "requests_without_usage": self.unknown_usage, "in_flight": len(self.reservations), "reserved_input_tokens": sum(v[0] for v in self.reservations.values()), "reserved_output_tokens": sum(v[1] for v in self.reservations.values()), "platform_quota": self.platform_quota, "platform_quota_floor": self.quota_floor, "last_quota_probe_error": self.quota_error, "stop_reason": self.stopped, "unknown_usage_policy": "retain pre-request reservation; never count unknown usage as zero"})
 
     def stop(self, reason):
         with self.lock:
@@ -250,13 +253,20 @@ class BatchBudget:
 
     def reserve(self, incoming, outgoing):
         with self.lock:
-            if not self.stopped and self.quota_probe:
+            if not self.stopped and self.quota_probe and time.time() >= self.next_quota_check:
                 try:
                     self.platform_quota = self.quota_probe()
+                    self.platform_quota.setdefault("checked_unix", time.time())
+                    self.quota_error = None
                     if not self.platform_quota["unlimited_quota"] and self.platform_quota["total_available"] <= self.quota_floor:
                         self.stopped = "platform_quota_low"
                 except Exception as exc:
-                    self.stopped = "platform_quota_probe_failed: " + type(exc).__name__
+                    self.quota_error = {"type": type(exc).__name__, "http_status": getattr(getattr(exc, "response", None), "status_code", None), "checked_unix": time.time()}
+                    # Quota is a control-plane query, not a model observation.
+                    # Tolerate a short outage with a recent confirmed balance.
+                    if not self.platform_quota or time.time() - self.platform_quota["checked_unix"] > 300:
+                        self.stopped = "platform_quota_probe_failed: " + type(exc).__name__
+                self.next_quota_check = time.time() + 60
             reserved_input = sum(v[0] for v in self.reservations.values())
             reserved_output = sum(v[1] for v in self.reservations.values())
             if not self.stopped and (self.requests >= self.limits["requests"] or self.input_tokens + reserved_input + incoming > self.limits["input_tokens"] or self.output_tokens + reserved_output + outgoing > self.limits["output_tokens"]):
@@ -318,7 +328,7 @@ def validate_batch_inputs(input_path, selection_manifest, rows, catalog):
 
 
 class Transport:
-    def __init__(self, *, base, key, output, limits, model, batch_budget=None):
+    def __init__(self, *, base, key, output, limits, model, batch_budget=None, replay_source=None):
         self.base = base.rstrip("/")
         self.key = key
         self.output = Path(output)
@@ -329,16 +339,49 @@ class Transport:
         self.input_tokens = 0
         self.output_tokens = 0
         self.started = time.monotonic()
+        self.replay_queue = []
+        self.replayed = []
+        self.replayed_input_tokens = self.replayed_output_tokens = 0
+        self.replayed_seconds = 0.0
+        if replay_source:
+            replay_source = Path(replay_source)
+            references = replay_source / "replayed_requests.json"
+            prior = json.loads(references.read_text()) if references.exists() else []
+            for item in prior:
+                path = Path(item["path"])
+                if sha256_file(path) != item["sha256"]:
+                    raise ValueError("Preserved response prefix hash mismatch")
+                self.replay_queue.append(path)
+            for path in sorted(replay_source.glob("request_*.json")):
+                record = json.loads(path.read_text())
+                if record.get("http_status") != 200 or not record.get("response"):
+                    break
+                self.replay_queue.append(path)
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.chat_create))
 
     def post(self, endpoint, body, *, request_timeout=None):
-        if self.requests >= self.limits["requests"] or time.monotonic() - self.started >= self.limits["seconds"]:
+        if self.replay_queue:
+            path = self.replay_queue.pop(0)
+            record = json.loads(path.read_text())
+            data = record.get("response", {})
+            if record.get("request") != body or record.get("endpoint") != endpoint or data.get("model") != self.model or not data.get("id") or (endpoint == "/responses" and data.get("reasoning", {}).get("effort") != "max"):
+                raise ValueError("Preserved response prefix does not match the exact request")
+            usage = data.get("usage") or {}
+            if usage.get("input_tokens", usage.get("prompt_tokens")) is None or usage.get("output_tokens", usage.get("completion_tokens")) is None:
+                raise ValueError("Preserved response prefix has unknown usage")
+            self.replayed_input_tokens += usage.get("input_tokens", usage.get("prompt_tokens", 0))
+            self.replayed_output_tokens += usage.get("output_tokens", usage.get("completion_tokens", 0))
+            self.replayed_seconds += record.get("elapsed_seconds", 0)
+            self.replayed.append({"path": str(path.resolve()), "sha256": sha256_file(path)})
+            write_json(self.output / "replayed_requests.json", self.replayed)
+            return copy.deepcopy(data)
+        if self.requests + len(self.replayed) >= self.limits["requests"] or time.monotonic() - self.started + self.replayed_seconds >= self.limits["seconds"]:
             raise RuntimeError("request_or_time_budget_exceeded")
         # UTF-8 bytes conservatively bound ordinary text tokenization before a request.
         reservation = len(canonical(body).encode())
-        if self.input_tokens + reservation > self.limits["input_tokens"]:
+        if self.input_tokens + self.replayed_input_tokens + reservation > self.limits["input_tokens"]:
             raise RuntimeError("input_token_budget_exceeded")
-        if self.output_tokens + body.get("max_output_tokens", body.get("max_tokens", 0)) > self.limits["output_tokens"]:
+        if self.output_tokens + self.replayed_output_tokens + body.get("max_output_tokens", body.get("max_tokens", 0)) > self.limits["output_tokens"]:
             raise RuntimeError("output_token_budget_exceeded")
         ticket = self.batch_budget.reserve(reservation, body.get("max_output_tokens", body.get("max_tokens", 0))) if self.batch_budget else None
         self.requests += 1
@@ -348,7 +391,7 @@ class Transport:
         start = time.monotonic()
         try:
             timeout = request_timeout or self.limits.get("request_timeout_seconds", 900)
-            with httpx.Client(timeout=min(timeout, self.limits["seconds"] - (start - self.started))) as client:
+            with httpx.Client(timeout=min(timeout, self.limits["seconds"] - (start - self.started) - self.replayed_seconds)) as client:
                 response = client.post(self.base + endpoint, headers={"Authorization": "Bearer " + self.key}, json=body)
             record.update(http_status=response.status_code,request_id=response.headers.get("x-request-id"))
             try:
@@ -403,7 +446,7 @@ class Transport:
         return ChatCompletion.model_validate({"id": data["id"], "object": "chat.completion", "created": int(time.time()), "model": data["model"], "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop" if data.get("status") == "completed" else "length"}]})
 
     def summary(self):
-        return {"requests": self.requests, "input_tokens": self.input_tokens, "output_tokens": self.output_tokens, "elapsed_seconds": time.monotonic() - self.started}
+        return {"requests": self.requests, "input_tokens": self.input_tokens, "output_tokens": self.output_tokens, "elapsed_seconds": time.monotonic() - self.started, "replayed_requests": len(self.replayed), "replayed_input_tokens": self.replayed_input_tokens, "replayed_output_tokens": self.replayed_output_tokens, "replayed_elapsed_seconds": self.replayed_seconds}
 
 
 def execute_tool_batch(calls, corpus, sample, *, max_chars):
@@ -458,36 +501,62 @@ def run_tree(sample, catalog, transport):
         return {"status": "failed", "error_type": type(exc).__name__, "error": str(exc), "trace": matcher.last_trace, "selected_rules": []}
 
 
-def transient_retry_jobs(source, config, arms):
+def run_ancestry(source):
+    runs = []
+    source = Path(source).resolve()
+    while True:
+        if source in runs:
+            raise ValueError("Cyclic run ancestry")
+        runs.append(source)
+        manifest = json.loads((source / "manifest.json").read_text())
+        parent = manifest.get("retry_of")
+        if not parent:
+            return runs
+        source = Path(parent["source"]).resolve()
+        if sha256_file(source / "manifest.json") != parent["manifest_sha256"]:
+            raise ValueError("Parent run manifest hash mismatch")
+
+
+def transient_retry_jobs(source, config, arms, *, include_pending=False):
     """Select recorded transport failures without repeating successful jobs."""
     original = json.loads((source / "manifest.json").read_text())
-    for key in ("input_sha256", "catalog_sha256", "matcher_sha256", "prompt_sha256", "limits", "max_read_chars", "endpoint_sha256", "vector_method", "phase"):
+    for key in ("input_sha256", "catalog_sha256", "matcher_sha256", "prompt_sha256", "limits", "max_read_chars", "endpoint_sha256", "vector_method", "phase", "tools", "batch_limits"):
         if original.get(key) != config.get(key):
             raise ValueError("Retry protocol differs: " + key)
     jobs = {}
+    ancestors = run_ancestry(source)
     for sid in config["sample_ids"]:
         if sid not in original["sample_ids"]:
             raise ValueError("Retry sample absent from original run")
         for arm in arms:
-            job = source / f"arm{arm}" / hashlib.sha256(sid.encode()).hexdigest()[:16]
+            relative = Path(f"arm{arm}") / hashlib.sha256(sid.encode()).hexdigest()[:16]
+            source_run = next((run for run in ancestors if (run / relative / "result.json").exists()), None)
+            if source_run is None:
+                if any(any((run / relative).glob("request_*.json")) for run in ancestors):
+                    continue  # Unresolved in-flight requests cannot be replayed.
+                if include_pending:
+                    jobs[(sid, arm)] = {"sample_id": sid, "arm": arm, "new_pending": True}
+                continue
+            job = source_run / relative
             result_path = job / "result.json"
-            if not result_path.exists():
-                continue  # Interrupted requests require separate reconciliation.
             result = json.loads(result_path.read_text())
             if result.get("status") != "failed":
                 continue
             requests = sorted(job.glob("request_*.json"))
+            if not requests and (job / "replayed_requests.json").exists():
+                requests = [Path(item["path"]) for item in json.loads((job / "replayed_requests.json").read_text())]
             if not requests:
                 continue
             last = json.loads(requests[-1].read_text())
             status = last.get("http_status")
             timeout = status is None and "timed out" in str(last.get("error", "")).lower()
-            if status not in {502, 503, 504} and not timeout:
+            paused = "BatchBudgetExceeded" in (str(result.get("error_type", "")) + str(result.get("error", "")))
+            if status not in {401, 402, 403, 429, 502, 503, 504} and not timeout and not paused:
                 continue
             expected = QWEN if arm == 1 else ASTRA
             if result.get("model") != expected:
                 raise ValueError("Retry would change the model")
-            jobs[(sid, arm)] = {"sample_id": sid, "arm": arm, "result_sha256": sha256_file(result_path), "failed_request_sha256": sha256_file(requests[-1]), "http_status": status, "reason": last.get("error")}
+            jobs[(sid, arm)] = {"sample_id": sid, "arm": arm, "source_run": str(source_run), "result_sha256": sha256_file(result_path), "failed_request_sha256": sha256_file(requests[-1]), "http_status": status, "reason": result.get("error") or last.get("error")}
     if not jobs:
         raise ValueError("No completed transient failure is eligible for retry")
     return jobs
@@ -515,12 +584,16 @@ def main():
     parser.add_argument("--max-seconds", type=int, default=1800)
     parser.add_argument("--request-timeout", type=int, default=900)
     parser.add_argument("--max-read-chars", type=int, default=500000)
-    parser.add_argument("--retry-transient-from", type=Path, help="Retry only recorded 502/503/504 or client timeout failures from this run; preserve successful jobs")
+    parser.add_argument("--retry-transient-from", type=Path, help="Resume recorded transport/budget failures; preserve completed jobs across linked runs")
+    parser.add_argument("--continue-pending", action="store_true", help="With --retry-transient-from, also run jobs not started in its ancestry")
+    parser.add_argument("--replay-prefix", action="store_true", help="With --retry-transient-from, reuse exact successful HTTP prefix responses instead of paying again")
     args = parser.parse_args()
     if args.phase == "formal":
         parser.error("Final scoring still requires reviewed GT and Qwen; use retrieval_batch for frozen API-first retrieval")
     if not os.getenv("CONDA_PREFIX"):
         parser.error("Run in the project conda environment")
+    if (args.continue_pending or args.replay_prefix) and not args.retry_transient_from:
+        parser.error("Continuation flags require --retry-transient-from")
     load_dotenv(args.env_file, override=False)
     catalog = json.loads(args.catalog.read_text())
     rows = json.loads(args.input.read_text())
@@ -542,11 +615,12 @@ def main():
         config["frozen_inputs"] = validate_batch_inputs(args.input, args.selection_manifest, rows, catalog)
         config["batch_limits"] = batch_limits
         config["platform_quota_floor"] = args.platform_quota_floor
+        config["quota_probe_policy"] = {"minimum_interval_seconds": 60, "last_good_balance_max_age_seconds": 300}
         config["tools"] = {"shared": ["bm25", "sparse_tfidf", "substring", "list_rules", "read_rules", "submit_rules"], "arm3_extra": "read_tree", "dense_embeddings": False, "arbitrary_code_execution": False}
         config["source_tree"] = fingerprint_source_tree(ROOT)
-    retries = transient_retry_jobs(args.retry_transient_from, config, args.arms) if args.retry_transient_from else None
+    retries = transient_retry_jobs(args.retry_transient_from, config, args.arms, include_pending=args.continue_pending) if args.retry_transient_from else None
     if retries is not None:
-        config["retry_of"] = {"source": str(args.retry_transient_from), "manifest_sha256": sha256_file(args.retry_transient_from / "manifest.json"), "jobs": list(retries.values())}
+        config["retry_of"] = {"source": str(args.retry_transient_from.resolve()), "manifest_sha256": sha256_file(args.retry_transient_from / "manifest.json"), "jobs": list(retries.values()), "include_pending": args.continue_pending, "replay_prefix": args.replay_prefix}
     signature = digest(config)
     args.output.mkdir(parents=True, exist_ok=True)
     manifest = args.output / "manifest.json"
@@ -556,7 +630,7 @@ def main():
         write_json(manifest, {"configuration_sha256": signature, **config, "git": capture_git_state(ROOT)})
     astra_base = os.getenv("ASTRA_BASE_URL", os.getenv("OPENAI_BASE_URL", ""))
     astra_key = os.getenv("ASTRA_API_KEY", os.getenv("OPENAI_API_KEY", ""))
-    budget = BatchBudget(args.output, batch_limits, quota_probe=lambda: platform_quota_probe(astra_base, astra_key), quota_floor=args.platform_quota_floor) if args.phase == "retrieval_batch" and any(a != 1 for a in args.arms) else None
+    budget = BatchBudget(args.output, batch_limits, quota_probe=lambda: platform_quota_probe(astra_base, astra_key), quota_floor=args.platform_quota_floor, prior_runs=run_ancestry(args.retry_transient_from) if args.retry_transient_from else ()) if args.phase == "retrieval_batch" and any(a != 1 for a in args.arms) else None
     jobs = []
     for position, row in enumerate(rows):
         order = config["arm_order"]
@@ -583,13 +657,16 @@ def main():
         key = os.getenv("QWEN_API_KEY", "EMPTY") if arm == 1 else os.getenv("ASTRA_API_KEY", os.getenv("OPENAI_API_KEY", ""))
         if not base or not key:
             raise ValueError(f"Missing endpoint/key for arm {arm}")
-        transport = Transport(base=base, key=key, output=job, limits=limits, model=model, batch_budget=budget if model == ASTRA else None)
+        replay_source = None
+        if args.replay_prefix and retries[(str(row["id"]), arm)].get("source_run"):
+            replay_source = Path(retries[(str(row["id"]), arm)]["source_run"]) / f"arm{arm}" / job.name
+        transport = Transport(base=base, key=key, output=job, limits=limits, model=model, batch_budget=budget if model == ASTRA else None, replay_source=replay_source)
         print(f"{row['id']} arm{arm}: start", flush=True)
         try:
             result = run_tree(sample, catalog, transport) if arm in (1, 2) else run_autonomous(sample, catalog, transport, tree=arm == 3, output=job, max_chars=args.max_read_chars)
         except Exception as exc:
             result = {"status": "failed", "error_type": type(exc).__name__, "error": str(exc), "selected_rules": []}
-        if budget and budget.stopped and transport.requests == 0:
+        if budget and budget.stopped and transport.requests == 0 and not transport.replayed:
             # No model request took place. Leave this job pending for a
             # budget-resume, without manufacturing a failed observation.
             tools_path = job / "tools.json"
@@ -605,11 +682,20 @@ def main():
 
     def progress(state):
         completed = [json.loads(p.read_text()) for p in args.output.glob("arm*/*/result.json")]
+        inherited = {}
+        if args.retry_transient_from:
+            for run in reversed(run_ancestry(args.retry_transient_from)):
+                for path in run.glob("arm*/*/result.json"):
+                    record = json.loads(path.read_text())
+                    if str(record["id"]) in ids and record["arm"] in args.arms:
+                        inherited[(str(record["id"]), record["arm"])] = record
+        effective = dict(inherited)
+        effective.update({(str(r["id"]), r["arm"]): r for r in completed})
         per_arm = {}
         for arm in config["arm_order"]:
             selected = [r for r in completed if r["arm"] == arm]
             per_arm[str(arm)] = {"recorded": len(selected), "status_counts": dict(Counter(r["status"] for r in selected)), "completed_empty": sum(r["status"] == "completed" and not r["selected_rules"] for r in selected)}
-        write_json(args.output / "progress.json", {"updated_unix": time.time(), "phase": args.phase, "stage": config["stage"], "state": state, "planned_tasks": len(jobs), "recorded_tasks": len(completed), "unrecorded_tasks": len(jobs) - len(completed), "arms": per_arm, "budget_stop_reason": budget.stopped if budget else "", "configuration_sha256": signature})
+        write_json(args.output / "progress.json", {"updated_unix": time.time(), "phase": args.phase, "stage": config["stage"], "state": state, "planned_tasks": len(jobs), "recorded_tasks": len(completed), "unrecorded_tasks": len(jobs) - len(completed), "experiment_tasks": len(rows) * len(config["arm_order"]), "experiment_completed": sum(r["status"] == "completed" for r in effective.values()), "inherited_completed": sum(r["status"] == "completed" for r in inherited.values()), "arms": per_arm, "budget_stop_reason": budget.stopped if budget else "", "configuration_sha256": signature})
 
     progress("running")
     queue = iter(pending)

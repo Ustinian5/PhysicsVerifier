@@ -71,12 +71,12 @@ def read_frozen_jobs(runs, input_path, catalog_path, rows, arms):
                     raise ValueError("Retrieval model mismatch")
                 previous = jobs.get((sid, arm))
                 evidence = {"path": str(path), "sha256": sha256_file(path), "status": value.get("status")}
+                links = retry.get("jobs", []) if retry else []
+                link = next((item for item in links if (str(item.get("sample_id")), item.get("arm")) == (sid, arm)), {})
                 if previous:
-                    links = retry.get("jobs", []) if retry else []
-                    link = next((item for item in links if (str(item.get("sample_id")), item.get("arm")) == (sid, arm)), {})
                     if previous["result"].get("status") != "failed" or link.get("result_sha256") != previous["attempts"][-1]["sha256"]:
                         raise ValueError("Only a linked failed attempt can be superseded")
-                elif retry:
+                elif retry and link.get("new_pending") is not True:
                     raise ValueError("Retry has no original result in the supplied runs")
                 jobs[(sid, arm)] = {"result": value, "attempts": (previous["attempts"] if previous else []) + [evidence]}
     return jobs

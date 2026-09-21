@@ -78,6 +78,55 @@ def check_tree_bridge_preserves_prompt_and_schema_without_sampling_parameters(tm
 
 
 class RetrievalComparisonTests(unittest.TestCase):
+    def test_quota_probe_is_cached_and_short_outages_do_not_abort_models(self):
+        import time
+        from unittest.mock import Mock
+        probe = Mock(side_effect=[{"total_available": 1000000, "unlimited_quota": False}, RuntimeError("temporary outage"), RuntimeError("still unavailable")])
+        with tempfile.TemporaryDirectory() as directory:
+            budget = BatchBudget(directory, {"requests": 10, "input_tokens": 10000, "output_tokens": 10000}, quota_probe=probe)
+            budget.reserve(1, 1)
+            budget.reserve(1, 1)
+            self.assertEqual(probe.call_count, 1)
+            budget.next_quota_check = 0
+            budget.reserve(1, 1)
+            self.assertFalse(budget.stopped)
+            budget.next_quota_check = 0
+            budget.platform_quota["checked_unix"] = time.time() - 301
+            with self.assertRaises(BatchBudgetExceeded):
+                budget.reserve(1, 1)
+
+    def test_response_prefix_replay_is_exact_and_does_not_call_network(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            body = {"model": "gpt-6-astra", "input": "original"}
+            response = {"id": "response", "model": "gpt-6-astra", "reasoning": {"effort": "max"}, "usage": {"input_tokens": 12, "output_tokens": 8}}
+            write_json(root / "source/request_001.json", {"request": body, "endpoint": "/responses", "http_status": 200, "response": response, "elapsed_seconds": 3})
+            options = dict(base="https://not-used.invalid", key="not-logged", limits={}, model="gpt-6-astra", replay_source=root / "source")
+            transport = Transport(output=root / "resume", **options)
+            self.assertEqual(transport.post("/responses", body), response)
+            self.assertEqual((transport.requests, transport.input_tokens, transport.replayed_input_tokens), (0, 0, 12))
+            other = Transport(output=root / "mismatch", **options)
+            with self.assertRaisesRegex(ValueError, "exact request"):
+                other.post("/responses", {**body, "input": "changed"})
+            self.assertEqual(other.requests, 0)
+
+    def test_continuation_skips_successes_in_all_ancestors(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original, child = root / "original", root / "child"
+            config = {"sample_ids": ["paused", "done_in_original", "done_in_child", "not_started"]}
+            write_json(original / "manifest.json", config)
+            write_json(child / "manifest.json", {**config, "retry_of": {"source": str(original), "manifest_sha256": sha256_file(original / "manifest.json")}})
+            for run, sid, state in [(original, "paused", "failed"), (original, "done_in_original", "completed"), (child, "done_in_child", "completed")]:
+                job = run / "arm2" / hashlib.sha256(sid.encode()).hexdigest()[:16]
+                write_json(job / "result.json", {"status": state, "model": "gpt-6-astra", "error_type": "BatchBudgetExceeded" if state == "failed" else None})
+                write_json(job / "request_001.json", {"http_status": 200})
+            jobs = transient_retry_jobs(child, config, [2], include_pending=True)
+            self.assertEqual(set(jobs), {("paused", 2), ("not_started", 2)})
+            self.assertTrue(jobs[("not_started", 2)]["new_pending"])
+            self.assertEqual(jobs[("paused", 2)]["source_run"], str(original.resolve()))
+
     def test_parallel_workers_share_token_reservations(self):
         from concurrent.futures import ThreadPoolExecutor
         with tempfile.TemporaryDirectory() as directory:
