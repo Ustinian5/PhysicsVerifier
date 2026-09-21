@@ -234,6 +234,16 @@ def upstream_overloaded(record):
     )
 
 
+def retryable_transport_failure(record):
+    if upstream_overloaded(record):
+        return "upstream_overload"
+    if record.get("http_status") in {408, 502, 503, 504}:
+        return "upstream_http_" + str(record["http_status"])
+    if record.get("http_status") is None and (record.get("retryable_transport_error") or "timed out" in str(record.get("error", "")).lower()):
+        return "transport_timeout_or_disconnect"
+    return None
+
+
 class BatchBudget:
     """Account across workers/resumes; missing usage retains its reservation."""
 
@@ -378,7 +388,7 @@ class Transport:
                 record = json.loads(path.read_text())
                 if interrupted and any(record.get(key) != interrupted.get(key) for key in ("request", "endpoint")):
                     raise ValueError("Overload retry does not match the exact request")
-                if upstream_overloaded(record):
+                if retryable_transport_failure(record):
                     interrupted = record
                     continue
                 if record.get("http_status") != 200 or not record.get("response"):
@@ -403,23 +413,29 @@ class Transport:
             self.replayed.append({"path": str(path.resolve()), "sha256": sha256_file(path)})
             write_json(self.output / "replayed_requests.json", self.replayed)
             return copy.deepcopy(data)
+        # Retries belong to one logical HTTP request. A completed request starts
+        # a fresh allowance; historical events remain available for audit.
+        retry_start = len(self.overload_events)
         while True:
             try:
                 return self._post_once(endpoint, body, request_timeout=request_timeout)
-            except httpx.HTTPStatusError:
+            except (httpx.HTTPStatusError, httpx.TransportError):
                 path = self.output / f"request_{self.requests:03d}.json"
                 record = json.loads(path.read_text())
-                if not self.overload_backoff or not upstream_overloaded(record):
+                if not self.overload_backoff or not retryable_transport_failure(record):
                     raise
-                self._wait_for_capacity(path, record)
+                self._wait_for_capacity(path, record, retry_start=retry_start)
 
     def active_seconds(self):
         return time.monotonic() - self.started - self.backoff_seconds + self.replayed_seconds
 
-    def _wait_for_capacity(self, path, record):
+    def _wait_for_capacity(self, path, record, *, retry_start):
         if self.batch_budget and self.batch_budget.stopped:
             raise BatchBudgetExceeded(self.batch_budget.stopped)
-        retry = len(self.overload_events)
+        if self.requests + len(self.replayed) >= self.limits["requests"] or self.active_seconds() >= self.limits["seconds"]:
+            raise RuntimeError("request_or_time_budget_exceeded")
+        current_events = self.overload_events[retry_start:]
+        retry = len(current_events)
         delay = self.overload_backoff[retry] if retry < len(self.overload_backoff) else None
         # Respect an upstream Retry-After without waiting or retrying indefinitely.
         header = record.get("retry_after")
@@ -434,18 +450,17 @@ class Transport:
                     retry_after = 0
             if math.isfinite(retry_after):
                 delay = max(delay, retry_after)
-        if (delay is None or sum(e["delay_seconds"] for e in self.overload_events) + delay > sum(self.overload_backoff)
-                or self.requests + len(self.replayed) >= self.limits["requests"] or self.active_seconds() >= self.limits["seconds"]):
-            reason = "upstream_overload_retry_exhausted"
+        if delay is None or sum(e["delay_seconds"] for e in current_events) + delay > sum(self.overload_backoff):
+            reason = "upstream_overload_retry_exhausted" if upstream_overloaded(record) else "upstream_transport_retry_exhausted"
             write_json(self.output / "overload_retry.json", {"state": "exhausted", "events": self.overload_events, "last_request": path.name, "updated_unix": time.time()})
             if self.batch_budget:
                 self.batch_budget.stop(reason)
             raise BatchBudgetExceeded(reason)
-        event = {"request": path.name, "sha256": sha256_file(path), "delay_seconds": delay, "started_unix": time.time(), "resume_after_unix": time.time() + delay}
+        event = {"request": path.name, "sha256": sha256_file(path), "reason": retryable_transport_failure(record), "consecutive_retry": retry + 1, "delay_seconds": delay, "started_unix": time.time(), "resume_after_unix": time.time() + delay}
         self.overload_events.append(event)
         status = {"state": "waiting", "events": self.overload_events, "updated_unix": time.time()}
         write_json(self.output / "overload_retry.json", status)
-        print(f"{self.output.parent.name}/{self.output.name}: upstream overloaded; retry {retry + 1}/{len(self.overload_backoff)} after {delay:g}s", flush=True)
+        print(f"{self.output.parent.name}/{self.output.name}: {event['reason']}; retry {retry + 1}/{len(self.overload_backoff)} for this request after {delay:g}s", flush=True)
         start = time.monotonic()
         try:
             remaining = delay
@@ -487,6 +502,7 @@ class Transport:
                 data = response.json()
             except ValueError:
                 record["response_text"] = response.text[:10000]
+                response.raise_for_status()  # HTML gateway errors are still retryable HTTP errors.
                 raise RuntimeError("Non-JSON API response")
             record["response"] = data
             response.raise_for_status()
@@ -504,6 +520,9 @@ class Transport:
             return data
         except Exception as exc:
             record["error"] = str(exc)
+            record["error_type"] = type(exc).__name__
+            if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)):
+                record["retryable_transport_error"] = True
             raise
         finally:
             record["elapsed_seconds"] = time.monotonic() - start
@@ -642,9 +661,8 @@ def transient_retry_jobs(source, config, arms, *, include_pending=False):
                 continue
             last = json.loads(requests[-1].read_text())
             status = last.get("http_status")
-            timeout = status is None and "timed out" in str(last.get("error", "")).lower()
             paused = "BatchBudgetExceeded" in (str(result.get("error_type", "")) + str(result.get("error", "")))
-            if status not in {401, 402, 403, 429, 502, 503, 504} and not upstream_overloaded(last) and not timeout and not paused:
+            if status not in {401, 402, 403, 429} and not retryable_transport_failure(last) and not paused:
                 continue
             expected = QWEN if arm == 1 else api_identity(config)[0]
             if result.get("model") != expected:
@@ -668,7 +686,7 @@ def main():
     parser.add_argument("--phase", choices=["development", "retrieval_batch", "formal"], default="development")
     parser.add_argument("--selection-manifest", type=Path, help="Frozen 50-input manifest required for retrieval_batch")
     parser.add_argument("--workers", type=int, choices=[1, 2, 3], default=1)
-    parser.add_argument("--overload-backoff", action="store_true", help="Single worker only: retry explicit upstream capacity errors after 5/10/15 minutes, at most three retries per task")
+    parser.add_argument("--overload-backoff", action="store_true", help="Single worker only: retry explicit overloads, 408/502/503/504 and transient transport errors after 5/10/15 minutes, at most three retries per request")
     parser.add_argument("--batch-max-requests", type=int, default=3000)
     parser.add_argument("--batch-max-input-tokens", type=int, default=30000000)
     parser.add_argument("--batch-max-output-tokens", type=int, default=1500000)
@@ -708,7 +726,7 @@ def main():
     config["reasoning_effort"] = args.reasoning_effort
     config["arm_order"] = list(dict.fromkeys(args.arms))
     config["workers"] = args.workers
-    config["overload_retry_policy"] = {"enabled": args.overload_backoff, "delays_seconds": list(OVERLOAD_BACKOFF_SECONDS) if args.overload_backoff else [], "scope": "per_task_not_reset_after_success", "waiting_excluded_from_task_seconds": True, "all_attempts_count_toward_request_and_batch_budgets": True, "exhaustion": "stop_batch", "unrecognized_auth_quota_rate_limit": "stop_batch"}
+    config["overload_retry_policy"] = {"enabled": args.overload_backoff, "delays_seconds": list(OVERLOAD_BACKOFF_SECONDS) if args.overload_backoff else [], "scope": "per_request_consecutive_failures", "retryable_http_statuses": [408, 502, 503, 504], "explicit_overload_statuses": [429, 500, 503], "retry_transient_transport_errors": True, "waiting_excluded_from_task_seconds": True, "all_attempts_count_toward_request_and_batch_budgets": True, "exhaustion": "stop_batch", "unrecognized_auth_quota_rate_limit": "stop_batch"}
     config["stage"] = "retrieval_only_no_checker_or_physics_scoring"
     batch_limits = {"requests": args.batch_max_requests, "input_tokens": args.batch_max_input_tokens, "output_tokens": args.batch_max_output_tokens}
     if args.phase == "retrieval_batch":
@@ -783,6 +801,8 @@ def main():
         print(f"{row['id']} arm{arm}: {result['status']}, {len(result['selected_rules'])} rules, {transport.requests} requests", flush=True)
 
     def progress(state):
+        if budget and budget.stopped.startswith("upstream_") and state in {"stopping_budget", "stopped_budget"}:
+            state = state.replace("_budget", "_upstream")
         completed = [json.loads(p.read_text()) for p in args.output.glob("arm*/*/result.json")]
         inherited = {}
         if args.retry_transient_from:

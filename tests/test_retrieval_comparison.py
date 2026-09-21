@@ -80,7 +80,7 @@ def check_tree_bridge_preserves_prompt_and_schema_without_sampling_parameters(tm
 
 
 class RetrievalComparisonTests(unittest.TestCase):
-    def simulate_overload(self, root, responses, *, successful_prefix=0):
+    def simulate_overload(self, root, responses, *, successful_prefix=0, task_requests=32, batch_requests=100):
         """Exercise real transport/budget code with a virtual clock and HTTP server."""
         import httpx
         from unittest.mock import patch
@@ -89,11 +89,16 @@ class RetrievalComparisonTests(unittest.TestCase):
         bodies = []
         def handle(request):
             bodies.append(json.loads(request.content))
-            status, body, headers = responses[min(len(bodies) - 1, len(responses) - 1)]
+            reply = responses[min(len(bodies) - 1, len(responses) - 1)]
+            if isinstance(reply, Exception):
+                raise reply
+            status, body, headers = reply
+            if isinstance(body, str):
+                return httpx.Response(status, text=body, headers=headers)
             return httpx.Response(status, json=body, headers=headers)
-        budget = BatchBudget(root / "run", {"requests": 100, "input_tokens": 100000, "output_tokens": 10000}, retry_overload=True)
+        budget = BatchBudget(root / "run", {"requests": batch_requests, "input_tokens": 100000, "output_tokens": 10000}, retry_overload=True)
         with patch("scripts.run_retrieval_comparison.time.monotonic", side_effect=lambda: clock[0]), patch("scripts.run_retrieval_comparison.time.sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)), patch("scripts.run_retrieval_comparison.httpx.Client", side_effect=lambda **kw: client_class(transport=httpx.MockTransport(handle), **kw)):
-            transport = Transport(base="https://not-used.invalid", key="secret-must-not-appear", output=root / "run/arm2/case", model=TERRA, limits={"requests": 32, "seconds": 10, "input_tokens": 100000, "output_tokens": 1000, "per_response": 20}, batch_budget=budget, overload_backoff=OVERLOAD_BACKOFF_SECONDS)
+            transport = Transport(base="https://not-used.invalid", key="secret-must-not-appear", output=root / "run/arm2/case", model=TERRA, limits={"requests": task_requests, "seconds": 10, "input_tokens": 100000, "output_tokens": 1000, "per_response": 20}, batch_budget=budget, overload_backoff=OVERLOAD_BACKOFF_SECONDS)
             error = result = None
             try:
                 for i in range(successful_prefix):
@@ -140,15 +145,20 @@ class RetrievalComparisonTests(unittest.TestCase):
             with self.assertRaises(BatchBudgetExceeded):
                 budget.reserve(1, 1)
 
-    def test_overload_retry_budget_does_not_reset_after_success(self):
+    def test_intermittent_overload_resets_retries_after_each_completed_request(self):
         overload = (500, {"error": {"message": "当前模型繁忙"}}, {})
         success = (200, {"id": "r", "model": TERRA, "reasoning": {"effort": "medium"}, "usage": {"input_tokens": 10, "output_tokens": 2}}, {})
         with tempfile.TemporaryDirectory() as directory:
-            _, budget, bodies, _, error, metrics = self.simulate_overload(Path(directory), [overload, success, overload, success, overload, success, overload], successful_prefix=3)
-            self.assertIsInstance(error, BatchBudgetExceeded)
-            self.assertEqual(len(bodies), 7)
-            self.assertEqual(metrics["overload_retries"], 3)
-            self.assertEqual(budget.stopped, "upstream_overload_retry_exhausted")
+            # Production sequence in cl_129_50393: success, success, three
+            # capacity errors, recovery, success, another capacity error.
+            _, budget, bodies, _, error, metrics = self.simulate_overload(Path(directory), [success, success, overload, overload, overload, success, success, overload, success], successful_prefix=4)
+            self.assertIsNone(error)
+            self.assertEqual(len(bodies), 9)
+            self.assertEqual(bodies[2:6], [bodies[2]] * 4)
+            self.assertEqual(bodies[7:9], [bodies[7]] * 2)
+            self.assertEqual(metrics["overload_retries"], 4)
+            self.assertEqual(metrics["overload_backoff_seconds"], 2100)
+            self.assertFalse(budget.stopped)
 
     def test_retry_after_is_respected_within_a_bounded_wait(self):
         overload = {"error": {"message": "Current group upstream load is saturated"}}
@@ -173,6 +183,41 @@ class RetrievalComparisonTests(unittest.TestCase):
                 self.assertEqual(len(bodies), 1)
                 self.assertEqual(metrics["overload_backoff_seconds"], 0)
                 self.assertEqual(bool(budget.stopped), status != 500)
+
+    def test_gateway_timeouts_retry_exact_body_and_replay_success_only(self):
+        import httpx
+        success = {"id": "resp", "model": TERRA, "reasoning": {"effort": "medium"}, "usage": {"input_tokens": 10, "output_tokens": 2}}
+        failures = [(408, {"error": {"message": "stream disconnected before completion"}}, {}), (502, "Bad Gateway", {}), (503, {"error": {"message": "Unavailable"}}, {}), (504, "Gateway Timeout", {}), httpx.ReadTimeout("timed out"), httpx.RemoteProtocolError("Server disconnected")]
+        for failure in failures:
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                transport, budget, bodies, result, error, metrics = self.simulate_overload(root, [failure, (200, success, {})])
+                self.assertIsNone(error)
+                self.assertEqual(result, success)
+                self.assertEqual(bodies, [bodies[0]] * 2)
+                self.assertEqual((budget.requests, budget.unknown_usage), (2, 1))
+                self.assertEqual(metrics["overload_backoff_seconds"], 300)
+                replay = Transport(base="unused", key="unused", output=root / "replay", model=TERRA, limits={}, replay_source=transport.output)
+                self.assertEqual(replay.post("/responses", bodies[0]), success)
+                self.assertEqual(replay.requests, 0)
+
+    def test_backoff_does_not_bypass_task_or_shared_request_budget(self):
+        overload = (500, {"error": {"message": "当前模型繁忙"}}, {})
+        for task_max, batch_max, calls, whole_batch_stopped in [(2, 100, 2, False), (32, 1, 1, True)]:
+            with self.subTest(task_max=task_max, batch_max=batch_max), tempfile.TemporaryDirectory() as directory:
+                _, budget, bodies, _, error, _ = self.simulate_overload(Path(directory), [overload], task_requests=task_max, batch_requests=batch_max)
+                self.assertIsInstance(error, RuntimeError)
+                self.assertEqual(len(bodies), calls)
+                self.assertEqual(bool(budget.stopped), whole_batch_stopped)
+
+    def test_unverified_model_aliases_are_not_retried_or_accepted(self):
+        for actual in ["gpt-5.6-terra-2026-07-09", "dz-gpt-5.6-terra-2026-07-09", ASTRA]:
+            with self.subTest(actual=actual), tempfile.TemporaryDirectory() as directory:
+                response = {"id": "resp", "model": actual, "reasoning": {"effort": "medium"}, "usage": {"input_tokens": 10, "output_tokens": 2}}
+                _, _, bodies, result, error, _ = self.simulate_overload(Path(directory), [(200, response, {})])
+                self.assertIsNone(result)
+                self.assertIn("model identity mismatch", str(error))
+                self.assertEqual(len(bodies), 1)
 
     def test_replay_rejects_changed_request_after_overload(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -327,13 +372,13 @@ class RetrievalComparisonTests(unittest.TestCase):
         import hashlib
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            config = {"sample_ids": ["failed", "successful", "invalid_model_json", "overload_500", "unknown_500"]}
+            config = {"sample_ids": ["failed", "successful", "invalid_model_json", "overload_500", "unknown_500", "stream_timeout"]}
             write_json(root / "manifest.json", config)
-            for sid, status, http in [("failed", "failed", 504), ("successful", "completed", 200), ("invalid_model_json", "failed", 200), ("overload_500", "failed", 500), ("unknown_500", "failed", 500)]:
+            for sid, status, http in [("failed", "failed", 504), ("successful", "completed", 200), ("invalid_model_json", "failed", 200), ("overload_500", "failed", 500), ("unknown_500", "failed", 500), ("stream_timeout", "failed", 408)]:
                 job = root / "arm2" / hashlib.sha256(sid.encode()).hexdigest()[:16]
                 write_json(job / "result.json", {"status": status, "model": "gpt-6-astra"})
                 write_json(job / "request_001.json", {"http_status": http, "response": {"error": {"message": "当前模型繁忙" if sid == "overload_500" else "unknown"}}})
-            self.assertEqual(set(transient_retry_jobs(root, config, [2])), {("failed", 2), ("overload_500", 2)})
+            self.assertEqual(set(transient_retry_jobs(root, config, [2])), {("failed", 2), ("overload_500", 2), ("stream_timeout", 2)})
             with self.assertRaisesRegex(ValueError, "protocol differs"):
                 transient_retry_jobs(root, {**config, "catalog_sha256": "changed"}, [2])
 
