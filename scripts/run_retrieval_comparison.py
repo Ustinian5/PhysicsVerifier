@@ -33,6 +33,7 @@ from scripts.experiment_manifest import sha256_file, capture_git_state, fingerpr
 ASTRA = "gpt-6-astra"
 TERRA = "gpt-5.6-terra"
 QWEN = "qwen3-30b-a3b-instruct-2507"
+OVERLOAD_BACKOFF_SECONDS = (300, 600, 900)
 LEAF_FIELDS = ("rule_id", "title", "summary", "trigger", "check_logic", "error_type", "symbolic_hint")
 PROMPT = """Select at most six existing rules that are useful for checking the supplied physics solution.
 You are responsible only for retrieval; a separate checker will check the rules.
@@ -223,12 +224,23 @@ class BatchBudgetExceeded(RuntimeError):
     pass
 
 
+def upstream_overloaded(record):
+    """Recognize the gateway's explicit capacity errors, never generic 429s."""
+    data = record.get("response")
+    error = data.get("error") if isinstance(data, dict) else None
+    message = str(error.get("message", "")).casefold() if isinstance(error, dict) else ""
+    return record.get("http_status") in {429, 500, 503} and (
+        "current group upstream load is saturated" in message or "当前模型繁忙" in message
+    )
+
+
 class BatchBudget:
     """Account across workers/resumes; missing usage retains its reservation."""
 
-    def __init__(self, output, limits, quota_probe=None, quota_floor=500000, prior_runs=()):
+    def __init__(self, output, limits, quota_probe=None, quota_floor=500000, prior_runs=(), retry_overload=False):
         self.output, self.limits = Path(output), limits
         self.quota_probe, self.quota_floor = quota_probe, quota_floor
+        self.retry_overload = retry_overload
         self.lock = threading.Lock()
         self.stopped = ""
         self.requests = self.input_tokens = self.output_tokens = self.unknown_usage = 0
@@ -299,7 +311,7 @@ class BatchBudget:
             self.output_tokens += outgoing
             if self.input_tokens > self.limits["input_tokens"] or self.output_tokens > self.limits["output_tokens"]:
                 self.stopped = self.stopped or "reported_usage_exceeds_batch_budget"
-            if record.get("http_status") in {401, 402, 403, 429}:
+            if record.get("http_status") in {401, 402, 403, 429} and not (self.retry_overload and upstream_overloaded(record)):
                 self.stopped = self.stopped or "provider_auth_quota_or_rate_limit"
             self._save()
 
@@ -333,7 +345,7 @@ def validate_batch_inputs(input_path, selection_manifest, rows, catalog):
 
 
 class Transport:
-    def __init__(self, *, base, key, output, limits, model, reasoning_effort=None, batch_budget=None, replay_source=None):
+    def __init__(self, *, base, key, output, limits, model, reasoning_effort=None, batch_budget=None, replay_source=None, overload_backoff=()):
         self.base = base.rstrip("/")
         self.key = key
         self.output = Path(output)
@@ -341,6 +353,9 @@ class Transport:
         self.model = model
         self.reasoning_effort = reasoning_effort or ("medium" if model == TERRA else "max")
         self.batch_budget = batch_budget
+        self.overload_backoff = tuple(overload_backoff)
+        self.overload_events = []
+        self.backoff_seconds = 0.0
         self.requests = 0
         self.input_tokens = 0
         self.output_tokens = 0
@@ -358,11 +373,18 @@ class Transport:
                 if sha256_file(path) != item["sha256"]:
                     raise ValueError("Preserved response prefix hash mismatch")
                 self.replay_queue.append(path)
+            interrupted = None
             for path in sorted(replay_source.glob("request_*.json")):
                 record = json.loads(path.read_text())
+                if interrupted and any(record.get(key) != interrupted.get(key) for key in ("request", "endpoint")):
+                    raise ValueError("Overload retry does not match the exact request")
+                if upstream_overloaded(record):
+                    interrupted = record
+                    continue
                 if record.get("http_status") != 200 or not record.get("response"):
                     break
                 self.replay_queue.append(path)
+                interrupted = None
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.chat_create))
 
     def post(self, endpoint, body, *, request_timeout=None):
@@ -381,7 +403,66 @@ class Transport:
             self.replayed.append({"path": str(path.resolve()), "sha256": sha256_file(path)})
             write_json(self.output / "replayed_requests.json", self.replayed)
             return copy.deepcopy(data)
-        if self.requests + len(self.replayed) >= self.limits["requests"] or time.monotonic() - self.started + self.replayed_seconds >= self.limits["seconds"]:
+        while True:
+            try:
+                return self._post_once(endpoint, body, request_timeout=request_timeout)
+            except httpx.HTTPStatusError:
+                path = self.output / f"request_{self.requests:03d}.json"
+                record = json.loads(path.read_text())
+                if not self.overload_backoff or not upstream_overloaded(record):
+                    raise
+                self._wait_for_capacity(path, record)
+
+    def active_seconds(self):
+        return time.monotonic() - self.started - self.backoff_seconds + self.replayed_seconds
+
+    def _wait_for_capacity(self, path, record):
+        if self.batch_budget and self.batch_budget.stopped:
+            raise BatchBudgetExceeded(self.batch_budget.stopped)
+        retry = len(self.overload_events)
+        delay = self.overload_backoff[retry] if retry < len(self.overload_backoff) else None
+        # Respect an upstream Retry-After without waiting or retrying indefinitely.
+        header = record.get("retry_after")
+        if delay is not None and header:
+            try:
+                retry_after = float(header)
+            except ValueError:
+                from email.utils import parsedate_to_datetime
+                try:
+                    retry_after = parsedate_to_datetime(header).timestamp() - time.time()
+                except (ValueError, TypeError, OverflowError):
+                    retry_after = 0
+            if math.isfinite(retry_after):
+                delay = max(delay, retry_after)
+        if (delay is None or sum(e["delay_seconds"] for e in self.overload_events) + delay > sum(self.overload_backoff)
+                or self.requests + len(self.replayed) >= self.limits["requests"] or self.active_seconds() >= self.limits["seconds"]):
+            reason = "upstream_overload_retry_exhausted"
+            write_json(self.output / "overload_retry.json", {"state": "exhausted", "events": self.overload_events, "last_request": path.name, "updated_unix": time.time()})
+            if self.batch_budget:
+                self.batch_budget.stop(reason)
+            raise BatchBudgetExceeded(reason)
+        event = {"request": path.name, "sha256": sha256_file(path), "delay_seconds": delay, "started_unix": time.time(), "resume_after_unix": time.time() + delay}
+        self.overload_events.append(event)
+        status = {"state": "waiting", "events": self.overload_events, "updated_unix": time.time()}
+        write_json(self.output / "overload_retry.json", status)
+        print(f"{self.output.parent.name}/{self.output.name}: upstream overloaded; retry {retry + 1}/{len(self.overload_backoff)} after {delay:g}s", flush=True)
+        start = time.monotonic()
+        try:
+            remaining = delay
+            while remaining > 0:
+                if self.batch_budget and self.batch_budget.stopped:
+                    raise BatchBudgetExceeded(self.batch_budget.stopped)
+                time.sleep(min(30, remaining))
+                remaining = delay - (time.monotonic() - start)
+        finally:
+            elapsed = time.monotonic() - start
+            self.backoff_seconds += elapsed
+            event["elapsed_seconds"] = elapsed
+            status.update(state="ready" if elapsed >= delay else "interrupted", updated_unix=time.time())
+            write_json(self.output / "overload_retry.json", status)
+
+    def _post_once(self, endpoint, body, *, request_timeout=None):
+        if self.requests + len(self.replayed) >= self.limits["requests"] or self.active_seconds() >= self.limits["seconds"]:
             raise RuntimeError("request_or_time_budget_exceeded")
         # UTF-8 bytes conservatively bound ordinary text tokenization before a request.
         reservation = len(canonical(body).encode())
@@ -397,9 +478,11 @@ class Transport:
         start = time.monotonic()
         try:
             timeout = request_timeout or self.limits.get("request_timeout_seconds", 900)
-            with httpx.Client(timeout=min(timeout, self.limits["seconds"] - (start - self.started) - self.replayed_seconds)) as client:
+            with httpx.Client(timeout=max(0.001, min(timeout, self.limits["seconds"] - self.active_seconds()))) as client:
                 response = client.post(self.base + endpoint, headers={"Authorization": "Bearer " + self.key}, json=body)
             record.update(http_status=response.status_code,request_id=response.headers.get("x-request-id"))
+            if response.headers.get("retry-after"):
+                record["retry_after"] = response.headers["retry-after"]
             try:
                 data = response.json()
             except ValueError:
@@ -452,7 +535,7 @@ class Transport:
         return ChatCompletion.model_validate({"id": data["id"], "object": "chat.completion", "created": int(time.time()), "model": data["model"], "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop" if data.get("status") == "completed" else "length"}]})
 
     def summary(self):
-        return {"requests": self.requests, "input_tokens": self.input_tokens, "output_tokens": self.output_tokens, "elapsed_seconds": time.monotonic() - self.started, "replayed_requests": len(self.replayed), "replayed_input_tokens": self.replayed_input_tokens, "replayed_output_tokens": self.replayed_output_tokens, "replayed_elapsed_seconds": self.replayed_seconds}
+        return {"requests": self.requests, "input_tokens": self.input_tokens, "output_tokens": self.output_tokens, "elapsed_seconds": time.monotonic() - self.started, "overload_backoff_seconds": self.backoff_seconds, "overload_retries": len(self.overload_events), "active_elapsed_seconds": self.active_seconds(), "replayed_requests": len(self.replayed), "replayed_input_tokens": self.replayed_input_tokens, "replayed_output_tokens": self.replayed_output_tokens, "replayed_elapsed_seconds": self.replayed_seconds}
 
 
 def execute_tool_batch(calls, corpus, sample, *, max_chars):
@@ -561,7 +644,7 @@ def transient_retry_jobs(source, config, arms, *, include_pending=False):
             status = last.get("http_status")
             timeout = status is None and "timed out" in str(last.get("error", "")).lower()
             paused = "BatchBudgetExceeded" in (str(result.get("error_type", "")) + str(result.get("error", "")))
-            if status not in {401, 402, 403, 429, 502, 503, 504} and not timeout and not paused:
+            if status not in {401, 402, 403, 429, 502, 503, 504} and not upstream_overloaded(last) and not timeout and not paused:
                 continue
             expected = QWEN if arm == 1 else api_identity(config)[0]
             if result.get("model") != expected:
@@ -585,6 +668,7 @@ def main():
     parser.add_argument("--phase", choices=["development", "retrieval_batch", "formal"], default="development")
     parser.add_argument("--selection-manifest", type=Path, help="Frozen 50-input manifest required for retrieval_batch")
     parser.add_argument("--workers", type=int, choices=[1, 2, 3], default=1)
+    parser.add_argument("--overload-backoff", action="store_true", help="Single worker only: retry explicit upstream capacity errors after 5/10/15 minutes, at most three retries per task")
     parser.add_argument("--batch-max-requests", type=int, default=3000)
     parser.add_argument("--batch-max-input-tokens", type=int, default=30000000)
     parser.add_argument("--batch-max-output-tokens", type=int, default=1500000)
@@ -607,6 +691,8 @@ def main():
         parser.error("Run in the project conda environment")
     if (args.continue_pending or args.replay_prefix) and not args.retry_transient_from:
         parser.error("Continuation flags require --retry-transient-from")
+    if args.overload_backoff and (args.phase != "retrieval_batch" or args.workers != 1 or 1 in args.arms):
+        parser.error("Overload backoff requires retrieval_batch, one worker and API arms only")
     load_dotenv(args.env_file, override=False)
     catalog = json.loads(args.catalog.read_text())
     rows = json.loads(args.input.read_text())
@@ -622,6 +708,7 @@ def main():
     config["reasoning_effort"] = args.reasoning_effort
     config["arm_order"] = list(dict.fromkeys(args.arms))
     config["workers"] = args.workers
+    config["overload_retry_policy"] = {"enabled": args.overload_backoff, "delays_seconds": list(OVERLOAD_BACKOFF_SECONDS) if args.overload_backoff else [], "scope": "per_task_not_reset_after_success", "waiting_excluded_from_task_seconds": True, "all_attempts_count_toward_request_and_batch_budgets": True, "exhaustion": "stop_batch", "unrecognized_auth_quota_rate_limit": "stop_batch"}
     config["stage"] = "retrieval_only_no_checker_or_physics_scoring"
     batch_limits = {"requests": args.batch_max_requests, "input_tokens": args.batch_max_input_tokens, "output_tokens": args.batch_max_output_tokens}
     if args.phase == "retrieval_batch":
@@ -630,7 +717,7 @@ def main():
         config["frozen_inputs"] = validate_batch_inputs(args.input, args.selection_manifest, rows, catalog)
         config["batch_limits"] = batch_limits
         config["platform_quota_floor"] = args.platform_quota_floor
-        config["quota_probe_policy"] = {"minimum_interval_seconds": 60, "error_backoff_seconds": 300, "query_error": "warn_only", "inference_auth_quota_rate_limit_error": "stop"}
+        config["quota_probe_policy"] = {"minimum_interval_seconds": 60, "error_backoff_seconds": 300, "query_error": "warn_only", "inference_auth_quota_rate_limit_error": "stop_unless_explicit_overload_backoff" if args.overload_backoff else "stop"}
         config["tools"] = {"shared": ["bm25", "sparse_tfidf", "substring", "list_rules", "read_rules", "submit_rules"], "arm3_extra": "read_tree", "dense_embeddings": False, "arbitrary_code_execution": False}
         config["source_tree"] = fingerprint_source_tree(ROOT)
     retries = transient_retry_jobs(args.retry_transient_from, config, args.arms, include_pending=args.continue_pending) if args.retry_transient_from else None
@@ -645,7 +732,7 @@ def main():
         write_json(manifest, {"configuration_sha256": signature, **config, "git": capture_git_state(ROOT)})
     api_base = os.getenv("ASTRA_BASE_URL", os.getenv("OPENAI_BASE_URL", ""))
     api_key = os.getenv("ASTRA_API_KEY", os.getenv("OPENAI_API_KEY", ""))
-    budget = BatchBudget(args.output, batch_limits, quota_probe=lambda: platform_quota_probe(api_base, api_key), quota_floor=args.platform_quota_floor, prior_runs=run_ancestry(args.retry_transient_from) if args.retry_transient_from else ()) if args.phase == "retrieval_batch" and any(a != 1 for a in args.arms) else None
+    budget = BatchBudget(args.output, batch_limits, quota_probe=lambda: platform_quota_probe(api_base, api_key), quota_floor=args.platform_quota_floor, prior_runs=run_ancestry(args.retry_transient_from) if args.retry_transient_from else (), retry_overload=args.overload_backoff) if args.phase == "retrieval_batch" and any(a != 1 for a in args.arms) else None
     jobs = []
     for position, row in enumerate(rows):
         order = config["arm_order"]
@@ -675,7 +762,7 @@ def main():
         replay_source = None
         if args.replay_prefix and retries[(str(row["id"]), arm)].get("source_run"):
             replay_source = Path(retries[(str(row["id"]), arm)]["source_run"]) / f"arm{arm}" / job.name
-        transport = Transport(base=base, key=key, output=job, limits=limits, model=model, reasoning_effort=args.reasoning_effort, batch_budget=budget if arm != 1 else None, replay_source=replay_source)
+        transport = Transport(base=base, key=key, output=job, limits=limits, model=model, reasoning_effort=args.reasoning_effort, batch_budget=budget if arm != 1 else None, replay_source=replay_source, overload_backoff=OVERLOAD_BACKOFF_SECONDS if args.overload_backoff else ())
         print(f"{row['id']} arm{arm}: start", flush=True)
         try:
             result = run_tree(sample, catalog, transport) if arm in (1, 2) else run_autonomous(sample, catalog, transport, tree=arm == 3, output=job, max_chars=args.max_read_chars)
@@ -710,7 +797,15 @@ def main():
         for arm in config["arm_order"]:
             selected = [r for r in completed if r["arm"] == arm]
             per_arm[str(arm)] = {"recorded": len(selected), "status_counts": dict(Counter(r["status"] for r in selected)), "completed_empty": sum(r["status"] == "completed" and not r["selected_rules"] for r in selected)}
-        write_json(args.output / "progress.json", {"updated_unix": time.time(), "phase": args.phase, "stage": config["stage"], "state": state, "planned_tasks": len(jobs), "recorded_tasks": len(completed), "unrecorded_tasks": len(jobs) - len(completed), "experiment_tasks": len(rows) * len(config["arm_order"]), "experiment_completed": sum(r["status"] == "completed" for r in effective.values()), "inherited_completed": sum(r["status"] == "completed" for r in inherited.values()), "arms": per_arm, "budget_stop_reason": budget.stopped if budget else "", "configuration_sha256": signature})
+        waiting = []
+        if state == "running" and args.overload_backoff:
+            for path in args.output.glob("arm*/*/overload_retry.json"):
+                status = json.loads(path.read_text())
+                if status["state"] == "waiting" and not (path.parent / "result.json").exists():
+                    waiting.append({"job": str(path.parent.relative_to(args.output)), **status["events"][-1]})
+            if waiting:
+                state = "waiting_for_capacity"
+        write_json(args.output / "progress.json", {"updated_unix": time.time(), "phase": args.phase, "stage": config["stage"], "state": state, "waiting_for_capacity": waiting, "planned_tasks": len(jobs), "recorded_tasks": len(completed), "unrecorded_tasks": len(jobs) - len(completed), "experiment_tasks": len(rows) * len(config["arm_order"]), "experiment_completed": sum(r["status"] == "completed" for r in effective.values()), "inherited_completed": sum(r["status"] == "completed" for r in inherited.values()), "arms": per_arm, "budget_stop_reason": budget.stopped if budget else "", "configuration_sha256": signature})
 
     progress("running")
     queue = iter(pending)

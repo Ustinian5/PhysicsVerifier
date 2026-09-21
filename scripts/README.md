@@ -20,7 +20,9 @@
 
 `run_physics_eval_pipeline.py` 要求显式传入规则库，使用当前 conda 解释器；`validation/final` 要求 clean worktree。运行配置与输出身份按 [实验清单](../experiments/README.md)保存。
 
-API 先行时使用 `run_retrieval_comparison.py --phase retrieval_batch --input … --selection-manifest … --output … --arms 2 3 4 --api-model gpt-5.6-terra --reasoning-effort medium --workers 3`。当前默认 Terra medium；历史 Astra 需显式传入 `--api-model gpt-6-astra --reasoning-effort max`。沿用 `.env` 的组内 `ASTRA_BASE_URL/ASTRA_API_KEY` 或 `OPENAI_BASE_URL/OPENAI_API_KEY`，变量名不决定实际模型。脚本校验冻结输入的 SHA、50 个 ID 和模型输入字段，并核验响应中的模型和推理档位；配置变化须独立运行，禁止混入旧模型结果。并发共用请求/token 预算，额度查询最多每分钟一次；查询接口故障只记警告、5 分钟后重试。确认低额度或模型接口的账户/限流错误会停止新请求。GT 复核和 Qwen 不阻塞检索采集，但仍是最终计分的前提。
+API 先行时使用 `run_retrieval_comparison.py --phase retrieval_batch --input … --selection-manifest … --output … --arms 2 3 4 --api-model gpt-5.6-terra --reasoning-effort medium --workers 1 --overload-backoff`。当前默认 Terra medium；历史 Astra 需显式传入 `--api-model gpt-6-astra --reasoning-effort max`。沿用 `.env` 的组内 `ASTRA_BASE_URL/ASTRA_API_KEY` 或 `OPENAI_BASE_URL/OPENAI_API_KEY`，变量名不决定实际模型。脚本校验冻结输入的 SHA、50 个 ID 和模型输入字段，并核验响应中的模型和推理档位；配置变化须独立运行，禁止混入旧模型结果。并发共用请求/token 预算，额度查询最多每分钟一次；查询接口故障只记警告、5 分钟后重试。确认低额度、鉴权失败或不明原因的 429 会停止新请求。GT 复核和 Qwen 不阻塞检索采集，但仍是最终计分的前提。
+
+`--overload-backoff` 仅用于单并发 API 批量。对网关明确返回的“上游负载饱和／当前模型繁忙”429、500、503，以完全相同请求按 5、10、15 分钟重试；每任务共用三次机会，成功一次不会重置。尊重 `Retry-After`，计划等待累计不得超过 30 分钟，超限停止整批。原始失败和重试记录均保留，所有实际请求计入上限，未知用量保留全批预算预留值。等待单列于 `overload_retry.json` 和耗时指标，不占原 30 分钟执行预算；进度会显示 `waiting_for_capacity`，不能将这段等待当成模型耗时或进程中断。不启用此选项时保留原错误停止行为。
 
 接续预算/网络中断时使用新的结果子目录，追加 `--retry-transient-from 原运行目录 --continue-pending --replay-prefix`。原始失败保留；在全部关联记录中跳过已成功项，未启动任务继续执行。已收到的成功响应只在完整请求逐项相同时重放以恢复运行状态，不重复付费；实际新请求、重放数量和历史用量分开记录，全批预算累计计算。没有明确完成状态的在途请求仍须先核对，不能覆盖重跑。
 

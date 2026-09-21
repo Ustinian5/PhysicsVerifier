@@ -9,6 +9,7 @@ from scripts.run_retrieval_comparison import (
     execute_tool_batch,
     transient_retry_jobs, write_json, BatchBudget, BatchBudgetExceeded,
     validate_batch_inputs, sha256_file, ASTRA, TERRA,
+    OVERLOAD_BACKOFF_SECONDS,
 )
 
 
@@ -79,6 +80,108 @@ def check_tree_bridge_preserves_prompt_and_schema_without_sampling_parameters(tm
 
 
 class RetrievalComparisonTests(unittest.TestCase):
+    def simulate_overload(self, root, responses, *, successful_prefix=0):
+        """Exercise real transport/budget code with a virtual clock and HTTP server."""
+        import httpx
+        from unittest.mock import patch
+        client_class = httpx.Client
+        clock = [0.0]
+        bodies = []
+        def handle(request):
+            bodies.append(json.loads(request.content))
+            status, body, headers = responses[min(len(bodies) - 1, len(responses) - 1)]
+            return httpx.Response(status, json=body, headers=headers)
+        budget = BatchBudget(root / "run", {"requests": 100, "input_tokens": 100000, "output_tokens": 10000}, retry_overload=True)
+        with patch("scripts.run_retrieval_comparison.time.monotonic", side_effect=lambda: clock[0]), patch("scripts.run_retrieval_comparison.time.sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)), patch("scripts.run_retrieval_comparison.httpx.Client", side_effect=lambda **kw: client_class(transport=httpx.MockTransport(handle), **kw)):
+            transport = Transport(base="https://not-used.invalid", key="secret-must-not-appear", output=root / "run/arm2/case", model=TERRA, limits={"requests": 32, "seconds": 10, "input_tokens": 100000, "output_tokens": 1000, "per_response": 20}, batch_budget=budget, overload_backoff=OVERLOAD_BACKOFF_SECONDS)
+            error = result = None
+            try:
+                for i in range(successful_prefix):
+                    transport.responses(input="prefix " + str(i))
+                result = transport.responses(input="unchanged request")
+            except Exception as exc:
+                error = exc
+            metrics = transport.summary()
+        return transport, budget, bodies, result, error, metrics
+
+    def test_overload_retries_identical_requests_and_keeps_failed_usage(self):
+        success = {"id": "resp", "model": TERRA, "reasoning": {"effort": "medium"}, "usage": {"input_tokens": 10, "output_tokens": 2}}
+        replies = [
+            (429, {"error": {"message": "Current group upstream load is saturated, please try again later"}}, {}),
+            (500, {"error": {"message": "当前模型繁忙，请稍后重试。"}}, {}),
+            (200, success, {}),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transport, budget, bodies, result, error, metrics = self.simulate_overload(root, replies)
+            self.assertIsNone(error)
+            self.assertEqual(result, success)
+            self.assertEqual(bodies, [bodies[0]] * 3)
+            self.assertFalse(budget.stopped)
+            self.assertEqual((budget.requests, budget.unknown_usage, budget.output_tokens), (3, 2, 42))
+            self.assertEqual(metrics["overload_backoff_seconds"], 900)
+            self.assertEqual(metrics["active_elapsed_seconds"], 0)
+            records = [json.loads(p.read_text()) for p in sorted(transport.output.glob("request_*.json"))]
+            self.assertEqual([r["http_status"] for r in records], [429, 500, 200])
+            self.assertNotIn("secret-must-not-appear", json.dumps(records))
+            replay = Transport(base="unused", key="unused", output=root / "replay", model=TERRA, limits={}, replay_source=transport.output)
+            self.assertEqual(replay.post("/responses", bodies[0]), success)
+            self.assertEqual(replay.requests, 0)
+
+    def test_overload_exhaustion_stops_batch_instead_of_starting_more_jobs(self):
+        reply = (429, {"error": {"message": "Current group upstream load is saturated"}}, {})
+        with tempfile.TemporaryDirectory() as directory:
+            transport, budget, bodies, _, error, metrics = self.simulate_overload(Path(directory), [reply])
+            self.assertIsInstance(error, BatchBudgetExceeded)
+            self.assertEqual(budget.stopped, "upstream_overload_retry_exhausted")
+            self.assertEqual(len(bodies), 4)
+            self.assertEqual(metrics["overload_backoff_seconds"], 1800)
+            self.assertEqual(json.loads((transport.output / "overload_retry.json").read_text())["state"], "exhausted")
+            with self.assertRaises(BatchBudgetExceeded):
+                budget.reserve(1, 1)
+
+    def test_overload_retry_budget_does_not_reset_after_success(self):
+        overload = (500, {"error": {"message": "当前模型繁忙"}}, {})
+        success = (200, {"id": "r", "model": TERRA, "reasoning": {"effort": "medium"}, "usage": {"input_tokens": 10, "output_tokens": 2}}, {})
+        with tempfile.TemporaryDirectory() as directory:
+            _, budget, bodies, _, error, metrics = self.simulate_overload(Path(directory), [overload, success, overload, success, overload, success, overload], successful_prefix=3)
+            self.assertIsInstance(error, BatchBudgetExceeded)
+            self.assertEqual(len(bodies), 7)
+            self.assertEqual(metrics["overload_retries"], 3)
+            self.assertEqual(budget.stopped, "upstream_overload_retry_exhausted")
+
+    def test_retry_after_is_respected_within_a_bounded_wait(self):
+        overload = {"error": {"message": "Current group upstream load is saturated"}}
+        success = {"id": "r", "model": TERRA, "reasoning": {"effort": "medium"}, "usage": {"input_tokens": 10, "output_tokens": 2}}
+        for retry_after, expected_calls, expected_wait in [("600", 2, 600), ("3600", 1, 0)]:
+            with self.subTest(retry_after=retry_after), tempfile.TemporaryDirectory() as directory:
+                _, budget, bodies, _, error, metrics = self.simulate_overload(Path(directory), [(429, overload, {"Retry-After": retry_after}), (200, success, {})])
+                self.assertEqual(len(bodies), expected_calls)
+                self.assertEqual(metrics["overload_backoff_seconds"], expected_wait)
+                if expected_calls == 1:
+                    self.assertIsInstance(error, BatchBudgetExceeded)
+                    self.assertTrue(budget.stopped)
+                else:
+                    self.assertIsNone(error)
+
+    def test_auth_quota_and_unrecognized_errors_are_never_automatically_retried(self):
+        import httpx
+        for status, message in [(401, "Invalid key"), (402, "Insufficient quota"), (403, "Forbidden"), (429, "Insufficient quota"), (429, "Unknown rate limit"), (500, "Unknown error")]:
+            with self.subTest(status=status, message=message), tempfile.TemporaryDirectory() as directory:
+                _, budget, bodies, _, error, metrics = self.simulate_overload(Path(directory), [(status, {"error": {"message": message}}, {})])
+                self.assertIsInstance(error, httpx.HTTPStatusError)
+                self.assertEqual(len(bodies), 1)
+                self.assertEqual(metrics["overload_backoff_seconds"], 0)
+                self.assertEqual(bool(budget.stopped), status != 500)
+
+    def test_replay_rejects_changed_request_after_overload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json(root / "source/request_001.json", {"http_status": 429, "endpoint": "/responses", "request": {"input": "original"}, "response": {"error": {"message": "Current group upstream load is saturated"}}})
+            write_json(root / "source/request_002.json", {"http_status": 200, "endpoint": "/responses", "request": {"input": "changed"}, "response": {"id": "r"}})
+            with self.assertRaisesRegex(ValueError, "exact request"):
+                Transport(base="unused", key="unused", output=root / "resume", limits={}, model=TERRA, replay_source=root / "source")
+
     def test_terra_rejects_response_with_wrong_reasoning_effort(self):
         import httpx
         from unittest.mock import patch
@@ -224,13 +327,13 @@ class RetrievalComparisonTests(unittest.TestCase):
         import hashlib
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            config = {"sample_ids": ["failed", "successful", "invalid_model_json"]}
+            config = {"sample_ids": ["failed", "successful", "invalid_model_json", "overload_500", "unknown_500"]}
             write_json(root / "manifest.json", config)
-            for sid, status, http in [("failed", "failed", 504), ("successful", "completed", 200), ("invalid_model_json", "failed", 200)]:
+            for sid, status, http in [("failed", "failed", 504), ("successful", "completed", 200), ("invalid_model_json", "failed", 200), ("overload_500", "failed", 500), ("unknown_500", "failed", 500)]:
                 job = root / "arm2" / hashlib.sha256(sid.encode()).hexdigest()[:16]
                 write_json(job / "result.json", {"status": status, "model": "gpt-6-astra"})
-                write_json(job / "request_001.json", {"http_status": http})
-            self.assertEqual(set(transient_retry_jobs(root, config, [2])), {("failed", 2)})
+                write_json(job / "request_001.json", {"http_status": http, "response": {"error": {"message": "当前模型繁忙" if sid == "overload_500" else "unknown"}}})
+            self.assertEqual(set(transient_retry_jobs(root, config, [2])), {("failed", 2), ("overload_500", 2)})
             with self.assertRaisesRegex(ValueError, "protocol differs"):
                 transient_retry_jobs(root, {**config, "catalog_sha256": "changed"}, [2])
 
