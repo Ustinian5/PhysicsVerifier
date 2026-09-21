@@ -10,6 +10,7 @@ from scripts.run_retrieval_comparison import (
     transient_retry_jobs, write_json, BatchBudget, BatchBudgetExceeded,
     validate_batch_inputs, sha256_file, ASTRA, TERRA,
     OVERLOAD_BACKOFF_SECONDS,
+    run_ancestry, evidence_path, exclusive_run_lock,
 )
 
 
@@ -315,6 +316,76 @@ class RetrievalComparisonTests(unittest.TestCase):
             self.assertEqual(set(jobs), {("paused", 2), ("not_started", 2)})
             self.assertTrue(jobs[("not_started", 2)]["new_pending"])
             self.assertEqual(jobs[("paused", 2)]["source_run"], str(original.resolve()))
+
+    def test_moved_runs_preserve_ancestry_budget_and_response_replay(self):
+        import hashlib
+        import shutil
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            old, new = root / "server", root / "local"
+            original, child = old / "original", old / "child"
+            key = hashlib.sha256(b"paused").hexdigest()[:16]
+            config = {"api_model": TERRA, "reasoning_effort": "medium", "sample_ids": ["done", "paused", "pending"]}
+            body = {"model": TERRA, "input": "original", "max_output_tokens": 20}
+            response = {"id": "response", "model": TERRA, "reasoning": {"effort": "medium"}, "usage": {"input_tokens": 12, "output_tokens": 8}}
+            record = {"request": body, "endpoint": "/responses", "http_status": 200, "response": response}
+            request = original / "arm3" / key / "request_001.json"
+            write_json(original / "manifest.json", config)
+            write_json(request, record)
+            write_json(child / "manifest.json", {**config, "retry_of": {"source": str(original), "manifest_sha256": sha256_file(original / "manifest.json")}})
+            write_json(child / "arm3" / key / "replayed_requests.json", [{"path": str(request), "sha256": sha256_file(request)}])
+            write_json(child / "arm3" / key / "result.json", {"status": "failed", "model": TERRA, "error_type": "BatchBudgetExceeded"})
+            write_json(original / "arm3" / hashlib.sha256(b"done").hexdigest()[:16] / "result.json", {"status": "completed", "model": TERRA})
+            frozen = {p.relative_to(old): sha256_file(p) for p in old.rglob("*.json")}
+            shutil.move(old, new)
+            mapping = [(str(old), str(new))]
+            current = new / "current"
+            write_json(current / "manifest.json", {**config, "path_relocations": mapping, "retry_of": {"source": str(new / "child"), "manifest_sha256": sha256_file(new / "child/manifest.json")}})
+            ancestors = run_ancestry(current)  # Inherit mappings on the next resume.
+            self.assertEqual(ancestors, [current, new / "child", new / "original"])
+            jobs = transient_retry_jobs(current, config, [3], include_pending=True)
+            self.assertEqual(set(jobs), {("paused", 3), ("pending", 3)})
+            budget = BatchBudget(current, {"requests": 100, "input_tokens": 1000, "output_tokens": 1000}, prior_runs=ancestors)
+            self.assertEqual((budget.requests, budget.input_tokens, budget.output_tokens), (1, 12, 8))
+            transport = Transport(base="unused", key="unused", output=current / "arm3" / key, model=TERRA, limits={}, replay_source=new / "child/arm3" / key, path_relocations=mapping)
+            self.assertEqual(transport.post("/responses", body), response)
+            self.assertEqual(transport.requests, 0)
+            self.assertEqual({p: sha256_file(new / p) for p in frozen}, frozen)
+            moved_request = new / request.relative_to(old)
+            moved_request.write_text("{}")
+            with self.assertRaisesRegex(ValueError, "prefix hash mismatch"):
+                Transport(base="unused", key="unused", output=current, model=TERRA, limits={}, replay_source=new / "child/arm3" / key, path_relocations=mapping)
+            (new / "original/manifest.json").write_text("{}")
+            with self.assertRaisesRegex(ValueError, "manifest hash mismatch"):
+                run_ancestry(current)
+
+    def test_relocation_requires_explicit_matching_absolute_root(self):
+        self.assertEqual(evidence_path("/unrelated/request.json", [("/old", "/new")]), Path("/unrelated/request.json"))
+        self.assertEqual(evidence_path("/old-other/request.json", [("/old", "/new")]), Path("/old-other/request.json"))
+        for mapping in [[("old", "/new")], [("/old", "new")], [("/", "/new")]]:
+            with self.assertRaisesRegex(ValueError, "absolute project roots"):
+                evidence_path("/old/request.json", mapping)
+
+    def test_shared_run_lock_rejects_duplicate_and_releases_after_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "active.lock"
+            with self.assertRaisesRegex(RuntimeError, "test interruption"):
+                with exclusive_run_lock(path):
+                    with self.assertRaisesRegex(RuntimeError, "Another retrieval runner"):
+                        with exclusive_run_lock(path):
+                            self.fail("Duplicate process acquired the lock")
+                    raise RuntimeError("test interruption")
+            with exclusive_run_lock(path):
+                pass
+
+    def test_stop_marker_prevents_new_requests_before_quota_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stop = Path(directory) / "STOP"
+            stop.touch()
+            budget = BatchBudget(directory, {"requests": 10, "input_tokens": 1000, "output_tokens": 1000}, stop_file=stop, quota_probe=lambda: self.fail("Stop must precede any network access"))
+            with self.assertRaisesRegex(BatchBudgetExceeded, "operator_stop_requested"):
+                budget.reserve(20, 20)
+            self.assertEqual(budget.requests, 0)
 
     def test_parallel_workers_share_token_reservations(self):
         from concurrent.futures import ThreadPoolExecutor

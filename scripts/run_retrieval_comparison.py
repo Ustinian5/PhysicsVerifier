@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import fcntl
 import hashlib
 import json
 import math
@@ -18,6 +19,7 @@ import threading
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -65,6 +67,48 @@ def write_json(path, value):
     temp = path.with_suffix(path.suffix + ".tmp")
     temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
     temp.replace(path)
+
+
+def evidence_path(path, relocations=()):
+    """Resolve moved evidence without rewriting its frozen bytes or hash links."""
+    path = Path(os.path.abspath(path))
+    for old, new in sorted(relocations, key=lambda pair: len(Path(pair[0]).parts), reverse=True):
+        old, new = Path(old), Path(new)
+        if not old.is_absolute() or not new.is_absolute() or old == Path("/"):
+            raise ValueError("Relocations require absolute project roots")
+        if path.is_relative_to(old):
+            return (new / path.relative_to(old)).resolve()
+    return path.resolve()
+
+
+def inherited_relocations(source, overrides=()):
+    manifest = json.loads((Path(source) / "manifest.json").read_text())
+    return list({**dict(manifest.get("path_relocations", [])), **dict(overrides)}.items())
+
+
+def preserved_response_path(reference, relocations=()):
+    path = evidence_path(reference["path"], relocations)
+    if sha256_file(path) != reference["sha256"]:
+        raise ValueError("Preserved response prefix hash mismatch")
+    return path
+
+
+@contextmanager
+def exclusive_run_lock(path):
+    """Advisory lock shared by all local attempts; works on macOS and Linux."""
+    if path is None:
+        yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("Another retrieval runner holds " + str(path)) from None
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def model_input(row):
@@ -247,10 +291,11 @@ def retryable_transport_failure(record):
 class BatchBudget:
     """Account across workers/resumes; missing usage retains its reservation."""
 
-    def __init__(self, output, limits, quota_probe=None, quota_floor=500000, prior_runs=(), retry_overload=False):
+    def __init__(self, output, limits, quota_probe=None, quota_floor=500000, prior_runs=(), retry_overload=False, stop_file=None):
         self.output, self.limits = Path(output), limits
         self.quota_probe, self.quota_floor = quota_probe, quota_floor
         self.retry_overload = retry_overload
+        self.stop_file = Path(stop_file) if stop_file else None
         self.lock = threading.Lock()
         self.stopped = ""
         self.requests = self.input_tokens = self.output_tokens = self.unknown_usage = 0
@@ -281,6 +326,8 @@ class BatchBudget:
 
     def reserve(self, incoming, outgoing):
         with self.lock:
+            if self.stop_file and self.stop_file.exists():
+                self.stopped = self.stopped or "operator_stop_requested"
             if not self.stopped and self.quota_probe and time.time() >= self.next_quota_check:
                 try:
                     self.platform_quota = self.quota_probe()
@@ -355,7 +402,7 @@ def validate_batch_inputs(input_path, selection_manifest, rows, catalog):
 
 
 class Transport:
-    def __init__(self, *, base, key, output, limits, model, reasoning_effort=None, batch_budget=None, replay_source=None, overload_backoff=()):
+    def __init__(self, *, base, key, output, limits, model, reasoning_effort=None, batch_budget=None, replay_source=None, overload_backoff=(), path_relocations=()):
         self.base = base.rstrip("/")
         self.key = key
         self.output = Path(output)
@@ -379,10 +426,7 @@ class Transport:
             references = replay_source / "replayed_requests.json"
             prior = json.loads(references.read_text()) if references.exists() else []
             for item in prior:
-                path = Path(item["path"])
-                if sha256_file(path) != item["sha256"]:
-                    raise ValueError("Preserved response prefix hash mismatch")
-                self.replay_queue.append(path)
+                self.replay_queue.append(preserved_response_path(item, path_relocations))
             interrupted = None
             for path in sorted(replay_source.glob("request_*.json")):
                 record = json.loads(path.read_text())
@@ -609,7 +653,7 @@ def run_tree(sample, catalog, transport):
         return {"status": "failed", "error_type": type(exc).__name__, "error": str(exc), "trace": matcher.last_trace, "selected_rules": []}
 
 
-def run_ancestry(source):
+def run_ancestry(source, path_relocations=()):
     runs = []
     source = Path(source).resolve()
     while True:
@@ -617,15 +661,16 @@ def run_ancestry(source):
             raise ValueError("Cyclic run ancestry")
         runs.append(source)
         manifest = json.loads((source / "manifest.json").read_text())
+        path_relocations = list({**dict(manifest.get("path_relocations", [])), **dict(path_relocations)}.items())
         parent = manifest.get("retry_of")
         if not parent:
             return runs
-        source = Path(parent["source"]).resolve()
+        source = evidence_path(parent["source"], path_relocations)
         if sha256_file(source / "manifest.json") != parent["manifest_sha256"]:
             raise ValueError("Parent run manifest hash mismatch")
 
 
-def transient_retry_jobs(source, config, arms, *, include_pending=False):
+def transient_retry_jobs(source, config, arms, *, include_pending=False, path_relocations=()):
     """Select recorded transport failures without repeating successful jobs."""
     original = json.loads((source / "manifest.json").read_text())
     if api_identity(original) != api_identity(config):
@@ -634,7 +679,8 @@ def transient_retry_jobs(source, config, arms, *, include_pending=False):
         if original.get(key) != config.get(key):
             raise ValueError("Retry protocol differs: " + key)
     jobs = {}
-    ancestors = run_ancestry(source)
+    path_relocations = inherited_relocations(source, path_relocations)
+    ancestors = run_ancestry(source, path_relocations)
     if any(api_identity(json.loads((run / "manifest.json").read_text())) != api_identity(config) for run in ancestors):
         raise ValueError("Retry ancestry mixes API models or reasoning efforts")
     for sid in config["sample_ids"]:
@@ -656,7 +702,7 @@ def transient_retry_jobs(source, config, arms, *, include_pending=False):
                 continue
             requests = sorted(job.glob("request_*.json"))
             if not requests and (job / "replayed_requests.json").exists():
-                requests = [Path(item["path"]) for item in json.loads((job / "replayed_requests.json").read_text())]
+                requests = [preserved_response_path(item, path_relocations) for item in json.loads((job / "replayed_requests.json").read_text())]
             if not requests:
                 continue
             last = json.loads(requests[-1].read_text())
@@ -701,6 +747,9 @@ def main():
     parser.add_argument("--retry-transient-from", type=Path, help="Resume recorded transport/budget failures; preserve completed jobs across linked runs")
     parser.add_argument("--continue-pending", action="store_true", help="With --retry-transient-from, also run jobs not started in its ancestry")
     parser.add_argument("--replay-prefix", action="store_true", help="With --retry-transient-from, reuse exact successful HTTP prefix responses instead of paying again")
+    parser.add_argument("--relocate-root", nargs=2, action="append", default=[], metavar=("OLD", "NEW"), help="Resolve copied evidence under a new absolute project root; keep original files and hashes unchanged")
+    parser.add_argument("--lock-file", type=Path, help="Shared advisory lock for all attempts on this host")
+    parser.add_argument("--notify-on-exit", action="store_true", help="Request a macOS desktop notification when the runner finishes or stops")
     args = parser.parse_args()
     args.reasoning_effort = args.reasoning_effort or ("medium" if args.api_model == TERRA else "max")
     if args.phase == "formal":
@@ -711,6 +760,25 @@ def main():
         parser.error("Continuation flags require --retry-transient-from")
     if args.overload_backoff and (args.phase != "retrieval_batch" or args.workers != 1 or 1 in args.arms):
         parser.error("Overload backoff requires retrieval_batch, one worker and API arms only")
+    if args.phase == "retrieval_batch" and not args.selection_manifest:
+        parser.error("retrieval_batch requires --selection-manifest")
+    with exclusive_run_lock(args.lock_file or args.output / "active.lock"):
+        args.output.mkdir(parents=True, exist_ok=True)
+        pid_file = args.output / "runner.pid"
+        pid_file.write_text(str(os.getpid()) + "\n")
+        try:
+            run_experiment(args)
+        finally:
+            pid_file.unlink(missing_ok=True)
+            if args.notify_on_exit and sys.platform == "darwin":
+                import subprocess
+                try:
+                    subprocess.run(["/usr/bin/osascript", "-e", 'display notification "检索任务已结束或停止，请查看 progress.json 和 runner.log。" with title "PhysicsVerifier"'], timeout=5, check=False, capture_output=True)
+                except (OSError, subprocess.SubprocessError):
+                    pass  # Notification settings must never change experiment results.
+
+
+def run_experiment(args):
     load_dotenv(args.env_file, override=False)
     catalog = json.loads(args.catalog.read_text())
     rows = json.loads(args.input.read_text())
@@ -728,17 +796,22 @@ def main():
     config["workers"] = args.workers
     config["overload_retry_policy"] = {"enabled": args.overload_backoff, "delays_seconds": list(OVERLOAD_BACKOFF_SECONDS) if args.overload_backoff else [], "scope": "per_request_consecutive_failures", "retryable_http_statuses": [408, 502, 503, 504], "explicit_overload_statuses": [429, 500, 503], "retry_transient_transport_errors": True, "waiting_excluded_from_task_seconds": True, "all_attempts_count_toward_request_and_batch_budgets": True, "exhaustion": "stop_batch", "unrecognized_auth_quota_rate_limit": "stop_batch"}
     config["stage"] = "retrieval_only_no_checker_or_physics_scoring"
+    relocations = inherited_relocations(args.retry_transient_from, args.relocate_root) if args.retry_transient_from else args.relocate_root
+    # Validate even unused mappings before any request. Host paths are operational
+    # metadata, not part of model input or the frozen retrieval protocol.
+    for old, new in relocations:
+        evidence_path(old, [(old, new)])
+    if relocations:
+        config["path_relocations"] = relocations
     batch_limits = {"requests": args.batch_max_requests, "input_tokens": args.batch_max_input_tokens, "output_tokens": args.batch_max_output_tokens}
     if args.phase == "retrieval_batch":
-        if not args.selection_manifest:
-            parser.error("retrieval_batch requires --selection-manifest")
         config["frozen_inputs"] = validate_batch_inputs(args.input, args.selection_manifest, rows, catalog)
         config["batch_limits"] = batch_limits
         config["platform_quota_floor"] = args.platform_quota_floor
         config["quota_probe_policy"] = {"minimum_interval_seconds": 60, "error_backoff_seconds": 300, "query_error": "warn_only", "inference_auth_quota_rate_limit_error": "stop_unless_explicit_overload_backoff" if args.overload_backoff else "stop"}
         config["tools"] = {"shared": ["bm25", "sparse_tfidf", "substring", "list_rules", "read_rules", "submit_rules"], "arm3_extra": "read_tree", "dense_embeddings": False, "arbitrary_code_execution": False}
         config["source_tree"] = fingerprint_source_tree(ROOT)
-    retries = transient_retry_jobs(args.retry_transient_from, config, args.arms, include_pending=args.continue_pending) if args.retry_transient_from else None
+    retries = transient_retry_jobs(args.retry_transient_from, config, args.arms, include_pending=args.continue_pending, path_relocations=relocations) if args.retry_transient_from else None
     if retries is not None:
         config["retry_of"] = {"source": str(args.retry_transient_from.resolve()), "manifest_sha256": sha256_file(args.retry_transient_from / "manifest.json"), "jobs": list(retries.values()), "include_pending": args.continue_pending, "replay_prefix": args.replay_prefix}
     signature = digest(config)
@@ -750,7 +823,8 @@ def main():
         write_json(manifest, {"configuration_sha256": signature, **config, "git": capture_git_state(ROOT)})
     api_base = os.getenv("ASTRA_BASE_URL", os.getenv("OPENAI_BASE_URL", ""))
     api_key = os.getenv("ASTRA_API_KEY", os.getenv("OPENAI_API_KEY", ""))
-    budget = BatchBudget(args.output, batch_limits, quota_probe=lambda: platform_quota_probe(api_base, api_key), quota_floor=args.platform_quota_floor, prior_runs=run_ancestry(args.retry_transient_from) if args.retry_transient_from else (), retry_overload=args.overload_backoff) if args.phase == "retrieval_batch" and any(a != 1 for a in args.arms) else None
+    ancestors = run_ancestry(args.retry_transient_from, relocations) if args.retry_transient_from else []
+    budget = BatchBudget(args.output, batch_limits, quota_probe=lambda: platform_quota_probe(api_base, api_key), quota_floor=args.platform_quota_floor, prior_runs=ancestors, retry_overload=args.overload_backoff, stop_file=args.output / "STOP") if args.phase == "retrieval_batch" and any(a != 1 for a in args.arms) else None
     jobs = []
     for position, row in enumerate(rows):
         order = config["arm_order"]
@@ -780,7 +854,7 @@ def main():
         replay_source = None
         if args.replay_prefix and retries[(str(row["id"]), arm)].get("source_run"):
             replay_source = Path(retries[(str(row["id"]), arm)]["source_run"]) / f"arm{arm}" / job.name
-        transport = Transport(base=base, key=key, output=job, limits=limits, model=model, reasoning_effort=args.reasoning_effort, batch_budget=budget if arm != 1 else None, replay_source=replay_source, overload_backoff=OVERLOAD_BACKOFF_SECONDS if args.overload_backoff else ())
+        transport = Transport(base=base, key=key, output=job, limits=limits, model=model, reasoning_effort=args.reasoning_effort, batch_budget=budget if arm != 1 else None, replay_source=replay_source, overload_backoff=OVERLOAD_BACKOFF_SECONDS if args.overload_backoff else (), path_relocations=relocations)
         print(f"{row['id']} arm{arm}: start", flush=True)
         try:
             result = run_tree(sample, catalog, transport) if arm in (1, 2) else run_autonomous(sample, catalog, transport, tree=arm == 3, output=job, max_chars=args.max_read_chars)
@@ -803,10 +877,12 @@ def main():
     def progress(state):
         if budget and budget.stopped.startswith("upstream_") and state in {"stopping_budget", "stopped_budget"}:
             state = state.replace("_budget", "_upstream")
+        if budget and budget.stopped == "operator_stop_requested" and state in {"stopping_budget", "stopped_budget"}:
+            state = state.replace("_budget", "_operator")
         completed = [json.loads(p.read_text()) for p in args.output.glob("arm*/*/result.json")]
         inherited = {}
         if args.retry_transient_from:
-            for run in reversed(run_ancestry(args.retry_transient_from)):
+            for run in reversed(ancestors):
                 for path in run.glob("arm*/*/result.json"):
                     record = json.loads(path.read_text())
                     if str(record["id"]) in ids and record["arm"] in args.arms:
@@ -832,6 +908,8 @@ def main():
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         active = set()
         while True:
+            if budget and budget.stop_file.exists():
+                budget.stop("operator_stop_requested")
             while len(active) < args.workers and not (budget and budget.stopped):
                 next_job = next(queue, None)
                 if next_job is None:
@@ -844,6 +922,7 @@ def main():
                 future.result()
             progress("stopping_budget" if budget and budget.stopped else "running")
     progress("stopped_budget" if budget and budget.stopped else "finished")
+    print("Runner stopped: " + (budget.stopped if budget and budget.stopped else "queue finished; inspect progress.json for effective completions"), flush=True)
 
 
 if __name__ == "__main__":
