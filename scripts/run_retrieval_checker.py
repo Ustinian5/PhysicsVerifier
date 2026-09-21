@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 from core.physics_rule_verifier import PhysicsRuleVerifier
 from scripts.experiment_manifest import capture_source_state, sha256_file
 from scripts.run_checker_replay import _catalog_index, _checker_status_succeeded, _validate_checker_result
-from scripts.run_retrieval_comparison import ASTRA, QWEN, Transport, digest, model_input, write_json
+from scripts.run_retrieval_comparison import QWEN, Transport, api_identity, digest, model_input, write_json
 
 SOURCES = {1: "native_semantic_tree", 2: "native_semantic_tree", 3: "autonomous_tree_tools", 4: "autonomous_leaf_tools"}
 POLICY = "existing_semantic_0_1_gates_with_truthful_candidate_source"
@@ -37,6 +37,7 @@ def read_frozen_jobs(runs, input_path, catalog_path, rows, arms):
     """Resolve explicitly supplied, hash-linked retries; never pick the best run."""
     jobs = {}
     manifests = {}
+    api_models = set()
     for run in runs:
         run = Path(run).resolve()
         manifest_path = run / "manifest.json"
@@ -67,8 +68,15 @@ def read_frozen_jobs(runs, input_path, catalog_path, rows, arms):
                     raise ValueError("Retrieval result configuration mismatch")
                 if value.get("candidate_source") != SOURCES[arm]:
                     raise ValueError("Retrieval candidate source mismatch")
-                if value.get("model") != (QWEN if arm == 1 else ASTRA):
+                model, effort = api_identity(manifest)
+                if value.get("model") != (QWEN if arm == 1 else model):
                     raise ValueError("Retrieval model mismatch")
+                if arm != 1:
+                    if value.get("reasoning_effort", effort) != effort:
+                        raise ValueError("Retrieval reasoning effort mismatch")
+                    api_models.add((model, effort))
+                    if len(api_models) > 1:
+                        raise ValueError("Cannot mix API models or reasoning efforts in one comparison")
                 previous = jobs.get((sid, arm))
                 evidence = {"path": str(path), "sha256": sha256_file(path), "status": value.get("status")}
                 links = retry.get("jobs", []) if retry else []

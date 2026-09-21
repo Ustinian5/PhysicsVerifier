@@ -8,7 +8,7 @@ import httpx
 
 from scripts.experiment_manifest import sha256_file
 from scripts.run_retrieval_checker import FrozenVerifier, SharedResponses, job_key, matcher_result, read_frozen_jobs, run_job
-from scripts.run_retrieval_comparison import ASTRA, QWEN, write_json
+from scripts.run_retrieval_comparison import ASTRA, TERRA, QWEN, write_json
 
 
 class RetrievalCheckerTests(unittest.TestCase):
@@ -117,6 +117,21 @@ class RetrievalCheckerTests(unittest.TestCase):
         write_json(path, {**result, "status": "completed"})
         with self.assertRaisesRegex(ValueError, "Only a linked failed"):
             read_frozen_jobs([source, retry], inputs, self.catalog_path, [self.sample], [2])
+
+    def test_checker_accepts_terra_but_rejects_mixed_api_models(self):
+        inputs = self.root / "inputs.json"
+        write_json(inputs, [self.sample])
+        runs = []
+        for arm, model, effort, source in [(2, TERRA, "medium", "native_semantic_tree"), (3, ASTRA, "max", "autonomous_tree_tools")]:
+            run = self.root / model
+            runs.append(run)
+            manifest = {"phase": "development", "input_sha256": sha256_file(inputs), "catalog_sha256": sha256_file(self.catalog_path), "configuration_sha256": model, "api_model": model, "reasoning_effort": effort}
+            write_json(run / "manifest.json", manifest)
+            write_json(run / f"arm{arm}" / job_key("case") / "result.json", {"id": "case", "arm": arm, "status": "completed", "model": model, "reasoning_effort": effort, "candidate_source": source, "configuration_sha256": model})
+        jobs = read_frozen_jobs(runs[:1], inputs, self.catalog_path, [self.sample], [2, 3])
+        self.assertEqual(jobs[("case", 2)]["result"]["model"], TERRA)
+        with self.assertRaisesRegex(ValueError, "Cannot mix API models"):
+            read_frozen_jobs(runs, inputs, self.catalog_path, [self.sample], [2, 3])
 
 
 if __name__ == "__main__":

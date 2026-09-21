@@ -8,7 +8,7 @@ from scripts.run_retrieval_comparison import (
     Corpus, Transport, digest, model_input, tool_definitions, validate_selection,
     execute_tool_batch,
     transient_retry_jobs, write_json, BatchBudget, BatchBudgetExceeded,
-    validate_batch_inputs, sha256_file,
+    validate_batch_inputs, sha256_file, ASTRA, TERRA,
 )
 
 
@@ -60,24 +60,56 @@ def check_budget_rejects_before_any_network_request(case, tmp_path):
     assert not list(tmp_path.iterdir())
 
 
-def check_tree_bridge_preserves_prompt_and_schema_without_sampling_parameters(tmp_path):
-    transport = Transport(base="http://not-used.invalid", key="not-logged", output=tmp_path, model="gpt-6-astra", limits={"requests": 1, "seconds": 5, "input_tokens": 10000, "output_tokens": 16384, "per_response": 16384})
+def check_tree_bridge_preserves_prompt_and_schema_without_sampling_parameters(tmp_path, model=ASTRA, effort="max"):
+    transport = Transport(base="http://not-used.invalid", key="not-logged", output=tmp_path, model=model, reasoning_effort=effort, limits={"requests": 1, "seconds": 5, "input_tokens": 10000, "output_tokens": 16384, "per_response": 16384})
     captured = {}
     def post(endpoint, body):
         captured.update(body)
-        return {"id": "resp_test", "model": "gpt-6-astra", "status": "completed", "output": [{"type": "message", "content": [{"type": "output_text", "text": '{"ok":true}'}]}]}
+        return {"id": "resp_test", "model": model, "status": "completed", "output": [{"type": "message", "content": [{"type": "output_text", "text": '{"ok":true}'}]}]}
     transport.post = post
     messages = [{"role": "system", "content": "original instructions"}, {"role": "user", "content": "original input"}]
     schema = {"name": "test", "strict": True, "schema": {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"], "additionalProperties": False}}
-    response = transport.chat_create(messages=messages, temperature=0, max_tokens=1024, model="gpt-6-astra", response_format={"type": "json_schema", "json_schema": schema}, extra_body={"chat_template_kwargs": {"enable_thinking": False}})
+    response = transport.chat_create(messages=messages, temperature=0, max_tokens=1024, model=model, response_format={"type": "json_schema", "json_schema": schema}, extra_body={"chat_template_kwargs": {"enable_thinking": False}})
     assert captured["input"] == messages
     assert captured["text"]["format"]["schema"] == schema["schema"]
-    assert captured["reasoning"] == {"effort": "max"}
+    assert captured["reasoning"] == {"effort": effort}
+    assert captured["model"] == model
     assert not {"temperature", "max_tokens", "extra_body"} & set(captured)
     assert json.loads(response.choices[0].message.content) == {"ok": True}
 
 
 class RetrievalComparisonTests(unittest.TestCase):
+    def test_terra_rejects_response_with_wrong_reasoning_effort(self):
+        import httpx
+        from unittest.mock import patch
+        original_client = httpx.Client
+        body = {"id": "response", "model": TERRA, "reasoning": {"effort": "high"}, "usage": {"input_tokens": 10, "output_tokens": 2}}
+        with tempfile.TemporaryDirectory() as directory:
+            transport = Transport(base="https://not-used.invalid", key="not-logged", output=directory, model=TERRA, reasoning_effort="medium", limits={"requests": 2, "seconds": 10, "input_tokens": 10000, "output_tokens": 100, "per_response": 20})
+            with patch("scripts.run_retrieval_comparison.httpx.Client", side_effect=lambda **kw: original_client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=body)), **kw)):
+                with self.assertRaisesRegex(RuntimeError, "confirm medium"):
+                    transport.responses(input="test")
+            record = json.loads((Path(directory) / "request_001.json").read_text())
+            self.assertEqual(record["request"]["reasoning"]["effort"], "medium")
+            self.assertEqual(transport.input_tokens, 10)
+
+    def test_retry_never_combines_models_or_reasoning_efforts(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = {"sample_ids": ["case"]}
+            write_json(root / "manifest.json", config)
+            terra = {**config, "api_model": TERRA, "reasoning_effort": "medium"}
+            with self.assertRaisesRegex(ValueError, "API model or reasoning effort"):
+                transient_retry_jobs(root, terra, [2])
+            write_json(root / "manifest.json", terra)
+            job = root / "arm2" / hashlib.sha256(b"case").hexdigest()[:16]
+            write_json(job / "result.json", {"status": "failed", "model": TERRA, "reasoning_effort": "medium"})
+            write_json(job / "request_001.json", {"http_status": 504})
+            self.assertEqual(set(transient_retry_jobs(root, terra, [2])), {("case", 2)})
+            with self.assertRaisesRegex(ValueError, "API model or reasoning effort"):
+                transient_retry_jobs(root, {**terra, "reasoning_effort": "high"}, [2])
+
     def test_quota_probe_is_cached_and_outages_do_not_abort_bounded_model_calls(self):
         import time
         from unittest.mock import Mock
@@ -251,7 +283,9 @@ class RetrievalComparisonTests(unittest.TestCase):
 
     def test_transport_adapter(self):
         with tempfile.TemporaryDirectory() as directory:
-            check_tree_bridge_preserves_prompt_and_schema_without_sampling_parameters(Path(directory))
+            for model, effort in [(ASTRA, "max"), (TERRA, "medium")]:
+                with self.subTest(model=model):
+                    check_tree_bridge_preserves_prompt_and_schema_without_sampling_parameters(Path(directory), model, effort)
 
 
 if __name__ == "__main__":

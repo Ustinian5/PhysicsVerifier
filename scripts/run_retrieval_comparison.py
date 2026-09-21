@@ -1,7 +1,7 @@
 """Run auditable retrieval arms without changing the production verifier.
 
 Arms 1/2 inject a transport adapter into the actual semantic matcher. Arms 3/4
-let Astra choose corpus tools; only arm 3 exposes the catalog tree. This entry
+let the configured API model choose corpus tools; only arm 3 exposes the tree. This entry
 point runs retrieval, not Checker scoring or human adjudication.
 """
 from __future__ import annotations
@@ -31,6 +31,7 @@ from core.unified_semantic_matcher import UnifiedSemanticMatcher
 from scripts.experiment_manifest import sha256_file, capture_git_state, fingerprint_source_tree
 
 ASTRA = "gpt-6-astra"
+TERRA = "gpt-5.6-terra"
 QWEN = "qwen3-30b-a3b-instruct-2507"
 LEAF_FIELDS = ("rule_id", "title", "summary", "trigger", "check_logic", "error_type", "symbolic_hint")
 PROMPT = """Select at most six existing rules that are useful for checking the supplied physics solution.
@@ -67,6 +68,11 @@ def write_json(path, value):
 
 def model_input(row):
     return {key: row[key] for key in ("id", "question", "prediction", "context") if key in row}
+
+
+def api_identity(config):
+    # Manifests written before model selection was configurable used Astra/max.
+    return config.get("api_model", ASTRA), config.get("reasoning_effort", "max")
 
 
 def tokens(text):
@@ -327,12 +333,13 @@ def validate_batch_inputs(input_path, selection_manifest, rows, catalog):
 
 
 class Transport:
-    def __init__(self, *, base, key, output, limits, model, batch_budget=None, replay_source=None):
+    def __init__(self, *, base, key, output, limits, model, reasoning_effort=None, batch_budget=None, replay_source=None):
         self.base = base.rstrip("/")
         self.key = key
         self.output = Path(output)
         self.limits = limits
         self.model = model
+        self.reasoning_effort = reasoning_effort or ("medium" if model == TERRA else "max")
         self.batch_budget = batch_budget
         self.requests = 0
         self.input_tokens = 0
@@ -363,7 +370,7 @@ class Transport:
             path = self.replay_queue.pop(0)
             record = json.loads(path.read_text())
             data = record.get("response", {})
-            if record.get("request") != body or record.get("endpoint") != endpoint or data.get("model") != self.model or not data.get("id") or (endpoint == "/responses" and data.get("reasoning", {}).get("effort") != "max"):
+            if record.get("request") != body or record.get("endpoint") != endpoint or data.get("model") != self.model or not data.get("id") or (endpoint == "/responses" and data.get("reasoning", {}).get("effort") != self.reasoning_effort):
                 raise ValueError("Preserved response prefix does not match the exact request")
             usage = data.get("usage") or {}
             if usage.get("input_tokens", usage.get("prompt_tokens")) is None or usage.get("output_tokens", usage.get("completion_tokens")) is None:
@@ -409,8 +416,8 @@ class Transport:
             self.output_tokens += outgoing
             if data.get("model") != self.model or not data.get("id"):
                 raise RuntimeError("Provider model identity mismatch")
-            if endpoint == "/responses" and data.get("reasoning", {}).get("effort") != "max":
-                raise RuntimeError("Provider did not confirm max reasoning")
+            if endpoint == "/responses" and data.get("reasoning", {}).get("effort") != self.reasoning_effort:
+                raise RuntimeError("Provider did not confirm " + self.reasoning_effort + " reasoning")
             return data
         except Exception as exc:
             record["error"] = str(exc)
@@ -422,11 +429,11 @@ class Transport:
                 self.batch_budget.settle(ticket, record)
 
     def responses(self, **kwargs):
-        body = {"model": self.model, "reasoning": {"effort": "max"}, "max_output_tokens": self.limits["per_response"], "store": False, **kwargs}
+        body = {**kwargs, "model": self.model, "reasoning": {"effort": self.reasoning_effort}, "max_output_tokens": self.limits["per_response"], "store": False}
         return self.post("/responses", body)
 
     def chat_create(self, **kwargs):
-        if self.model != ASTRA:
+        if self.model not in {ASTRA, TERRA}:
             # Match the SDK: timeout controls the client, while extra_body is
             # merged into the JSON root (e.g. vLLM chat_template_kwargs).
             body = copy.deepcopy(kwargs)
@@ -519,11 +526,15 @@ def run_ancestry(source):
 def transient_retry_jobs(source, config, arms, *, include_pending=False):
     """Select recorded transport failures without repeating successful jobs."""
     original = json.loads((source / "manifest.json").read_text())
+    if api_identity(original) != api_identity(config):
+        raise ValueError("Retry protocol differs: API model or reasoning effort")
     for key in ("input_sha256", "catalog_sha256", "matcher_sha256", "prompt_sha256", "limits", "max_read_chars", "endpoint_sha256", "vector_method", "phase", "tools", "batch_limits"):
         if original.get(key) != config.get(key):
             raise ValueError("Retry protocol differs: " + key)
     jobs = {}
     ancestors = run_ancestry(source)
+    if any(api_identity(json.loads((run / "manifest.json").read_text())) != api_identity(config) for run in ancestors):
+        raise ValueError("Retry ancestry mixes API models or reasoning efforts")
     for sid in config["sample_ids"]:
         if sid not in original["sample_ids"]:
             raise ValueError("Retry sample absent from original run")
@@ -552,7 +563,7 @@ def transient_retry_jobs(source, config, arms, *, include_pending=False):
             paused = "BatchBudgetExceeded" in (str(result.get("error_type", "")) + str(result.get("error", "")))
             if status not in {401, 402, 403, 429, 502, 503, 504} and not timeout and not paused:
                 continue
-            expected = QWEN if arm == 1 else ASTRA
+            expected = QWEN if arm == 1 else api_identity(config)[0]
             if result.get("model") != expected:
                 raise ValueError("Retry would change the model")
             jobs[(sid, arm)] = {"sample_id": sid, "arm": arm, "source_run": str(source_run), "result_sha256": sha256_file(result_path), "failed_request_sha256": sha256_file(requests[-1]), "http_status": status, "reason": result.get("error") or last.get("error")}
@@ -567,6 +578,8 @@ def main():
     parser.add_argument("--catalog", type=Path, default=ROOT / "catalogs/rules_unified_3000.json")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
+    parser.add_argument("--api-model", choices=[TERRA, ASTRA], default=TERRA, help="Model for arms 2/3/4; changing it requires an independent run")
+    parser.add_argument("--reasoning-effort", choices=["none", "low", "medium", "high", "xhigh", "max"], help="Defaults to medium for Terra, max for Astra")
     parser.add_argument("--arms", nargs="+", type=int, choices=[1, 2, 3, 4], default=[1, 2, 3, 4])
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--phase", choices=["development", "retrieval_batch", "formal"], default="development")
@@ -587,6 +600,7 @@ def main():
     parser.add_argument("--continue-pending", action="store_true", help="With --retry-transient-from, also run jobs not started in its ancestry")
     parser.add_argument("--replay-prefix", action="store_true", help="With --retry-transient-from, reuse exact successful HTTP prefix responses instead of paying again")
     args = parser.parse_args()
+    args.reasoning_effort = args.reasoning_effort or ("medium" if args.api_model == TERRA else "max")
     if args.phase == "formal":
         parser.error("Final scoring still requires reviewed GT and Qwen; use retrieval_batch for frozen API-first retrieval")
     if not os.getenv("CONDA_PREFIX"):
@@ -604,6 +618,8 @@ def main():
     limits = {"requests": args.max_requests, "input_tokens": args.max_input_tokens, "output_tokens": args.max_output_tokens, "per_response": args.response_tokens, "seconds": args.max_seconds, "request_timeout_seconds": args.request_timeout}
     config = {"input_sha256": sha256_file(args.input), "catalog_sha256": sha256_file(args.catalog), "script_sha256": sha256_file(Path(__file__)), "matcher_sha256": sha256_file(ROOT / "core/unified_semantic_matcher.py"), "sample_ids": ids, "limits": limits, "max_read_chars": args.max_read_chars, "prompt_sha256": digest(PROMPT), "phase": args.phase, "vector_method": "sparse_tfidf_not_dense_embedding"}
     config["endpoint_sha256"] = {"astra": digest(os.getenv("ASTRA_BASE_URL", os.getenv("OPENAI_BASE_URL", ""))), "qwen": digest(os.getenv("QWEN_BASE_URL", ""))}
+    config["api_model"] = args.api_model
+    config["reasoning_effort"] = args.reasoning_effort
     config["arm_order"] = list(dict.fromkeys(args.arms))
     config["workers"] = args.workers
     config["stage"] = "retrieval_only_no_checker_or_physics_scoring"
@@ -627,9 +643,9 @@ def main():
         raise ValueError("Existing run configuration differs; do not overwrite it")
     if not manifest.exists():
         write_json(manifest, {"configuration_sha256": signature, **config, "git": capture_git_state(ROOT)})
-    astra_base = os.getenv("ASTRA_BASE_URL", os.getenv("OPENAI_BASE_URL", ""))
-    astra_key = os.getenv("ASTRA_API_KEY", os.getenv("OPENAI_API_KEY", ""))
-    budget = BatchBudget(args.output, batch_limits, quota_probe=lambda: platform_quota_probe(astra_base, astra_key), quota_floor=args.platform_quota_floor, prior_runs=run_ancestry(args.retry_transient_from) if args.retry_transient_from else ()) if args.phase == "retrieval_batch" and any(a != 1 for a in args.arms) else None
+    api_base = os.getenv("ASTRA_BASE_URL", os.getenv("OPENAI_BASE_URL", ""))
+    api_key = os.getenv("ASTRA_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+    budget = BatchBudget(args.output, batch_limits, quota_probe=lambda: platform_quota_probe(api_base, api_key), quota_floor=args.platform_quota_floor, prior_runs=run_ancestry(args.retry_transient_from) if args.retry_transient_from else ()) if args.phase == "retrieval_batch" and any(a != 1 for a in args.arms) else None
     jobs = []
     for position, row in enumerate(rows):
         order = config["arm_order"]
@@ -651,7 +667,7 @@ def main():
         sample = model_input(row)
         job = args.output / f"arm{arm}" / hashlib.sha256(str(row["id"]).encode()).hexdigest()[:16]
         result_path = job / "result.json"
-        model = QWEN if arm == 1 else ASTRA
+        model = QWEN if arm == 1 else args.api_model
         base = os.getenv("QWEN_BASE_URL", "") if arm == 1 else os.getenv("ASTRA_BASE_URL", os.getenv("OPENAI_BASE_URL", ""))
         key = os.getenv("QWEN_API_KEY", "EMPTY") if arm == 1 else os.getenv("ASTRA_API_KEY", os.getenv("OPENAI_API_KEY", ""))
         if not base or not key:
@@ -659,7 +675,7 @@ def main():
         replay_source = None
         if args.replay_prefix and retries[(str(row["id"]), arm)].get("source_run"):
             replay_source = Path(retries[(str(row["id"]), arm)]["source_run"]) / f"arm{arm}" / job.name
-        transport = Transport(base=base, key=key, output=job, limits=limits, model=model, batch_budget=budget if model == ASTRA else None, replay_source=replay_source)
+        transport = Transport(base=base, key=key, output=job, limits=limits, model=model, reasoning_effort=args.reasoning_effort, batch_budget=budget if arm != 1 else None, replay_source=replay_source)
         print(f"{row['id']} arm{arm}: start", flush=True)
         try:
             result = run_tree(sample, catalog, transport) if arm in (1, 2) else run_autonomous(sample, catalog, transport, tree=arm == 3, output=job, max_chars=args.max_read_chars)
@@ -675,7 +691,7 @@ def main():
                 job.rmdir()
             print(f"{row['id']} arm{arm}: pending; {budget.stopped}", flush=True)
             return
-        result.update(id=row["id"], arm=arm, model=model, configuration_sha256=signature, metrics=transport.summary(), candidate_source="native_semantic_tree" if arm in (1, 2) else "autonomous_tree_tools" if arm == 3 else "autonomous_leaf_tools", checker_executed=False)
+        result.update(id=row["id"], arm=arm, model=model, reasoning_effort=args.reasoning_effort if arm != 1 else None, configuration_sha256=signature, metrics=transport.summary(), candidate_source="native_semantic_tree" if arm in (1, 2) else "autonomous_tree_tools" if arm == 3 else "autonomous_leaf_tools", checker_executed=False)
         write_json(result_path, result)
         print(f"{row['id']} arm{arm}: {result['status']}, {len(result['selected_rules'])} rules, {transport.requests} requests", flush=True)
 
