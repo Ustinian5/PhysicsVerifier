@@ -78,7 +78,7 @@ def check_tree_bridge_preserves_prompt_and_schema_without_sampling_parameters(tm
 
 
 class RetrievalComparisonTests(unittest.TestCase):
-    def test_quota_probe_is_cached_and_short_outages_do_not_abort_models(self):
+    def test_quota_probe_is_cached_and_outages_do_not_abort_bounded_model_calls(self):
         import time
         from unittest.mock import Mock
         probe = Mock(side_effect=[{"total_available": 1000000, "unlimited_quota": False}, RuntimeError("temporary outage"), RuntimeError("still unavailable")])
@@ -92,8 +92,17 @@ class RetrievalComparisonTests(unittest.TestCase):
             self.assertFalse(budget.stopped)
             budget.next_quota_check = 0
             budget.platform_quota["checked_unix"] = time.time() - 301
-            with self.assertRaises(BatchBudgetExceeded):
-                budget.reserve(1, 1)
+            budget.reserve(1, 1)
+            self.assertFalse(budget.stopped)
+            self.assertIsNotNone(budget.quota_error)
+
+    def test_inference_rate_limit_stops_new_model_requests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            budget = BatchBudget(directory, {"requests": 10, "input_tokens": 1000, "output_tokens": 1000})
+            ticket = budget.reserve(20, 20)
+            budget.settle(ticket, {"http_status": 429})
+            with self.assertRaisesRegex(BatchBudgetExceeded, "provider_auth_quota_or_rate_limit"):
+                budget.reserve(20, 20)
 
     def test_response_prefix_replay_is_exact_and_does_not_call_network(self):
         with tempfile.TemporaryDirectory() as directory:

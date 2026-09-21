@@ -262,11 +262,10 @@ class BatchBudget:
                         self.stopped = "platform_quota_low"
                 except Exception as exc:
                     self.quota_error = {"type": type(exc).__name__, "http_status": getattr(getattr(exc, "response", None), "status_code", None), "checked_unix": time.time()}
-                    # Quota is a control-plane query, not a model observation.
-                    # Tolerate a short outage with a recent confirmed balance.
-                    if not self.platform_quota or time.time() - self.platform_quota["checked_unix"] > 300:
-                        self.stopped = "platform_quota_probe_failed: " + type(exc).__name__
-                self.next_quota_check = time.time() + 60
+                    # The platform rate-limits this metadata endpoint separately
+                    # from inference. A failed query must not fabricate model
+                    # failures; local budgets and inference quota errors still stop.
+                self.next_quota_check = time.time() + (300 if self.quota_error else 60)
             reserved_input = sum(v[0] for v in self.reservations.values())
             reserved_output = sum(v[1] for v in self.reservations.values())
             if not self.stopped and (self.requests >= self.limits["requests"] or self.input_tokens + reserved_input + incoming > self.limits["input_tokens"] or self.output_tokens + reserved_output + outgoing > self.limits["output_tokens"]):
@@ -615,7 +614,7 @@ def main():
         config["frozen_inputs"] = validate_batch_inputs(args.input, args.selection_manifest, rows, catalog)
         config["batch_limits"] = batch_limits
         config["platform_quota_floor"] = args.platform_quota_floor
-        config["quota_probe_policy"] = {"minimum_interval_seconds": 60, "last_good_balance_max_age_seconds": 300}
+        config["quota_probe_policy"] = {"minimum_interval_seconds": 60, "error_backoff_seconds": 300, "query_error": "warn_only", "inference_auth_quota_rate_limit_error": "stop"}
         config["tools"] = {"shared": ["bm25", "sparse_tfidf", "substring", "list_rules", "read_rules", "submit_rules"], "arm3_extra": "read_tree", "dense_embeddings": False, "arbitrary_code_execution": False}
         config["source_tree"] = fingerprint_source_tree(ROOT)
     retries = transient_retry_jobs(args.retry_transient_from, config, args.arms, include_pending=args.continue_pending) if args.retry_transient_from else None
