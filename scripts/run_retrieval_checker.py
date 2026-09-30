@@ -84,7 +84,7 @@ def read_frozen_jobs(runs, input_path, catalog_path, rows, arms):
                 if previous:
                     if previous["attempts"][-1]["status"] != "failed" or link.get("result_sha256") != previous["attempts"][-1]["sha256"]:
                         raise ValueError("Only a linked failed attempt can be superseded")
-                elif retry and link.get("new_pending") is not True:
+                elif retry and link.get("new_pending") is not True and not link.get("interrupted_request_sha256"):
                     raise ValueError("Retry has no original result in the supplied runs")
                 jobs[(sid, arm)] = {"result": value, "attempts": (previous["attempts"] if previous else []) + [evidence]}
     return jobs
@@ -175,24 +175,32 @@ class FrozenVerifier(PhysicsRuleVerifier):
 class SharedResponses(Transport):
     """Reuse the first identified HTTP response for an identical full request."""
 
-    def __init__(self, *, response_index, **kwargs):
+    def __init__(self, *, response_index, fallback_indexes=(), **kwargs):
         super().__init__(**kwargs)
         self.index_path = Path(response_index)
+        self.fallback_indexes = [Path(path) for path in fallback_indexes]
         self.reused = []
 
     def post(self, endpoint, body, *, request_timeout=None):
         key = digest({"base": self.base, "endpoint": endpoint, "body": body})
         index = json.loads(self.index_path.read_text()) if self.index_path.exists() else {}
-        if key in index:
-            entry = index[key]
-            source = self.index_path.parent / entry["path"]
+        source_index = self.index_path
+        entry = index.get(key)
+        if entry is None:
+            for fallback in self.fallback_indexes:
+                fallback_index = json.loads(fallback.read_text()) if fallback.exists() else {}
+                if key in fallback_index:
+                    entry, source_index = fallback_index[key], fallback
+                    break
+        if entry is not None:
+            source = source_index.parent / entry["path"]
             if sha256_file(source) != entry["sha256"]:
                 raise ValueError("Frozen checker response hash mismatch")
             record = json.loads(source.read_text())
             data = record.get("response", {})
             if record.get("request") != body or record.get("endpoint") != endpoint or record.get("http_status") != 200 or data.get("model") != self.model or not data.get("id"):
                 raise ValueError("Frozen checker response identity mismatch")
-            self.reused.append({"request_sha256": key, **entry})
+            self.reused.append({"request_sha256": key, "index": str(source_index.resolve()), **entry})
             write_json(self.output / "reused_responses.json", self.reused)
             return copy.deepcopy(data)
         data = super().post(endpoint, body, request_timeout=request_timeout)
@@ -200,6 +208,29 @@ class SharedResponses(Transport):
         index[key] = {"path": str(source.relative_to(self.index_path.parent)), "sha256": sha256_file(source)}
         write_json(self.index_path, index)
         return data
+
+
+def checker_run_ancestry(source):
+    runs = []
+    source = Path(source).resolve()
+    while True:
+        if source in runs:
+            raise ValueError("Cyclic checker retry ancestry")
+        runs.append(source)
+        manifest = json.loads((source / "manifest.json").read_text())
+        parent = manifest.get("checker_retry_of")
+        if not parent:
+            return runs
+        source = Path(parent["source"]).resolve()
+        if sha256_file(source / "manifest.json") != parent["manifest_sha256"]:
+            raise ValueError("Parent checker manifest hash mismatch")
+
+
+def checker_transport_failed(result):
+    if result.get("status") != "failed":
+        return False
+    failures = result.get("trace", {}).get("checker_failures", [])
+    return bool(failures) and all(item.get("status") == "transport_failure" for item in failures)
 
 
 def run_job(sample, result, *, catalog_path, output, transport):
@@ -220,6 +251,7 @@ def main():
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
     parser.add_argument("--arms", type=int, choices=[1, 2, 3, 4], nargs="+", default=[1, 2, 3, 4])
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--retry-checker-from", type=Path, help="Linked recovery run: keep completed checker jobs and retry only transport failures or pending jobs")
     args = parser.parse_args()
     if not os.getenv("CONDA_PREFIX"):
         parser.error("Run in the project conda environment")
@@ -258,14 +290,43 @@ def main():
     if not base:
         parser.error("QWEN_BASE_URL is required; never substitute the Astra/group endpoint")
     config["endpoint_sha256"] = digest(base.rstrip("/"))
+    checker_ancestors = checker_run_ancestry(args.retry_checker_from) if args.retry_checker_from else []
+    prior_results = {}
+    for run in reversed(checker_ancestors):
+        for path in run.glob("arm*/*/result.json"):
+            value = json.loads(path.read_text())
+            prior_results[(str(value["id"]), value["arm"])] = {"result": value, "path": path}
+    if args.retry_checker_from:
+        previous = json.loads((args.retry_checker_from / "manifest.json").read_text())
+        protocol_keys = ("phase", "input_sha256", "catalog_sha256", "jobs", "model", "candidate_policy", "checker_mode", "temperature", "max_output_tokens", "request_timeout_seconds", "disable_thinking_flag", "json_attempts", "symbolic", "semantic_min_publish_score", "max_diagnostics_per_sample", "max_diagnostics_per_paragraph", "quote_required_symbol_ratio", "response_reuse", "gt_reviewed", "endpoint_sha256")
+        for key in protocol_keys:
+            if previous.get(key) != config.get(key):
+                raise ValueError("Checker retry protocol differs: " + key)
+        config["checker_retry_of"] = {"source": str(args.retry_checker_from.resolve()), "manifest_sha256": sha256_file(args.retry_checker_from / "manifest.json")}
     signature = digest(config)
     manifest = output / "manifest.json"
     if manifest.exists() and json.loads(manifest.read_text())["configuration_sha256"] != signature:
         raise ValueError("Existing checker configuration differs")
     if not manifest.exists():
         write_json(manifest, {"configuration_sha256": signature, **config})
+
+    def progress(state):
+        current = {}
+        for path in output.glob("arm*/*/result.json"):
+            value = json.loads(path.read_text())
+            current[(str(value["id"]), value["arm"])] = value
+        effective = {key: value["result"] for key, value in prior_results.items()}
+        effective.update(current)
+        counts = {status: sum(item.get("status") == status for item in effective.values()) for status in ("completed", "failed")}
+        report = {"state": state, "tasks": len(rows) * len(arms), "completed": counts["completed"], "failed": counts["failed"], "pending": len(rows) * len(arms) - len(effective), "recorded_current": len(current), "inherited": len(prior_results)}
+        write_json(output / "progress.json", report)
+
+    progress("running")
     for row in rows:
         for arm in arms:
+            prior = prior_results.get((str(row["id"]), arm))
+            if prior and (prior["result"].get("status") == "completed" or not checker_transport_failed(prior["result"])):
+                continue
             frozen = jobs[(str(row["id"]), arm)]
             directory = output / f"arm{arm}" / job_key(row["id"])
             target = directory / "result.json"
@@ -275,7 +336,7 @@ def main():
                 raise RuntimeError("Reconcile interrupted checker requests before resuming: " + str(directory))
             result = {"status": "not_run_retrieval_failed", "checker_executed": False}
             if frozen["result"]["status"] == "completed":
-                transport = SharedResponses(base=base, key=os.getenv("QWEN_API_KEY", "EMPTY"), model=QWEN, output=directory, response_index=output / "response_index.json", limits={"requests": 6, "input_tokens": 600000, "output_tokens": 12288, "seconds": 1800, "request_timeout_seconds": 900})
+                transport = SharedResponses(base=base, key=os.getenv("QWEN_API_KEY", "EMPTY"), model=QWEN, output=directory, response_index=output / "response_index.json", fallback_indexes=[run / "response_index.json" for run in checker_ancestors], limits={"requests": 6, "input_tokens": 600000, "output_tokens": 12288, "seconds": 1800, "request_timeout_seconds": 900})
                 try:
                     result = run_job(model_input(row), frozen["result"], catalog_path=args.catalog, output=directory, transport=transport)
                 except Exception as exc:
@@ -285,6 +346,8 @@ def main():
             result.update(id=row["id"], arm=arm, model=QWEN, candidate_source=SOURCES[arm], candidate_policy=POLICY, configuration_sha256=signature, retrieval_attempts=frozen["attempts"])
             write_json(target, result)
             print(f"{row['id']} arm{arm}: {result['status']}", flush=True)
+            progress("running")
+    progress("finished")
 
 
 if __name__ == "__main__":

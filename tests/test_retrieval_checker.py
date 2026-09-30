@@ -124,6 +124,19 @@ class RetrievalCheckerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Only a linked failed"):
             read_frozen_jobs([source, retry], inputs, self.catalog_path, [self.sample], [2])
 
+    def test_retry_resolution_accepts_hash_linked_process_interruption(self):
+        source, retry = self.root / "retrieval", self.root / "retry"
+        inputs = self.root / "inputs.json"
+        write_json(inputs, [self.sample])
+        manifest = {"phase": "development", "input_sha256": sha256_file(inputs), "catalog_sha256": sha256_file(self.catalog_path), "configuration_sha256": "config"}
+        write_json(source / "manifest.json", manifest)
+        retry_manifest = {**manifest, "retry_of": {"manifest_sha256": sha256_file(source / "manifest.json"), "jobs": [{"sample_id": "case", "arm": 2, "source_run": str(source), "interrupted_request_sha256": "request-hash"}]}}
+        write_json(retry / "manifest.json", retry_manifest)
+        write_json(retry / "arm2" / job_key("case") / "result.json", {"id": "case", "arm": 2, "status": "completed", "model": ASTRA, "candidate_source": "native_semantic_tree", "configuration_sha256": "config"})
+        jobs = read_frozen_jobs([source, retry], inputs, self.catalog_path, [self.sample], [2])
+        self.assertEqual(jobs[("case", 2)]["result"]["status"], "completed")
+        self.assertEqual(len(jobs[("case", 2)]["attempts"]), 1)
+
     def test_checker_accepts_terra_but_rejects_mixed_api_models(self):
         inputs = self.root / "inputs.json"
         write_json(inputs, [self.sample])

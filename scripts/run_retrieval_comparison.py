@@ -732,8 +732,27 @@ def transient_retry_jobs(source, config, arms, *, include_pending=False, path_re
             relative = Path(f"arm{arm}") / hashlib.sha256(sid.encode()).hexdigest()[:16]
             source_run = next((run for run in ancestors if (run / relative / "result.json").exists()), None)
             if source_run is None:
-                if any(any((run / relative).glob("request_*.json")) for run in ancestors):
-                    continue  # Unresolved in-flight requests cannot be replayed.
+                interrupted_run = next((run for run in ancestors if any((run / relative).glob("request_*.json"))), None)
+                if interrupted_run is not None:
+                    request_paths = sorted((interrupted_run / relative).glob("request_*.json"))
+                    records = [json.loads(path.read_text()) for path in request_paths]
+                    completed_prefix = 0
+                    for record in records:
+                        if record.get("http_status") == 200 and record.get("response"):
+                            completed_prefix += 1
+                            continue
+                        break
+                    if completed_prefix != len(records) - 1 or records[-1].get("http_status") is not None or records[-1].get("response"):
+                        continue
+                    jobs[(sid, arm)] = {
+                        "sample_id": sid,
+                        "arm": arm,
+                        "source_run": str(interrupted_run),
+                        "interrupted_request_sha256": sha256_file(request_paths[-1]),
+                        "completed_prefix_requests": completed_prefix,
+                        "reason": "process_interrupted_during_request",
+                    }
+                    continue
                 if include_pending:
                     jobs[(sid, arm)] = {"sample_id": sid, "arm": arm, "new_pending": True}
                 continue
