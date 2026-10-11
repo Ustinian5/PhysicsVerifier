@@ -17,6 +17,7 @@
 | `prepare_retrieval_comparison.py` | 从历史池冻结 50 条，隔离参考答案与待复核标注 |
 | `run_retrieval_comparison.py` | 四组检索；`development` 预跑、`retrieval_batch` 运行已冻结的 50 条；保存 API 请求和工具记录，不含 checker 与物理计分 |
 | `run_retrieval_checker.py` | 将上述冻结候选接回原 Qwen checker、定位和发布；`--prepare-only` 无 API 调用，完整请求一致时共享原始响应 |
+| `run_continuous_context_v2.py` | 固定 GPT-OSS 连续会话对照：C0p 纯模型与 C3 问题驱动规则辅助，各 50 题；共用引文协议，自动保存及计分 |
 
 `run_physics_eval_pipeline.py` 要求显式传入规则库，使用当前 conda 解释器；`validation/final` 要求 clean worktree。运行配置与输出身份按 [实验清单](../experiments/README.md)保存。
 
@@ -29,6 +30,29 @@ API 先行时使用 `run_retrieval_comparison.py --phase retrieval_batch --input
 跨机器续跑时，先确认旧端已停止，复制完整关联记录，再增加 `--relocate-root /旧项目绝对路径 /新项目绝对路径`；旧 manifest 和响应保持原字节，仍逐项验证哈希，新 manifest 记录路径映射，后续续跑自动继承。`--lock-file …/active.lock` 为本机各次尝试指定同一把锁，防止重复调用；锁不能代替跨机器停机确认。脚本记录运行中的 `runner.pid`，正常退出后移除。API 批量可在当前输出目录创建空文件 `STOP`，待正在发送的请求结束并落盘后停止新请求；不要强杀。macOS 可加 `--notify-on-exit` 发送结束通知（是否显示由系统通知权限决定），并使用 `caffeinate -i` 防止空闲休眠；合盖、断网仍会影响运行。
 
 接续预算/网络中断时使用新的结果子目录，追加 `--retry-transient-from 原运行目录 --continue-pending --replay-prefix`。原始失败保留；在全部关联记录中跳过已成功项，未启动任务继续执行。已收到的成功响应只在完整请求逐项相同时重放以恢复运行状态，不重复付费；实际新请求、重放数量和历史用量分开记录，全批预算累计计算。没有明确完成状态的在途请求仍须先核对，不能覆盖重跑。
+
+## 连续会话对照：C0p / C3
+
+完整提示在 [continuous_context_v2.py](continuous_context_v2.py) 的 `BASE`、`RULES` 和 `repair_message`；实验调度和冻结参数在 [run_continuous_context_v2.py](run_continuous_context_v2.py)。被测模型固定 GPT-OSS-120B medium，两组共用全文检查提示，C3 增加按具体疑点检索、查询无进展时换路线、核对规则前提及返回全文查漏。检索和诊断在同一会话完成，不另接 checker。
+
+每题累计输出 16,384 token（含推理），最多 12 响应，规则组最多 6 个不同完整叶。程序核对原文引文，必要时在原会话最多进行一次只改引文的修正；计入原预算，诊断数量、顺序、理由和规则引用不允许改动，修正失败保留原诊断。两组都执行此协议，并分别计分修正前、修正后输出。
+
+在服务器原仓库、个人 conda 环境中执行以下命令；`RUN_DIR` 为个人持久化结果目录，`PYTHON_BIN` 为该环境的 Python 绝对路径，所需只读运行库按已有服务器配置设置。输入固定为 `results/retrieval_comparison_50_20260920/frozen50/inputs.json`，旧标签文件只供离线计分；`prepare` 会验证样本、规则、标签和源码哈希。
+
+```bash
+"$PYTHON_BIN" -m scripts.run_continuous_context_v2 prepare --output "$RUN_DIR"
+nohup "$PYTHON_BIN" -u -m scripts.run_continuous_context_v2 run --output "$RUN_DIR" >> "$RUN_DIR/runner.log" 2>&1 < /dev/null &
+```
+
+退出启动 SSH，再新建 SSH 会话，在同一环境和目录中执行：
+
+```bash
+"$PYTHON_BIN" -m scripts.run_continuous_context_v2 confirm-detached --output "$RUN_DIR"
+```
+
+启动后先等待断连确认（最长 10 分钟），再执行 1 次原生工具 IO 探针和 5 个集外样例×2 组；工程验收不要求物理判定全正确。通过后按题目轮换两组，自动完成 100 项正式任务及旧位置 P/R/F1 计分。不修改提示、模型或预算参数，不重跑空诊断/零检索结果；技术故障保存原始证据并停止，不自动重试或换模型。创建 `STOP` 可在当前题结束后停止新任务；重启先核实进程和锁。
+
+查看 `execution_status.json`、`formal/progress.json` 和 `runner.log`。最终 `metrics_automatic_proxy_unreviewed.json` 包含完整三指标、修正前后分数、未定位数、用量和位置命中增减。未完成组不给伪完整分数；旧位置分数不是物理正确率。只读重计分用同入口 `score` 模式。配置发生变化时拒绝混入同批次，不能删除原文件绕过校验。
 
 ## Checker 回放
 
