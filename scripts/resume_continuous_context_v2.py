@@ -7,6 +7,7 @@ import argparse
 import copy
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import time
@@ -17,6 +18,31 @@ from scripts import run_continuous_context_v2 as runner
 from scripts import gpt_oss_harmony_transport as transport
 
 ORIGINAL_DECODE = transport.decode_response
+
+
+def repair_quote_boundary(content):
+    """Remove two structural backslashes only at the parser's invalid quote value.
+
+    No field text is regenerated. Ambiguous/incomplete/other malformed outputs
+    stay errors; final JSON must parse after this sole boundary edit.
+    """
+    try:
+        json.loads(content)
+        return content, []
+    except json.JSONDecodeError as exc:
+        if not re.search(r'"quote"\s*:\s*$', content[:exc.pos]):
+            raise
+        match = re.match(r'\\"(.*?)\\"(?=\s*[,}])', content[exc.pos:], re.S)
+        if match is None:
+            raise
+        candidate = content[:exc.pos] + '"' + match[1] + '"' + content[exc.pos + match.end():]
+        value = json.loads(candidate)
+        if not isinstance(value, dict) or set(value) != {"diagnostics"}:
+            raise ValueError("Boundary recovery is for diagnostics only")
+        return candidate, [{"type": "quote_value_boundary_backslashes", "offset": exc.pos,
+            "removed_structural_backslashes": 2, "field_text_preserved": True,
+            "original_content_sha256": runner.r.sha256_value(content),
+            "restored_content_sha256": runner.r.sha256_value(candidate)}]
 
 
 def normalize_messages(parsed):
@@ -38,7 +64,15 @@ def decode_response(raw, **kwargs):
     parse = harmony_utils.parse_output_into_messages
     with patch.object(harmony_utils, "parse_output_into_messages",
                       lambda ids: normalize_messages(parse(ids))):
-        return ORIGINAL_DECODE(raw, **kwargs)
+        decoded = ORIGINAL_DECODE(raw, **kwargs)
+    if not decoded.get("tool_calls"):
+        try:
+            content, edits = repair_quote_boundary(decoded["content"])
+        except (json.JSONDecodeError, ValueError):
+            return decoded  # Normal frozen parsing still rejects unknown errors.
+        if edits:
+            decoded.update(content=content, serialization_repairs=edits)
+    return decoded
 
 
 def prepare(parent, output):
@@ -61,7 +95,9 @@ def prepare(parent, output):
                 if runner.healthy_result(item):
                     successes.append((phase, path, item))
                     continue
-                if item.get("failure_reason") != "ValueError: Unregistered actual Harmony recipient":
+                reason = item.get("failure_reason", "")
+                if (reason != "ValueError: Unregistered actual Harmony recipient"
+                        and not reason.startswith("JSONDecodeError: Expecting value:")):
                     raise ValueError("Unreviewed failure; no automatic model retry")
                 state = json.loads((path.parent / "state.json").read_text())
                 pending = state["pending"]
@@ -100,6 +136,12 @@ def prepare(parent, output):
             restored.pop("error", None)
             r.write_json(turn / "response.json", restored)
             state["pending"]["response_path"] = str(turn / "response.json")
+            # If the failed final was already metered before JSON parsing failed,
+            # retain that usage once; redirect only its derived response evidence.
+            for evidence in state["response_evidence"]:
+                if evidence["turn"] == state["turn"] + 1:
+                    evidence["response_path"] = str(turn / "response.json")
+                    evidence["response_sha256"] = r.sha256_file(turn / "response.json")
             elapsed = max(0, stopped["unix"] - state["started_unix"])
             state["started_unix"] = time.time() - elapsed
             state.pop("last_error", None)
@@ -112,7 +154,7 @@ def prepare(parent, output):
         r.write_json(output / "recovery.json", {"parent": str(parent),
             "parent_configuration_sha256": plan["configuration_sha256"],
             "entry_sha256": r.sha256_file(Path(__file__)), "created_unix": time.time(),
-            "fix": "case-insensitive JSON final serialization marker only",
+            "fix": "JSON final marker case and verified quote-value boundary compatibility only",
             "unchanged_successes": [{"path": str(p), "sha256": r.sha256_file(p)} for _, p, _ in successes],
             "offline_restored": recovered, "offline_wait_excluded_from_active_wall_time": True,
             "prompts_model_budgets_inputs_unchanged": True})

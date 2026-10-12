@@ -48,3 +48,23 @@ def test_unknown_failure_is_not_retried_or_copied(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="Unreviewed failure"):
         recovery.prepare(parent, output)
     assert not output.exists()
+
+
+def test_quote_boundary_recovery_preserves_all_field_bytes():
+    good = r'{"diagnostics":[{"message":"keep \\rho and sign","evidence":{"quote":"Since M \\gg m"},"rule_refs":[]}]}'
+    bad = good.replace('"Since M', r'\"Since M').replace('m"}', r'm\"}')
+    repaired, edits = recovery.repair_quote_boundary(bad)
+    assert repaired == good
+    assert json.loads(repaired) == json.loads(good)
+    assert edits[0]["removed_structural_backslashes"] == 2
+    assert recovery.repair_quote_boundary(good) == (good, [])
+
+
+@pytest.mark.parametrize("bad", [
+    r'{"diagnostics":[{"message":\"do not repair\"}]}',
+    r'{"diagnostics":[{"evidence":{"quote":\"unterminated}}]}',
+    r'{"diagnostics":[{"evidence":{"quote":\"text\"}},broken]}',
+])
+def test_other_or_incomplete_syntax_not_reconstructed(bad):
+    with pytest.raises((json.JSONDecodeError, ValueError)):
+        recovery.repair_quote_boundary(bad)
