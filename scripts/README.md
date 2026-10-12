@@ -18,6 +18,7 @@
 | `run_retrieval_comparison.py` | 四组检索；`development` 预跑、`retrieval_batch` 运行已冻结的 50 条；保存 API 请求和工具记录，不含 checker 与物理计分 |
 | `run_retrieval_checker.py` | 将上述冻结候选接回原 Qwen checker、定位和发布；`--prepare-only` 无 API 调用，完整请求一致时共享原始响应 |
 | `run_continuous_context_v2.py` | 固定 GPT-OSS 连续会话对照：C0p 纯模型与 C3 问题驱动规则辅助，各 50 题；共用引文协议，自动保存及计分 |
+| `run_bench_reannotation.py` | 完整 99 题的四轮机器重标；盲复标不看初标，旧 GT 与 verifier 输出不进入提示；`audit` 离线核验，结果待人工裁定 |
 
 `run_physics_eval_pipeline.py` 要求显式传入规则库，使用当前 conda 解释器；`validation/final` 要求 clean worktree。运行配置与输出身份按 [实验清单](../experiments/README.md)保存。
 
@@ -53,6 +54,10 @@ nohup "$PYTHON_BIN" -u -m scripts.run_continuous_context_v2 run --output "$RUN_D
 启动后先等待断连确认（最长 10 分钟），再执行 1 次原生工具 IO 探针和 5 个集外样例×2 组；工程验收不要求物理判定全正确。通过后按题目轮换两组，自动完成 100 项正式任务及旧位置 P/R/F1 计分。不修改提示、模型或预算参数，不重跑空诊断/零检索结果；技术故障保存原始证据并停止，不自动重试或换模型。创建 `STOP` 可在当前题结束后停止新任务；重启先核实进程和锁。
 
 查看 `execution_status.json`、`formal/progress.json` 和 `runner.log`。最终 `metrics_automatic_proxy_unreviewed.json` 包含完整三指标、修正前后分数、未定位数、用量和位置命中增减。未完成组不给伪完整分数；旧位置分数不是物理正确率。只读重计分用同入口 `score` 模式。配置发生变化时拒绝混入同批次，不能删除原文件绕过校验。
+
+## Bench 重标
+
+重标入口使用 `conda run -n physicsverifier python scripts/run_bench_reannotation.py --source <99题历史输入> --output <原结果目录> --env .env --mode pilot|formal|audit --recover-technical`，`.env` 使用 `OPENAI_BASE_URL/OPENAI_API_KEY`，实际模型固定 `gpt-6.1-sol`、high。先做固定 5 题四轮试跑；`supervise_bench_reannotation.py` 可在工程验收后接续正式 396 项，同协议试跑结果复用。正式续跑先核实进程和锁，已有终稿不重抽。整批技术退避为 5/10/20/30 分钟并跨重启保留；新未知 429、鉴权、余额或内容协议异常停止，成功响应与原文哈希不符也停止。历史 HTTP 发出前的连接失败可在一次性凭据下补回请求计数，原始记录及未知 token 预留不清零；后续重启不自动加额度。查看 `progress.json`、`budget.json`、`scheduler.json` 和 `quality_audit.json`；创建 `STOP` 或发送 SIGTERM 后当前请求先落盘，再停止。机器标注完成不等于人工金标；未决、引文歧义/未定位及来源问题全部留在质量审核队列，未人工验收不能冻结为新基准。
 
 ## Checker 回放
 

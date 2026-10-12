@@ -299,8 +299,10 @@ def upstream_overloaded(record):
     data = record.get("response")
     error = data.get("error") if isinstance(data, dict) else None
     message = str(error.get("message", "")).casefold() if isinstance(error, dict) else ""
+    code = error.get("code") if isinstance(error, dict) else None
     return record.get("http_status") in {429, 500, 503} and (
-        "current group upstream load is saturated" in message or "当前模型繁忙" in message
+        code in {"server_is_overloaded", "upstream_overloaded"}
+        or "current group upstream load is saturated" in message or "当前模型繁忙" in message
     )
 
 
@@ -570,21 +572,34 @@ class Transport:
         self.requests += 1
         path = self.output / f"request_{self.requests:03d}.json"
         record = {"request": body, "endpoint": endpoint, "started_unix": time.time()}
+        if getattr(self, "record_metadata", None):
+            record["client_metadata"] = dict(self.record_metadata)
         write_json(path, record)
         start = time.monotonic()
         try:
             timeout = request_timeout or self.limits.get("request_timeout_seconds", 900)
-            with httpx.Client(timeout=max(0.001, min(timeout, self.limits["seconds"] - self.active_seconds()))) as client:
-                response = client.post(self.base + endpoint, headers={"Authorization": "Bearer " + self.key}, json=body)
-            record.update(http_status=response.status_code,request_id=response.headers.get("x-request-id"))
-            if response.headers.get("retry-after"):
-                record["retry_after"] = response.headers["retry-after"]
-            try:
-                data = response.json()
-            except ValueError:
-                record["response_text"] = response.text[:10000]
-                response.raise_for_status()  # HTML gateway errors are still retryable HTTP errors.
-                raise RuntimeError("Non-JSON API response")
+            effective_timeout = max(0.001, min(timeout, self.limits["seconds"] - self.active_seconds()))
+            connection_timeout = min(effective_timeout, self.limits.get("connect_timeout_seconds", effective_timeout))
+            with httpx.Client(timeout=httpx.Timeout(effective_timeout, connect=connection_timeout)) as client:
+                if body.get("stream"):
+                    from scripts.response_stream import read_response_stream
+                    with client.stream("POST", self.base + endpoint, headers={"Authorization": "Bearer " + self.key}, json=body) as response:
+                        data = read_response_stream(response, record, path, started=start,
+                                                    timeout=effective_timeout, save=write_json)
+                else:
+                    response = client.post(self.base + endpoint, headers={"Authorization": "Bearer " + self.key}, json=body)
+                    record.update(http_status=response.status_code, request_id=response.headers.get("x-request-id"))
+                    if response.headers.get("retry-after"):
+                        record["retry_after"] = response.headers["retry-after"]
+                    try:
+                        data = response.json()
+                    except ValueError:
+                        record["response_text"] = response.text[:10000]
+                        response.raise_for_status()
+                        raise RuntimeError("Non-JSON API response")
+                    # Preserve the body before HTTP exceptions too.
+                    record["response"] = data
+                    response.raise_for_status()
             record["response"] = data
             response.raise_for_status()
             usage = data.get("usage") or {}
