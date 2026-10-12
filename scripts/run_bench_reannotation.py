@@ -241,16 +241,25 @@ def annotation_from_record(path, body, stage, previous):
         receipt = json.loads(correction.read_text())
         if receipt.get("raw_record_sha256") != sha256_file(path):
             raise ValueError("provenance correction raw hash mismatch")
-        match = re.fullmatch(r"decisions\[(\d+)\]\.source: ([^ ]+) -> ([^ ]+)", receipt.get("change", ""))
-        if not match or not receipt.get("basis") or receipt.get("new_generation_calls") != 0:
+        if not receipt.get("basis") or receipt.get("new_generation_calls") != 0:
             raise ValueError("unsupported provenance correction receipt")
-        index, old, new = int(match[1]), match[2], match[3]
-        if annotation["decisions"][index]["source"] != old:
-            raise ValueError("provenance correction source mismatch")
+        changes = receipt.get("changes")
+        if changes is None:
+            match = re.fullmatch(r"decisions\[(\d+)\]\.source: ([^ ]+) -> ([^ ]+)", receipt.get("change", ""))
+            if not match:
+                raise ValueError("unsupported provenance correction receipt")
+            changes = [{"index":int(match[1]), "from":match[2], "to":match[3]}]
+        if not isinstance(changes, list) or not changes:
+            raise ValueError("invalid provenance changes")
         allowed = {n+":"+e["root_id"] for n, data in previous.items() for e in data["errors"]}
-        if new not in allowed:
-            raise ValueError("provenance correction target is not in actual input")
-        annotation["decisions"][index]["source"] = new
+        for change in changes:
+            old, new = change["from"], change["to"]
+            indices = [i for i, d in enumerate(annotation["decisions"]) if d["source"] == old]
+            if len(indices) != 1 or ("index" in change and change["index"] != indices[0]):
+                raise ValueError("provenance correction source mismatch")
+            if new not in allowed:
+                raise ValueError("provenance correction target is not in actual input")
+            annotation["decisions"][indices[0]]["source"] = new
     return evidence(annotation, body["input"]["prediction"], stage, previous)
 
 
