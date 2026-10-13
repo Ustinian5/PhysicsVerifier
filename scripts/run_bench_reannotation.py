@@ -63,6 +63,13 @@ INSTRUCTIONS = {
 }
 
 
+class DecisionCoverageError(ValueError):
+    """A complete response needs provenance review, not another generation."""
+    def __init__(self, missing):
+        self.missing = sorted(missing)
+        super().__init__("unreviewed incoming items: " + str(self.missing))
+
+
 def evidence(payload, solution, stage, previous):
     if not isinstance(payload, dict) or payload.get("assessment") not in {
         "errors_found", "no_errors_found", "partially_evaluable", "insufficient_context"
@@ -135,7 +142,7 @@ def evidence(payload, solution, stage, previous):
         required = {name + ":" + e["root_id"] for name, data in previous.items() for e in data["errors"]}
         covered = {d["source"] for d in payload["decisions"]}
         if required - covered:
-            raise ValueError("unreviewed incoming items: " + str(sorted(required - covered)))
+            raise DecisionCoverageError(required - covered)
     return payload
 
 
@@ -291,6 +298,21 @@ def write_result(out, folder, stage, row, previous, path):
     return result
 
 
+def hold_decision_coverage(out, path, exc):
+    """Quarantine just this response; never correct its content or reroll it."""
+    hold = {"id": path.parent.name, "stage": path.parent.parent.name.removeprefix("arm_"),
+            "reason": "decision_coverage_needs_review", "response_record": str(path.relative_to(out)),
+            "response_record_sha256": sha256_file(path), "missing_sources": exc.missing,
+            "new_generation_calls": 0}
+    receipt = path.parent / "decision_coverage_hold.json"
+    if receipt.exists():
+        if json.loads(receipt.read_text()) != hold:
+            raise ValueError("decision coverage hold evidence changed")
+    else:
+        write_json(receipt, hold)
+    return hold
+
+
 def audit(out, inputs, config):
     """Recompute evidence from raw responses; never judge or change physics here."""
     completed = {stage: 0 for stage in STAGES}
@@ -346,6 +368,26 @@ def audit(out, inputs, config):
                 and failure_kind(rec, path.parent) is None and not (path.parent/"result.json").exists()):
             technical_holds.append({"id": path.parent.name, "stage": path.parent.parent.name.removeprefix("arm_"),
                                     "reason": "historical_429_requires_cause", "records": [str(path.relative_to(out))]})
+    content_holds = []
+    for row in inputs:
+        for stage in STAGES:
+            folder = out / ("arm_"+stage) / row["id"]
+            receipt = folder / "decision_coverage_hold.json"
+            if not receipt.exists() or (folder / "result.json").exists():
+                continue
+            hold = json.loads(receipt.read_text())
+            raw = (out / hold["response_record"]).resolve()
+            if raw.parent != folder.resolve() or not re.fullmatch(r"request_\d+\.json", raw.name):
+                raise ValueError("decision coverage hold points outside its task")
+            previous = previous_annotations(out, stage, row["id"])
+            if previous is None:
+                raise ValueError("decision coverage hold has missing dependencies")
+            try:
+                annotation_from_record(raw, task_body(stage, row, previous), stage, previous)
+            except DecisionCoverageError as exc:
+                content_holds.append(hold_decision_coverage(out, raw, exc))
+            else:
+                raise ValueError("decision coverage hold no longer matches validation")
     # Fix the spot-check sample now, before annotations are complete or scores exist.
     human_spotcheck = sorted(random.Random(20261012).sample([r["id"] for r in inputs], min(10, len(inputs))))
     report = {"updated_unix": time.time(), "model": MODEL, "reasoning_effort": "high",
@@ -353,6 +395,7 @@ def audit(out, inputs, config):
               "completed_tasks": sum(completed.values()), "fully_annotated_questions": len(final_ids),
               "final_ids": final_ids, "preserved_results": preserved,
               "technical_holds": technical_holds,
+              "content_holds": content_holds,
               "statistics": request_statistics(records, sum(completed.values()), {**config, "max_requests": execution_limits(out, config, records)["requests"]}),
               "human_review_queue": findings, "fixed_human_spotcheck_ids": human_spotcheck,
               "human_gold": False, "label_freeze_ready": False,
@@ -386,13 +429,16 @@ def run(args):
         (out / "runner.pid").write_text(str(os.getpid()))
         stop_file = out / "STOP"
         stop_requested = False
+        stop_reason = None
         def request_stop(signum, frame):
-            nonlocal stop_requested
+            nonlocal stop_requested, stop_reason
             stop_requested = True  # Allow the current request to persist its response.
+            stop_reason = {"source": "signal", "signal": signal.Signals(signum).name,
+                           "received_unix": time.time()}
         old_handlers = {sig: signal.signal(sig, request_stop) for sig in (signal.SIGTERM, signal.SIGINT)}
         progress = {"mode": args.mode, "state": "starting", "pid": os.getpid(),
                     "completed": initial_audit["completed"], "runtime_policy": POLICY,
-                    "held_tasks": initial_audit["technical_holds"],
+                    "held_tasks": initial_audit["technical_holds"] + initial_audit["content_holds"],
                     "request_capacity": initial_audit["statistics"], "updated_unix": time.time()}
         budget = None
         def update(**fields):
@@ -458,13 +504,17 @@ def run(args):
                         paths = sorted(folder.glob("request_*.json"))
                         records = [(p, json.loads(p.read_text())) for p in paths]
                         recovered = None
+                        content_hold = None
                         held_429 = []
                         for path, rec in records:
                             validate_request(rec, body)
                             if (rec.get("response") or {}).get("status") == "completed":
                                 # A received complete response is authoritative even if the
                                 # process died before serializing result.json. Never regenerate.
-                                recovered = write_result(out, folder, stage, row, previous, path)
+                                try:
+                                    recovered = write_result(out, folder, stage, row, previous, path)
+                                except DecisionCoverageError as exc:
+                                    content_hold = hold_decision_coverage(out, path, exc)
                                 break
                             if rec.get("http_status") == 429 and sha256_file(path) in acknowledged_429:
                                 # An earlier operator receipt based only on balance
@@ -477,6 +527,11 @@ def run(args):
                         if recovered:
                             made_progress = True
                             update(state="running", active_task=None)
+                            continue
+                        if content_hold:
+                            deferred.append(content_hold)
+                            holds = [h for h in progress.get("held_tasks", []) if (h["id"], h["stage"]) != (sid, stage)]
+                            update(held_tasks=holds+[content_hold], active_task=None)
                             continue
                         if held_429:
                             hold = {"id": sid, "stage": stage, "reason": "historical_429_requires_cause", "records": held_429}
@@ -520,6 +575,12 @@ def run(args):
                                 raise  # Budget/quota failure before HTTP dispatch.
                             rec = json.loads(path.read_text())
                             circuit.observe(path, rec)
+                            if isinstance(exc, DecisionCoverageError):
+                                hold = hold_decision_coverage(out, path, exc)
+                                deferred.append(hold)
+                                holds = [h for h in progress.get("held_tasks", []) if (h["id"], h["stage"]) != (sid, stage)]
+                                update(state="running", held_tasks=holds+[hold], active_task=None)
+                                continue
                             if budget.stopped or not technical_failure(rec, folder) or not args.recover_technical:
                                 raise
                             deferred.append({"id": sid, "stage": stage, "reason": failure_kind(rec, folder)})
@@ -539,7 +600,8 @@ def run(args):
                     return 2
                 if not made_progress and next_ready:
                     wait_until(max(time.time()+1, min(next_ready), circuit.state["next_request_unix"]))
-            update(state="operator_stopped", active_task=None)
+            update(state="operator_stopped", active_task=None,
+                   stop_reason=stop_reason or {"source": "STOP_file", "path": str(stop_file)})
             return 0
         except Exception as exc:
             update(state="stopped", error_type=type(exc).__name__, error=str(exc)[:500])

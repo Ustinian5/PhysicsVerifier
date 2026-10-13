@@ -230,6 +230,50 @@ class RecoveryTests(unittest.TestCase):
                 with self.assertRaises(ValueError):run(args)
             self.assertEqual(len(calls),1)
 
+    def test_final_source_mismatch_holds_one_task_and_finishes_other_questions(self):
+        args = self.setup_pilot()
+        rows, cfg = prepare(args.source, args.output, 'https://fixture.invalid/v1')
+        sid = next(r['id'] for r in rows if r['id'] in cfg['pilot_ids'])
+        calls = []
+        claim = dict(root_id='E1', claim='wrong force', reason='check force balance',
+                     correct_relation='F = ma', quote='solution', category='physics',
+                     premises='', status='confirmed', depends_on=[])
+        def handler(request):
+            task = json.loads(json.loads(request.content)['input'])
+            calls.append(task)
+            a = copy.deepcopy(EMPTY)
+            if task['input']['id'] == sid and not task['task'].startswith('In this fresh'):
+                a['assessment'], a['errors'] = 'errors_found', [copy.deepcopy(claim)]
+                if task['previous_annotations']:
+                    # Final repeats initial:E1, instead of its supplied review:E1.
+                    a['decisions'] = [{'source':'initial:E1', 'action':'retain', 'reason':'same claim'}]
+            return sse_response([{'type':'response.completed', 'response':terminal(json.dumps(a))}])
+        with patch.dict(os.environ, OPENAI_BASE_URL='https://fixture.invalid/v1', OPENAI_API_KEY='test-only'), self.client(handler), patch('scripts.run_bench_reannotation.platform_quota_probe', return_value={'total_available':100000000, 'unlimited_quota':False}):
+            self.assertEqual(run(args), 2)
+            self.assertEqual(len(calls), 20)
+            folder = args.output/'arm_final'/sid
+            self.assertFalse((folder/'result.json').exists())
+            receipt = json.loads((folder/'decision_coverage_hold.json').read_text())
+            self.assertEqual(receipt['missing_sources'], ['review:E1'])
+            report = json.loads((args.output/'quality_audit.json').read_text())
+            self.assertEqual(report['completed_tasks'], 19)
+            self.assertEqual(report['fully_annotated_questions'], 4)
+            self.assertEqual(len(report['content_holds']), 1)
+            self.assertFalse(report['label_freeze_ready'])
+            self.assertFalse((args.output/'machine_reference.json').exists())
+            before = {str(p):p.read_bytes() for p in args.output.glob('arm*/*/result.json')}
+            raw_before = (folder/'request_001.json').read_bytes()
+            self.assertEqual(run(args), 2)
+            self.assertEqual(len(calls), 20)  # Held completed content is never rerolled.
+            self.assertEqual(raw_before, (folder/'request_001.json').read_bytes())
+            self.assertEqual(before, {str(p):p.read_bytes() for p in args.output.glob('arm*/*/result.json')})
+            # A corrupted hold receipt stops before any generation.
+            receipt['missing_sources'] = []
+            write_json(folder/'decision_coverage_hold.json', receipt)
+            with self.assertRaisesRegex(ValueError, 'hold evidence changed'):
+                run(args)
+            self.assertEqual(len(calls), 20)
+
     def test_completed_response_survives_crash_before_result_write(self):
         args=self.setup_pilot();rows,cfg=prepare(args.source,args.output,'https://fixture.invalid/v1')
         row=next(r for r in rows if r['id'] in cfg['pilot_ids'])
