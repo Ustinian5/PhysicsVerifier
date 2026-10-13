@@ -356,9 +356,10 @@ def score(output):
                   "Legacy offset normalization maps a zero start offset to -1; preserved for common scoring",
                   "Location overlap does not verify the physical reason"]}
     if len(scores) == 2:
-        report["changes_from_C0p"] = r.matched_claim_differences(scores["C0p"], scores["C3"])
+        rule_arm = next(a for a in protocol.ARMS if a != "C0p")
+        report["changes_from_C0p"] = r.matched_claim_differences(scores["C0p"], scores[rule_arm])
         report["all_three_point_estimates_not_lower"] = all(
-            scores["C3"]["summary"][k] >= scores["C0p"]["summary"][k] for k in ("precision", "recall", "f1"))
+            scores[rule_arm]["summary"][k] >= scores["C0p"]["summary"][k] for k in ("precision", "recall", "f1"))
     r.write_json(output / "metrics_automatic_proxy_unreviewed.json", report)
     return report
 

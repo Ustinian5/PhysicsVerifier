@@ -253,6 +253,9 @@ def assert_no_control_tokens(messages: list[dict[str, str]]) -> None:
 
 
 def prompt_messages(row: dict[str, Any], *, rules: bool, tree_root: Any = None, review_protocol: str = "optional") -> list[dict[str, str]]:
+    if review_protocol == "continuous_assessment_then_rules_v3":
+        from scripts.continuous_context_v3 import messages
+        return messages(row, rules=rules, tree_root=tree_root)
     if review_protocol == "continuous_issue_driven_v2":
         from scripts.continuous_context_v2 import messages
         return messages(row, rules=rules, tree_root=tree_root)
@@ -413,7 +416,7 @@ def execute_action(corpus: Corpus, action: str, args: dict[str, Any], *, tree_ac
 
 
 def initial_state(row: dict[str, Any], *, arm: str, catalog: dict[str, Any], max_chars: int, review_protocol: str = "optional") -> dict[str, Any]:
-    tree_access = arm in {"tree_self_check", "C1", "C2", "C3"}
+    tree_access = arm in {"tree_self_check", "C1", "C2", "C3", "C4"}
     corpus = Corpus(catalog, tree=tree_access)
     root_view = None
     if tree_access:
@@ -455,9 +458,12 @@ def run_sample(row: dict[str, Any], *, arm: str, catalog: dict[str, Any], tokeni
     if limits.get("review_protocol") == "forced_rules_native_v1" or (arm not in {"C0", "C0p"} and limits.get("review_protocol", "").startswith("continuous_")):
         from scripts.gpt_oss_rule_protocol import native_tools
         functions = native_tools(state["tree_access"])
-    v2 = limits.get("review_protocol") == "continuous_issue_driven_v2"
+    v2 = limits.get("review_protocol") in {"continuous_issue_driven_v2", "continuous_assessment_then_rules_v3"}
     if v2:
-        from scripts import continuous_context_v2 as protocol
+        if limits.get("review_protocol") == "continuous_assessment_then_rules_v3":
+            from scripts import continuous_context_v3 as protocol
+        else:
+            from scripts import continuous_context_v2 as protocol
     error = ""
     try:
         while state["turn"] < limits["max_requests_per_sample"]:
@@ -553,7 +559,7 @@ def run_sample(row: dict[str, Any], *, arm: str, catalog: dict[str, Any], tokeni
                 write_json(state_path, state)
             if "diagnostics" in parsed and v2:
                 # The first physics diagnosis is immutable; at most one evidence patch.
-                protocol.audit_final(parsed, row, corpus.events, rules=arm == "C3")
+                protocol.audit_final(parsed, row, corpus.events, rules=arm in {"C3", "C4"})
                 if protocol.maybe_start_repair(parsed, row, state, limits, sample_dir, content):
                     continue
                 return protocol.finish(row, arm, model, signature, state, corpus, parsed, sample_dir,
