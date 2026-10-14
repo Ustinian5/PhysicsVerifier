@@ -13,7 +13,7 @@ from unittest.mock import patch
 import httpx
 
 from scripts.bench_reannotation_runtime import Circuit, failure_kind, request_statistics, execution_limits, provider_stream_attempts
-from scripts.run_bench_reannotation import MODEL, SYSTEM, evidence, run, prepare, task_body
+from scripts.run_bench_reannotation import MODEL, SYSTEM, evidence, run, prepare, task_body, annotation_from_record
 from scripts.run_retrieval_comparison import canonical
 from scripts.experiment_manifest import sha256_file
 from scripts.run_retrieval_comparison import Transport, BatchBudget, write_json
@@ -197,6 +197,55 @@ class RecoveryTests(unittest.TestCase):
         source=self.out/'source.json'
         source.write_text(json.dumps([{'id':str(i),'question':'question','prediction':'solution','answer':'reference','physics_error_gt':['MUST NOT BE SENT']} for i in range(99)]))
         return SimpleNamespace(env=self.out/'unused.env',source=source,output=self.out/'run',mode='pilot',recover_technical=True)
+
+    def category_fixture(self):
+        row = {'id':'x', 'question':'question', 'prediction':'solution', 'answer':'reference'}
+        body = task_body('initial', row, {})
+        annotation = copy.deepcopy(EMPTY)
+        annotation.update(assessment='errors_found', errors=[dict(
+            root_id='E1', claim='incorrect oblique path length', reason='project along the normal',
+            correct_relation='L=d/cos(theta)', quote='solution', category='geometry',
+            premises='d is normal thickness', status='confirmed', depends_on=[])])
+        raw = self.out/'request_001.json'
+        write_json(raw, {'endpoint':'/responses', 'request':{
+            'instructions':SYSTEM, 'input':canonical(body), 'text':{'format':{'type':'json_object'}},
+            'stream':True, 'model':MODEL, 'reasoning':{'effort':'high'},
+            'max_output_tokens':32768, 'store':False}, 'response':terminal(json.dumps(annotation))})
+        receipt = {'raw_record_sha256':sha256_file(raw), 'basis':'Reviewed path-length geometry as mathematical metadata only',
+                   'new_generation_calls':0, 'changes':[{'root_id':'E1','from':'geometry','to':'mathematics'}]}
+        return raw, body, annotation, receipt
+
+    def test_reviewed_category_replay_preserves_complete_content_and_raw(self):
+        raw, body, annotation, receipt = self.category_fixture()
+        before = raw.read_bytes()
+        with self.assertRaisesRegex(ValueError, 'invalid error category'):
+            annotation_from_record(raw, body, 'initial', {})
+        write_json(self.out/'category_correction.json', receipt)
+        recovered = annotation_from_record(raw, body, 'initial', {})
+        expected = copy.deepcopy(annotation)
+        expected['errors'][0]['category'] = 'mathematics'
+        self.assertEqual(recovered, evidence(expected, 'solution', 'initial', {}))
+        self.assertEqual(raw.read_bytes(), before)
+        self.assertEqual(annotation_from_record(raw, body, 'initial', {}), recovered)
+
+    def test_category_receipts_cannot_bypass_identity_or_change_other_metadata(self):
+        raw, body, _, receipt = self.category_fixture()
+        cases = []
+        for key, value in [('raw_record_sha256','invalid'), ('basis',''), ('new_generation_calls',1)]:
+            changed = copy.deepcopy(receipt); changed[key] = value; cases.append(changed)
+        for field, value in [('root_id','E2'), ('from','physics'), ('to','logic'), ('claim','edited')]:
+            changed = copy.deepcopy(receipt); changed['changes'][0][field] = value; cases.append(changed)
+        changed = copy.deepcopy(receipt); changed['changes'] *= 2; cases.append(changed)
+        for changed in cases:
+            with self.subTest(receipt=changed):
+                write_json(self.out/'category_correction.json', changed)
+                with self.assertRaises(ValueError):
+                    annotation_from_record(raw, body, 'initial', {})
+        write_json(self.out/'category_correction.json', receipt)
+        record = json.loads(raw.read_text());record['response']['model'] = 'other-model';write_json(raw,record)
+        receipt['raw_record_sha256'] = sha256_file(raw);write_json(self.out/'category_correction.json',receipt)
+        with self.assertRaisesRegex(ValueError, 'identity mismatch'):
+            annotation_from_record(raw, body, 'initial', {})
 
     def test_pilot_empty_results_complete_once_and_resume_without_calls(self):
         args=self.setup_pilot(); calls=[]

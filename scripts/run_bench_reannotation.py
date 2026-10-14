@@ -243,6 +243,29 @@ def annotation_from_record(path, body, stage, previous):
     if any(type(usage.get(k)) is not int or usage[k] < 0 for k in ("input_tokens", "output_tokens")):
         raise ValueError("missing or invalid response usage")
     annotation = extract(response)
+    # A reviewed enum correction changes metadata only. The original completed
+    # response remains authoritative; unsupported categories still stop by default.
+    category_receipt = path.parent / "category_correction.json"
+    if category_receipt.exists():
+        receipt = json.loads(category_receipt.read_text())
+        if receipt.get("raw_record_sha256") != sha256_file(path):
+            raise ValueError("category correction raw hash mismatch")
+        if not isinstance(receipt.get("basis"), str) or not receipt["basis"].strip() or receipt.get("new_generation_calls") != 0:
+            raise ValueError("unsupported category correction receipt")
+        changes = receipt.get("changes")
+        if not isinstance(changes, list) or not changes:
+            raise ValueError("invalid category corrections")
+        seen = set()
+        for change in changes:
+            if (not isinstance(change, dict) or set(change) != {"root_id", "from", "to"}
+                    or change["from"] != "geometry" or change["to"] != "mathematics"
+                    or change["root_id"] in seen):
+                raise ValueError("unsupported category correction")
+            matches = [e for e in annotation["errors"] if e["root_id"] == change["root_id"]]
+            if len(matches) != 1 or matches[0]["category"] != change["from"]:
+                raise ValueError("category correction root mismatch")
+            matches[0]["category"] = change["to"]
+            seen.add(change["root_id"])
     correction = path.parent / "provenance_correction.json"
     if correction.exists():
         receipt = json.loads(correction.read_text())
