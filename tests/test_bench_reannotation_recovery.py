@@ -342,6 +342,36 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(raw.read_bytes(),before)
         self.assertTrue((folder/'result.json').exists())
 
+    def test_later_complete_response_recovers_after_prior_provider_refusal(self):
+        args = self.setup_pilot()
+        rows, cfg = prepare(args.source, args.output, 'https://fixture.invalid/v1')
+        row = next(r for r in rows if r['id'] in cfg['pilot_ids'])
+        folder = args.output/'arm_initial'/row['id'];folder.mkdir(parents=True)
+        request = {'instructions':SYSTEM, 'input':canonical(task_body('initial',row,{})),
+                   'text':{'format':{'type':'json_object'}}, 'stream':True, 'model':MODEL,
+                   'reasoning':{'effort':'high'}, 'max_output_tokens':32768, 'store':False}
+        refused, complete = folder/'request_001.json', folder/'request_002.json'
+        write_json(refused, {'endpoint':'/responses','request':request,'http_status':429,
+                            'response':{'error':{'code':'model_cooldown','message':'usage_limit_reached'}}})
+        write_json(complete, {'endpoint':'/responses','request':request,'http_status':200,'response':terminal()})
+        before = {p:p.read_bytes() for p in [refused,complete]};calls=[]
+        def handler(request):
+            calls.append(json.loads(request.content))
+            return sse_response([{'type':'response.completed','response':terminal()}])
+        with patch.dict(os.environ,OPENAI_BASE_URL='https://fixture.invalid/v1',OPENAI_API_KEY='test-only'), self.client(handler), patch('scripts.run_bench_reannotation.platform_quota_probe',return_value={'total_available':100000000,'unlimited_quota':False}):
+            self.assertEqual(run(args),0)
+            self.assertEqual(len(calls),19)
+            self.assertEqual(before,{p:p.read_bytes() for p in before})
+            saved=json.loads((folder/'result.json').read_text())
+            self.assertTrue(saved['response_record'].endswith('request_002.json'))
+            # A complete result cannot conceal a changed historical envelope.
+            bad=json.loads(refused.read_text());bad['request']['model']='other-model';write_json(refused,bad)
+            for stage in ('initial','blind','review','final'):
+                (args.output/('arm_'+stage)/row['id']/'result.json').unlink()
+            with self.assertRaisesRegex(ValueError,'frozen protocol'):
+                run(args)
+            self.assertEqual(len(calls),19)
+
     def test_overload_enters_batch_cooldown_before_any_different_task(self):
         args=self.setup_pilot();calls=[]; observed=[]
         def handler(request):

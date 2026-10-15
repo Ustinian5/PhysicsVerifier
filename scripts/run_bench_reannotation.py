@@ -531,6 +531,13 @@ def run(args):
                         held_429 = []
                         for path, rec in records:
                             validate_request(rec, body)
+                        # A later, fully received response can be recovered even
+                        # when an earlier attempt was refused. Validate every
+                        # envelope first, then use the earliest complete content;
+                        # this never authorizes a retry of a refusal by itself.
+                        complete = [(path, rec) for path, rec in records
+                                    if (rec.get("response") or {}).get("status") == "completed"]
+                        for path, rec in complete or records:
                             if (rec.get("response") or {}).get("status") == "completed":
                                 # A received complete response is authoritative even if the
                                 # process died before serializing result.json. Never regenerate.
