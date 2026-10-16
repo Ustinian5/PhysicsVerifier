@@ -129,7 +129,13 @@ def completed_at(path, record):
 
 
 def task_ready_at(path, record):
-    return max(record.get("started_unix", 0) + POLICY["unknown_request_wait_seconds"],
+    # Only an uncertain dispatch/completion needs the duplicate-billing wait.
+    # A positively reported rejection or a pre-HTTP connection failure does not.
+    unknown = failure_kind(record, path.parent) in {
+        "transport_disconnect_unknown_completion", "interrupted_request_unknown_completion",
+        "stream_eof_unknown_completion",
+    }
+    return max(record.get("started_unix", 0) + POLICY["unknown_request_wait_seconds"] if unknown else 0,
                completed_at(path, record) + POLICY["task_cooldown_seconds"],
                retry_after_deadline(record))
 

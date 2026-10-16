@@ -11,6 +11,7 @@ import signal
 import sys
 import time
 from pathlib import Path
+import httpx
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -70,7 +71,7 @@ class DecisionCoverageError(ValueError):
         super().__init__("unreviewed incoming items: " + str(self.missing))
 
 
-def evidence(payload, solution, stage, previous):
+def evidence(payload, solution, stage, previous, reviewed_sources=()):
     if not isinstance(payload, dict) or payload.get("assessment") not in {
         "errors_found", "no_errors_found", "partially_evaluable", "insufficient_context"
     }:
@@ -140,7 +141,7 @@ def evidence(payload, solution, stage, previous):
             raise ValueError("invalid action")
     if stage in {"review", "final"}:
         required = {name + ":" + e["root_id"] for name, data in previous.items() for e in data["errors"]}
-        covered = {d["source"] for d in payload["decisions"]}
+        covered = {d["source"] for d in payload["decisions"]} | set(reviewed_sources)
         if required - covered:
             raise DecisionCoverageError(required - covered)
     return payload
@@ -266,6 +267,7 @@ def annotation_from_record(path, body, stage, previous):
                 raise ValueError("category correction root mismatch")
             matches[0]["category"] = change["to"]
             seen.add(change["root_id"])
+    reviewed_sources = []
     correction = path.parent / "provenance_correction.json"
     if correction.exists():
         receipt = json.loads(correction.read_text())
@@ -273,13 +275,19 @@ def annotation_from_record(path, body, stage, previous):
             raise ValueError("provenance correction raw hash mismatch")
         if not receipt.get("basis") or receipt.get("new_generation_calls") != 0:
             raise ValueError("unsupported provenance correction receipt")
+        if ("previous_annotations_sha256" in receipt
+                and receipt["previous_annotations_sha256"] != digest(previous)):
+            raise ValueError("provenance correction input hash mismatch")
         changes = receipt.get("changes")
-        if changes is None:
+        aliases = receipt.get("coverage_aliases", [])
+        if changes is None and not aliases:
             match = re.fullmatch(r"decisions\[(\d+)\]\.source: ([^ ]+) -> ([^ ]+)", receipt.get("change", ""))
             if not match:
                 raise ValueError("unsupported provenance correction receipt")
             changes = [{"index":int(match[1]), "from":match[2], "to":match[3]}]
-        if not isinstance(changes, list) or not changes:
+        if changes is None:
+            changes = []
+        if not isinstance(changes, list) or (not changes and not aliases):
             raise ValueError("invalid provenance changes")
         allowed = {n+":"+e["root_id"] for n, data in previous.items() for e in data["errors"]}
         for change in changes:
@@ -290,7 +298,49 @@ def annotation_from_record(path, body, stage, previous):
             if new not in allowed:
                 raise ValueError("provenance correction target is not in actual input")
             annotation["decisions"][indices[0]]["source"] = new
-    return evidence(annotation, body["input"]["prediction"], stage, previous)
+        if not isinstance(aliases, list):
+            raise ValueError("invalid reviewed coverage aliases")
+        covered = {d["source"] for d in annotation["decisions"]}
+        for alias in aliases:
+            if (not isinstance(alias, dict) or set(alias) != {"source", "decision_source", "basis"}
+                    or alias["source"] not in allowed or alias["source"] in covered
+                    or alias["source"] in reviewed_sources or alias["decision_source"] not in allowed
+                    or sum(d["source"] == alias["decision_source"] for d in annotation["decisions"]) != 1
+                    or not isinstance(alias["basis"], str) or not alias["basis"].strip()):
+                raise ValueError("unsupported reviewed coverage alias")
+            reviewed_sources.append(alias["source"])
+        if aliases:
+            # Metadata acknowledges an explicitly reviewed duplicate allegation.
+            # Do not invent a new model decision or change any physical content.
+            annotation["decision_coverage_validation"] = {
+                "reviewed_aliases": aliases, "raw_record_sha256": sha256_file(path),
+                "reviewer": "Codex offline provenance review; not human physical adjudication",
+            }
+    return evidence(annotation, body["input"]["prediction"], stage, previous, reviewed_sources)
+
+
+def await_startup_quota(base, key, stopping, wait_until, update):
+    """Transient metadata outages must not kill a validated, detached batch."""
+    failures = 0
+    while not stopping():
+        try:
+            return platform_quota_probe(base, key)
+        except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if isinstance(exc, httpx.HTTPStatusError) and status not in {408, 500, 502, 503, 504}:
+                raise  # Unknown 429/authentication are never retried here.
+            delays = POLICY["global_backoff_seconds"]
+            failures += 1
+            deadline = time.time() + delays[min(failures, len(delays))-1]
+            response = getattr(exc, "response", None)
+            if response is not None:
+                from scripts.run_retrieval_comparison import retry_after_deadline
+                deadline = max(deadline, retry_after_deadline({
+                    "retry_after": response.headers.get("retry-after"), "started_unix": time.time()}))
+            update(quota_probe_retry={"error_type": type(exc).__name__, "http_status": status,
+                                      "failures": failures, "next_probe_unix": deadline})
+            wait_until(deadline)
+    return None
 
 
 def validate_saved(out, stage, row, previous):
@@ -498,9 +548,16 @@ def run(args):
             budget = BatchBudget(out, limits, quota_probe=lambda: platform_quota_probe(base, key),
                 quota_floor=config["platform_quota_floor"], retry_overload=True, stop_file=stop_file)
             budget._save()
-            quota = platform_quota_probe(base, key)
+            quota = await_startup_quota(base, key, stopping, wait_until, update)
+            if quota is None:
+                update(state="operator_stopped", active_task=None,
+                       stop_reason=stop_reason or {"source": "STOP_file", "path": str(stop_file)})
+                return 0
             if not quota["unlimited_quota"] and quota["total_available"] <= config["platform_quota_floor"]:
                 raise BatchBudgetExceeded("platform_quota_low")
+            budget.platform_quota = quota
+            budget.next_quota_check = time.time() + 60
+            budget._save()
             acknowledged = out / "rate_limit_recovery.json"
             acknowledged_429 = set(json.loads(acknowledged.read_text()).get("request_record_sha256", [])) if acknowledged.exists() else set()
             circuit = Circuit(out)
@@ -624,7 +681,10 @@ def run(args):
                         write_json(out / "machine_reference.json", [{"id": row["id"], **json.loads((out / "arm_final" / row["id"] / "result.json").read_text())["annotation"], "human_review": "pending"} for row in inputs])
                     update(state="pilot_complete_pending_acceptance" if args.mode == "pilot" else "machine_annotation_complete_human_review_pending", active_task=None, quality_audit="quality_audit.json")
                     return 0
-                update(deferred=deferred, active_task=None)
+                update(deferred=deferred, active_task=None,
+                       blocked_tasks=deferred,
+                       blocked_counts={reason: sum(d["reason"] == reason for d in deferred)
+                                       for reason in {d["reason"] for d in deferred}})
                 if not made_progress and not next_ready:
                     update(state="stopped_needs_review" if progress.get("held_tasks") else "stopped_technical_exhausted")
                     return 2

@@ -12,8 +12,8 @@ from unittest.mock import patch
 
 import httpx
 
-from scripts.bench_reannotation_runtime import Circuit, failure_kind, request_statistics, execution_limits, provider_stream_attempts
-from scripts.run_bench_reannotation import MODEL, SYSTEM, evidence, run, prepare, task_body, annotation_from_record
+from scripts.bench_reannotation_runtime import Circuit, failure_kind, request_statistics, execution_limits, provider_stream_attempts, task_ready_at
+from scripts.run_bench_reannotation import MODEL, SYSTEM, evidence, run, prepare, task_body, annotation_from_record, await_startup_quota, DecisionCoverageError
 from scripts.run_retrieval_comparison import canonical
 from scripts.experiment_manifest import sha256_file
 from scripts.run_retrieval_comparison import Transport, BatchBudget, write_json
@@ -143,6 +143,85 @@ class RecoveryTests(unittest.TestCase):
         circuit = Circuit(self.out)
         circuit.observe(path, rec)
         self.assertGreater(circuit.state["next_request_unix"], time.time()+3500)
+
+    def test_duplicate_completion_wait_only_applies_to_uncertain_dispatch(self):
+        for fields in [dict(http_status=503), dict(error_type='ConnectError'),
+                       dict(http_status=200, stream_error={'code':'server_is_overloaded'})]:
+            path, rec = self.record(**fields)
+            self.assertLess(task_ready_at(path, rec), time.time()+650)
+        path, rec = self.record(retryable_transport_error=True)
+        self.assertGreater(task_ready_at(path, rec), time.time()+1750)
+        path, rec = self.record(http_status=503, retry_after='3600')
+        self.assertGreater(task_ready_at(path, rec), time.time()+3500)
+
+    def test_startup_quota_transient_outage_waits_without_generating(self):
+        waits, updates = [], []
+        request = httpx.Request('GET', 'https://fixture.invalid/usage')
+        bad = httpx.HTTPStatusError('temporary', request=request,
+             response=httpx.Response(503, request=request, headers={'retry-after':'900'}))
+        quota = {'total_available':100000000, 'unlimited_quota':False}
+        with patch('scripts.run_bench_reannotation.platform_quota_probe',
+                   side_effect=[httpx.ConnectError('connection'), bad, quota]) as probe:
+            self.assertEqual(await_startup_quota('fixture','test-only',lambda:False,
+                             waits.append,lambda **kw:updates.append(kw)), quota)
+        self.assertEqual(probe.call_count,3)
+        self.assertEqual(len(waits),2)
+        self.assertGreater(waits[1],time.time()+850)
+        self.assertEqual(updates[1]['quota_probe_retry']['http_status'],503)
+
+    def test_startup_quota_auth_unknown_rate_and_bad_metadata_still_stop(self):
+        request = httpx.Request('GET','https://fixture.invalid/usage')
+        for status in [401,403,429]:
+            bad=httpx.HTTPStatusError('refused',request=request,
+                                     response=httpx.Response(status,request=request))
+            with patch('scripts.run_bench_reannotation.platform_quota_probe',side_effect=bad) as probe:
+                with self.assertRaises(httpx.HTTPStatusError):
+                    await_startup_quota('fixture','test-only',lambda:False,
+                                       lambda _:self.fail('must not retry'),lambda **kw:None)
+                self.assertEqual(probe.call_count,1)
+        with patch('scripts.run_bench_reannotation.platform_quota_probe',side_effect=ValueError('bad metadata')):
+            with self.assertRaises(ValueError):
+                await_startup_quota('fixture','test-only',lambda:False,
+                                   lambda _:self.fail('must not retry'),lambda **kw:None)
+
+    def test_startup_quota_wait_respects_stop_without_another_probe(self):
+        stopped=[]
+        with patch('scripts.run_bench_reannotation.platform_quota_probe',side_effect=httpx.ConnectError('connection')) as probe:
+            self.assertIsNone(await_startup_quota('fixture','test-only',lambda:bool(stopped),
+                              lambda _:stopped.append(True),lambda **kw:None))
+        self.assertEqual(probe.call_count,1)
+
+    def test_explicit_duplicate_source_review_preserves_model_decisions(self):
+        row={'id':'fixture','question':'q','context':'','prediction':'solution','answer':''}
+        claim=dict(root_id='E1',claim='same numerical error',reason='arithmetic',
+                   correct_relation='1+1=2',quote='solution',category='mathematics',
+                   premises='',status='confirmed',depends_on=[])
+        previous={name:{**copy.deepcopy(EMPTY),'errors':[copy.deepcopy(claim)],
+                        'assessment':'errors_found'} for name in ['initial','blind']}
+        a={**copy.deepcopy(EMPTY),'errors':[copy.deepcopy(claim)],'assessment':'errors_found',
+           'decisions':[{'source':'blind:E1','action':'retain','reason':'same arithmetic root'}]}
+        body=task_body('review',row,previous); raw=self.out/'request_001.json'
+        write_json(raw,{'endpoint':'/responses','request':{'instructions':SYSTEM,'input':canonical(body),
+                        'text':{'format':{'type':'json_object'}},'model':MODEL,
+                        'reasoning':{'effort':'high'},'max_output_tokens':32768,'store':False},
+                        'response':terminal(json.dumps(a))})
+        with self.assertRaises(DecisionCoverageError):annotation_from_record(raw,body,'review',previous)
+        original=raw.read_bytes()
+        receipt={'raw_record_sha256':sha256_file(raw),'basis':'Reviewed duplicate numerical allegation',
+                 'new_generation_calls':0,'changes':[], 'coverage_aliases':[
+                   {'source':'initial:E1','decision_source':'blind:E1','basis':'Both allege the same arithmetic root.'}]}
+        write_json(self.out/'provenance_correction.json',receipt)
+        recovered=annotation_from_record(raw,body,'review',previous)
+        self.assertEqual(recovered['decisions'],a['decisions'])
+        self.assertIn('decision_coverage_validation',recovered)
+        self.assertEqual(raw.read_bytes(),original)
+        for source in ['initial:E2','blind:E1']:
+            bad=copy.deepcopy(receipt);bad['coverage_aliases'][0]['source']=source
+            write_json(self.out/'provenance_correction.json',bad)
+            with self.assertRaises(ValueError):annotation_from_record(raw,body,'review',previous)
+        bad=copy.deepcopy(receipt);bad['raw_record_sha256']='tampered'
+        write_json(self.out/'provenance_correction.json',bad)
+        with self.assertRaisesRegex(ValueError,'raw hash mismatch'):annotation_from_record(raw,body,'review',previous)
 
     def test_restart_replays_failure_after_last_scheduler_checkpoint(self):
         circuit=Circuit(self.out)
