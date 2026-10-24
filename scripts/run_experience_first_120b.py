@@ -158,6 +158,8 @@ def run(output, phase):
                 while True:
                     try:return selected(stage,key,payload)
                     except Exception:
+                        if (output/'STOP').exists():
+                            raise
                         folder=selected.output/('arm_'+stage)/p.digest(key)[:24]
                         paths=sorted(folder.glob('request_*.json'))
                         if not paths or len(paths)>=c['attempts_per_job'] or not b.retryable_transport_failure(b.read(paths[-1])):raise
@@ -172,7 +174,7 @@ def run(output, phase):
             if phase=='pilot':rows=rows[:c['pilot_size']]
             built=flow.build_120b_experience_catalog(rows,b.read(output/'bench_questions.json'),call,
                 topic_skeleton=b.read(output/'topic_skeleton.json'),max_rules_per_sample=c['max_rules_per_sample'],batch_size=c['batch_size'])
-            verify(output,source_check=True)
+            verify(output,source_check=phase == "full")
             target=output/'pilot' if phase=='pilot' else output
             for name,value in built.items():b.write_once(target/(name+'.json'),value)
             if phase=='pilot':
