@@ -24,6 +24,180 @@ from scripts.validate_unified_catalog_structure import validate_catalog_structur
 DEFAULT_DATASET = "3000"
 
 
+EXPERIENCE_TAXONOMY_INSTRUCTION = """输入是原框架Domain/Topic的名称与层级，不含旧规则、题目或参考答案。
+保留全部领域/主题的id、name和层级，不增删、改名或合并。为每个Domain与Topic补充简短的中文summary，
+说明通用学科范围和相邻分类边界；不生成规则、错误例子、具体题目或答案。
+输出{"domains":[{"id":"输入id","name":"输入名称","summary":"范围",
+"topics":[{"id":"输入id","name":"输入名称","summary":"范围"}]}]}。
+"""
+
+
+def experience_topic_skeleton(knowledge: Dict[str, Any]) -> Dict[str, Any]:
+    """Reuse only the old ontology labels, never its rules/summaries/examples."""
+    from rule_framework.oss120b_construction import require, text_fields
+    from scripts.build_unified_catalog import _slug
+    require(isinstance(knowledge, dict) and isinstance(knowledge.get("domains"), list), "Missing ontology")
+    domains = []
+    for domain in knowledge["domains"]:
+        text_fields(domain, ("name",))
+        require(isinstance(domain.get("topics"), list), "Missing ontology topics")
+        topics = []
+        for topic in domain["topics"]:
+            text_fields(topic, ("name",))
+            topics.append({"id": topic.get("id") or _slug(topic["name"]), "name": topic["name"]})
+        domains.append({"id": domain.get("id") or _slug(domain["name"]), "name": domain["name"], "topics": topics})
+    return {"domains": domains}
+
+
+EXPERIENCE_CLUSTER_INSTRUCTION = """为已有叶规则建立ScenarioCluster导航层，不概括或重写叶规则。
+沿用Domain→Topic→ScenarioCluster→Rule结构。按可用同一组物理前提区分的检查场景归组，
+不是要求所有叶具有完全相同的具体错误。同场景的互补检查可同簇；名称不同或题面不同不必另建簇。
+先检查已有groups；只有确实不同的检查场景才新建。不要默认一条规则一个簇，也不要为减少簇数合并不兼容前提。
+每个items.id恰好归属一次，单叶簇允许存在；规则少不应导致叶被删除。
+只输出{"new_groups":[{"key":"new1","name":"场景名","summary":"共同前提与边界"}],
+"assignments":[{"item_id":"I1","group_id":"已有G编号或new1"}]}。
+只引用本请求给出的I/G局部编号；已存在组的名称和摘要不改。此阶段仅组织导航，不判定叶规则正确性。
+"""
+
+
+def experience_120b_messages(stage: str, payload: Dict[str, Any]) -> list[Dict[str, str]]:
+    """Messages for the opt-in legacy-flow adaptation; no network/model selection."""
+    from rule_framework import oss120b_construction as guards
+    from scripts.generate_experience_rules import experience_120b_prompt
+    if stage == "extract_experience":
+        system, user = experience_120b_prompt(**payload)
+    else:
+        guards.require(stage in {"taxonomy", "cluster_rules"}, "Unknown experience stage")
+        prompt = EXPERIENCE_TAXONOMY_INSTRUCTION if stage == "taxonomy" else EXPERIENCE_CLUSTER_INSTRUCTION
+        system = guards.SYSTEM + "\n" + prompt
+        user = json.dumps(payload, ensure_ascii=False, sort_keys=True).replace("<|", "\\u003c|")
+        guards.require(json.loads(user) == payload, "Lossy message serialization")
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def build_120b_experience_catalog(
+    rows: list[Dict[str, Any]], heldout: list[Dict[str, Any]], call: Any, *,
+    topic_skeleton: Dict[str, Any], max_rules_per_sample: int = 2, batch_size: int = 12,
+) -> Dict[str, Any]:
+    """Original extraction-first flow, with an injected evidence-journaled caller.
+
+    Restores per-answer audit+extraction and min_count=1 candidate retention.
+    Reuses the old exact deduplicator and leaf projection. Only clustering is
+    replaced by an LLM; multi-source generalization is a separate compression
+    experiment, never a prerequisite for retaining a candidate.
+
+    ``call(stage, key, payload)`` must use ``experience_120b_messages`` and bind
+    exact 120B identity, budgets, input/output hashes and successful-call replay.
+    This core does not launch a process, overwrite files or certify provenance.
+    Only preverified complete answers from the released 30B cohort may enter.
+    """
+    from collections import Counter, defaultdict
+    from rule_framework import oss120b_construction as guards
+    from scripts.build_unified_catalog import _project_navigation_rule
+    from scripts.generate_experience_rules import (
+        EXPERIENCE_120B_VERSION, _build_distilled_library, _fingerprint_rule, _experience_topics,
+        normalize_120b_experience,
+    )
+
+    guards.require(type(batch_size) is int and batch_size > 0, "Invalid batch size")
+    guards.require(type(max_rules_per_sample) is int and max_rules_per_sample > 0, "Invalid rule limit")
+    guards.require(rows, "Empty source cohort")
+    for row in rows:
+        guards.text_fields(row, ("id", "question", "prediction"))
+        guards.require(not row.get("answer") and not row.get("context"), "External references are not allowed")
+    eligible, excluded = guards.isolate_sources(rows, heldout)
+    guards.require(not excluded, "Benchmark overlap: stop and re-freeze source exclusion before any model call")
+    templates = [guards.question_template(r["question"]) for r in eligible]
+    guards.require(all(templates) and len(set(templates)) == len(templates), "Duplicate source question templates")
+    # Strip legacy content even if a caller accidentally passes the full catalog.
+    skeleton = experience_topic_skeleton(topic_skeleton)
+    placeholder = {"domains": [{**d, "summary": d["name"],
+                   "topics": [{**t, "summary": t["name"]} for t in d["topics"]]} for d in skeleton["domains"]]}
+    _experience_topics(placeholder)
+    taxonomy = call("taxonomy", "physics", skeleton)
+    _experience_topics(taxonomy)
+    guards.require(experience_topic_skeleton(taxonomy) == skeleton, "Ontology labels/structure changed")
+    topic_keys = {(d["name"], t["name"]): d["id"] + "/" + t["id"]
+                  for d in taxonomy["domains"] for t in d["topics"]}
+    guards.require(len(topic_keys) == sum(len(d["topics"]) for d in taxonomy["domains"]),
+                   "Ambiguous taxonomy names for legacy deduplication")
+    experiences = []
+    for row in eligible:
+        payload = {"sample": row, "taxonomy": taxonomy, "max_rules_per_sample": max_rules_per_sample}
+        raw = call("extract_experience", row["id"], payload)
+        experiences.append(normalize_120b_experience(raw, **payload))
+    # Historical min_count=1 semantics: source frequency is not a quality gate.
+    distilled = _build_distilled_library(experiences, min_count=1)
+    support = defaultdict(list)
+    for sample in experiences:
+        domain, topic = sample["topic_guess"]["domain"], sample["topic_guess"]["topic"]
+        errors = {e["id"]: e for e in sample["semantic_audit"]["key_errors"]}
+        for rule in sample["experience_rules"]:
+            rid = "exp_" + _fingerprint_rule(rule, domain, topic)
+            support[rid].extend({"sample_id": sample["sample_id"], "source_error": errors[eid]}
+                                for eid in rule["source_error_ids"])
+    by_topic, provenance = defaultdict(list), []
+    for rule in distilled["rules"]:
+        rid = rule["rule_id"]
+        leaf = _project_navigation_rule(rule)
+        key = topic_keys[(rule["domain"], rule["topic"])]
+        by_topic[key].append(leaf)
+        guards.require(set(rule["sample_ids"]) == {s["sample_id"] for s in support[rid]}, "Lost candidate support")
+        provenance.append({"rule_id": rid, "sample_ids": rule["sample_ids"], "support": support[rid],
+                           "support_level": "multi_question" if rule["count"] >= 2 else "single_question"})
+
+    def grouped_call(stage: str, key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        # The existing grouping validator still enforces exact membership, but
+        # the model no longer needs to copy long hash IDs.
+        item_ids = {f"I{i+1}": x["id"] for i, x in enumerate(payload["items"])}
+        group_ids = {f"G{i+1}": x["id"] for i, x in enumerate(payload["groups"])}
+        wire = {**payload,
+                "items": [{**x, "id": k} for k, x in zip(item_ids, payload["items"])],
+                "groups": [{**x, "id": k} for k, x in zip(group_ids, payload["groups"])]}
+        value = call(stage, key, wire)
+        guards.require(isinstance(value, dict) and isinstance(value.get("assignments"), list)
+                       and isinstance(value.get("new_groups"), list), "Invalid cluster response")
+        assignments = []
+        for item in value["assignments"]:
+            guards.text_fields(item, ("item_id", "group_id"))
+            guards.require(item["item_id"] in item_ids, "Unknown local rule ID")
+            assignments.append({"item_id": item_ids[item["item_id"]],
+                                "group_id": group_ids.get(item["group_id"], item["group_id"])})
+        guards.require(all(isinstance(g, dict) and g.get("key") not in group_ids
+                           for g in value["new_groups"]), "Local cluster ID collision")
+        return {"new_groups": value["new_groups"], "assignments": assignments}
+
+    domains = []
+    for domain in taxonomy["domains"]:
+        out = {k: domain[k] for k in ("id", "name", "summary")}; out["topics"] = []
+        for topic in domain["topics"]:
+            key = domain["id"] + "/" + topic["id"]
+            leaves = by_topic[key]
+            if not leaves:
+                continue
+            groups = guards.grouped([{"id": leaf["rule_id"], "rule": leaf} for leaf in leaves],
+                                    key, "cluster_rules", grouped_call, batch_size)
+            out["topics"].append({**{k: topic[k] for k in ("id", "name", "summary")}, "rules": leaves,
+                                  "scenario_clusters": [{"id": g["id"], "name": g["name"],
+                                      "summary": g["summary"], "rule_ids": g["members"]} for g in groups]})
+        if out["topics"]:
+            domains.append(out)
+    catalog = {"metadata": {"builder": EXPERIENCE_120B_VERSION, "embedding_calls": 0,
+                            "historical_seed_rules": 0, "human_gold": False,
+                            "physical_validity": "machine_candidates_not_quality_accepted"}, "domains": domains}
+    validation = validate_catalog_structure(catalog)
+    guards.require(validation["valid"], "Experience catalog structure invalid")
+    guards.require(set(guards.Corpus(catalog, tree=True).ids) == set(support), "Lost leaves during organization")
+    return {"catalog": catalog, "semantic_experience": experiences, "distilled": distilled,
+            "provenance": provenance, "validation": validation,
+            "counts": {"samples": len(experiences), "audit_status": dict(Counter(
+                e["semantic_audit"]["status"] for e in experiences)),
+                "errors": sum(len(e["semantic_audit"]["key_errors"]) for e in experiences),
+                "extracted_candidates": sum(len(e["experience_rules"]) for e in experiences),
+                "rules": len(distilled["rules"]), "support_levels": dict(Counter(
+                    e["support_level"] for e in provenance)), "clusters": validation["counts"]["scenario_clusters"]}}
+
+
 def _write_json(path: Path, data: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
