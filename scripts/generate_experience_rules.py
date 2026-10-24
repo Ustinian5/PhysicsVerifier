@@ -316,6 +316,7 @@ EXPERIENCE_120B_INSTRUCTION = """沿用逐题经验提炼流程，不先将错�
    多条不同规则可共享一个真实根因，但不能重复同一判据；共享来源不增加独立支持题数。
 6. topic_key必须精确来自topics。symbolic_hint固定为空，不生成符号程序。
 7. status为error_found/no_error_found/uncertain之一；有明确错误时为error_found，可同时保留其他uncertain。
+   key_errors为空而uncertain非空时必须为uncertain；两者均为空时才为no_error_found。
    未检出错误不表示已经证明回答正确。所有文本输出须正确JSON转义。
 输出：
 {"topic_key":"domain_id/topic_id","semantic_audit":{"status":"error_found","summary":"简要结论",
