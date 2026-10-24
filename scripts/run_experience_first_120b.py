@@ -32,11 +32,41 @@ def hashes():
     return {s: r.sha256_file(ROOT / s) for s in SOURCES}
 
 
-def prepare(output, release):
-    binding, rows = released_corpus.load(release, release.parent / 'answers.json',
-                                        full=True, complete_answers=True)
+def prepare(output, release, parent=None):
+    inherited = None
+    if parent is None:
+        binding, rows = released_corpus.load(release, release.parent / 'answers.json',
+                                            full=True, complete_answers=True)
+    else:
+        # A failed construction pilot does not invalidate its separately
+        # completed generation handoff. Reuse only that verified preparation,
+        # never its model judgments, taxonomy summaries or candidate rules.
+        old = b.read(parent/'plan.json'); oc = old['configuration']
+        p.require(p.digest(oc)==old['configuration_sha256'] and
+                  oc['protocol'].startswith('experience_first_120b_'), 'Invalid parent preparation')
+        p.require(oc['corpus_release_sha256']==r.sha256_file(release) and
+                  Path(oc['corpus_release']).resolve()==release.resolve(), 'Parent corpus changed')
+        binding=b.read(parent/'source_release.json')
+        p.require(p.digest(binding)==oc['source_binding_sha256'] and
+                  binding['source_model_evidence']=='all_complete_generation_requests_and_responses_verified' and
+                  binding['answers_sha256']==r.sha256_file(release.parent/'answers.json'), 'Parent generation handoff changed')
+        rows=b.read(release.parent/'answers.json')
+        p.require(p.digest(sorted(rows,key=lambda x:p.digest([oc['seed'],x['id']])))==oc['selected_sha256'] and
+                  p.digest(b.read(parent/'inputs.json'))==oc['selected_sha256'], 'Parent input cohort changed')
+        inherited={'parent':str(parent.resolve()), 'files':{name:r.sha256_file(parent/name) for name in
+            ('plan.json','inputs.json','source_release.json','isolation.json','bench_questions.json','topic_skeleton.json')},
+            'reuse':'verified generation and isolation only; no previous 120B judgments or rules'}
     heldout, cohorts = b.benchmark_questions()
-    eligible, excluded = p.isolate_sources(rows, heldout)
+    if parent is None:
+        eligible, excluded = p.isolate_sources(rows, heldout)
+    else:
+        p.require(oc['benchmark_files']==cohorts and oc['bench_questions_sha256']==p.digest(heldout) and
+                  oc['isolation']==p.ISOLATION_POLICY and oc['source_hashes']['rule_framework/oss120b_construction.py']==
+                  r.sha256_file(ROOT/'rule_framework/oss120b_construction.py'), 'Isolation inputs or algorithm changed')
+        prior=b.read(parent/'isolation.json')
+        p.require(prior['source_count']==len(rows) and prior['excluded']==[] and
+                  prior['selected_overlap_count']==0, 'Parent was not fully isolated')
+        eligible, excluded=rows, []
     # New overlap is a protocol decision; do not silently discard source rows.
     p.require(not excluded, 'New overlap in complete answers; mainline must review before freezing')
     templates = [p.question_template(x['question']) for x in eligible]
@@ -56,6 +86,8 @@ def prepare(output, release):
         external_teacher=None, embedding_model=None, human_gold=False,
         json_policy='literal_invalid_backslashes_only_with_evidence_no_content_repair',
         source_prediction_model=binding['generator'])
+    if inherited is not None:
+        config['parent_preparation_sha256']=p.digest(inherited)
     output.mkdir(parents=True, exist_ok=True)
     with r.run_lock(output / 'active.lock'):
         for name,value in [('inputs',rows),('bench_questions',heldout),('topic_skeleton',skeleton),
@@ -63,6 +95,7 @@ def prepare(output, release):
              'source_count':len(rows),'excluded':excluded,'selected_overlap_count':0})]:
             b.write_once(output / (name+'.json'),value)
         b.write_once(output/'plan.json',{'configuration':config,'configuration_sha256':p.digest(config)})
+        if inherited is not None:b.write_once(output/'parent_preparation.json',inherited)
     print(json.dumps({'state':'prepared','samples':len(rows),'pilot':config['pilot_size'],'requests_cap':config['max_requests']}),flush=True)
 
 
@@ -79,6 +112,11 @@ def verify(output, source_check=False):
     p.require(cohorts==c['benchmark_files'] and p.digest(heldout)==c['bench_questions_sha256'],'Benchmark registry changed')
     release=Path(c['corpus_release'])
     p.require(r.sha256_file(release)==c['corpus_release_sha256'],'Corpus release changed')
+    if 'parent_preparation_sha256' in c:
+        inherited=b.read(output/'parent_preparation.json')
+        p.require(p.digest(inherited)==c['parent_preparation_sha256'],'Parent preparation binding changed')
+        for name,sha in inherited['files'].items():
+            p.require(r.sha256_file(Path(inherited['parent'])/name)==sha,'Parent frozen artifact changed')
     if source_check:
         binding,rows=released_corpus.load(release,release.parent/'answers.json',complete_answers=True)
         p.require(p.digest(binding)==c['source_binding_sha256'],'Generation provenance changed')
@@ -206,11 +244,12 @@ def main():
     parser.add_argument('mode',choices=['prepare','verify','run','confirm-detached'])
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--corpus-release',type=Path)
+    parser.add_argument('--parent-preparation',type=Path,help='Reuse only a verified identical generation/isolation handoff')
     parser.add_argument('--phase',choices=['pilot','full'],default='pilot')
     args=parser.parse_args();output=args.output.resolve()
     if args.mode=='prepare':
         p.require(args.corpus_release is not None,'Provide corpus release')
-        prepare(output,args.corpus_release.resolve())
+        prepare(output,args.corpus_release.resolve(),args.parent_preparation.resolve() if args.parent_preparation else None)
     elif args.mode=='verify':print(json.dumps(verify(output,source_check=True)['configuration_sha256']))
     elif args.mode=='confirm-detached':confirm(output)
     else:run(output,args.phase)

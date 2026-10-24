@@ -40,3 +40,36 @@ def test_new_runner_dispatches_new_prompt_not_old_pair_support(tmp_path):
     messages=j.messages('extract_experience',{'sample':ROWS[0],'taxonomy':TAXONOMY,'max_rules_per_sample':2})
     assert '一道题足以' in messages[0]['content']
     assert j.supported_stages()=={'taxonomy','extract_experience','cluster_rules'}
+
+
+def test_short_topic_ids_roundtrip_without_guessing():
+    from scripts.generate_experience_rules import experience_120b_prompt, normalize_120b_experience
+    payload=json.loads(experience_120b_prompt(ROWS[0],TAXONOMY)[1])
+    assert payload['topics'][0]['key']=='T1'
+    value=response();value['topic_key']='T1'
+    result=normalize_120b_experience(value,sample=ROWS[0],taxonomy=TAXONOMY)
+    assert result['topic_key']=='electromagnetism/magnetostatics'
+    value['topic_key']='T999'
+    with pytest.raises(ValueError,match='Unknown experience topic'):
+        normalize_120b_experience(value,sample=ROWS[0],taxonomy=TAXONOMY)
+
+
+def test_parent_handoff_reuses_only_verified_inputs_and_detects_tampering(tmp_path,monkeypatch):
+    release=tmp_path/'release_manifest.json';e.r.write_json(release,{'fixture':True})
+    e.r.write_json(tmp_path/'answers.json',ROWS)
+    binding={'generator':'Qwen3-30B-A3B-Instruct-2507',
+        'answers_sha256':e.r.sha256_file(tmp_path/'answers.json'),
+        'source_model_evidence':'all_complete_generation_requests_and_responses_verified'}
+    monkeypatch.setattr(e.released_corpus,'load',lambda *a,**kw:(binding,ROWS))
+    monkeypatch.setattr(e.b,'benchmark_questions',lambda:([{'id':'b','question':'量子束缚态的波函数。'}],{}))
+    parent=tmp_path/'parent';child=tmp_path/'child'
+    e.prepare(parent,release)
+    def forbidden(*a,**kw):raise AssertionError('Repeated the previous generation handoff')
+    monkeypatch.setattr(e.released_corpus,'load',forbidden)
+    e.prepare(child,release,parent)
+    assert e.b.read(child/'inputs.json')==e.b.read(parent/'inputs.json')
+    assert not (child/'arm_extract_experience').exists()
+    e.verify(child)
+    rows=e.b.read(parent/'inputs.json');rows[0]['prediction']+='altered'
+    e.r.write_json(parent/'inputs.json',rows)
+    with pytest.raises(ValueError,match='Parent frozen artifact changed'):e.verify(child)
