@@ -114,7 +114,15 @@ def build_120b_experience_catalog(
     placeholder = {"domains": [{**d, "summary": d["name"],
                    "topics": [{**t, "summary": t["name"]} for t in d["topics"]]} for d in skeleton["domains"]]}
     _experience_topics(placeholder)
-    taxonomy = call("taxonomy", "physics", skeleton)
+    # Summarize one fixed domain per call to stay within the response cap for
+    # all 123 topics; no model may add/remove labels at this boundary either.
+    taxonomy = {"domains": []}
+    for domain in skeleton["domains"]:
+        part = {"domains": [domain]}
+        value = call("taxonomy", domain["id"], part)
+        _experience_topics(value)
+        guards.require(experience_topic_skeleton(value) == part, "Ontology labels/structure changed")
+        taxonomy["domains"].extend(value["domains"])
     _experience_topics(taxonomy)
     guards.require(experience_topic_skeleton(taxonomy) == skeleton, "Ontology labels/structure changed")
     topic_keys = {(d["name"], t["name"]): d["id"] + "/" + t["id"]
