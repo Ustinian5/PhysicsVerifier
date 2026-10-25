@@ -19,8 +19,8 @@ from scripts import generate_experience_rules as extraction
 from rule_framework import released_corpus, oss120b_construction as p
 r = b.r
 ROOT = b.ROOT
-VERSION = "experience_first_120b_v4_context_review"
-REVIEW_INSTRUCTION = """现在复查上一条初稿，不将初稿当作已确认事实。重新依据完整题目和回答逐条核实：引用上下文是否支持错误主张、是否已有明确假设或后文纠正、公式是否代数等价、修正式的符号定义/量纲/边界是否正确。缺图或条件不足应保留uncertain，不能编造几何；未展示推荐步骤不是错误。删除无法证实的错误及其规则，保留确有证据的错误，不强求维持或改变初稿数量。最后核验单值类别、行号、included与规则引用一一覆盖、最多规定条数；输出与前述schema完全相同的最终JSON。不要新增外部参考或声称已由人验证。"""
+VERSION = "experience_first_120b_v5_candidate_collection"
+
 SOURCES = sorted(set(b.SOURCES + [__file__.replace(str(ROOT) + '/', ''),
     'scripts/unified_rules_pipeline.py', 'scripts/generate_experience_rules.py',
     'scripts/build_unified_catalog.py', 'scripts/analyze_semantic_experience_run.py',
@@ -77,7 +77,7 @@ def prepare(output, release, parent=None):
     config = dict(protocol=VERSION, model=r.EXPECTED_MODEL, model_files=b.existing.MODEL_FILES,
         api_base='http://127.0.0.1:18083/v1', reasoning_effort='medium', max_tokens=16384,
         max_request_input_bytes=400000, attempts_per_job=3, batch_size=12, max_rules_per_sample=2,
-        max_requests=3 * (3 * len(rows) + 2 * len(rows) + 2 * len(skeleton['domains']) + 24),
+        max_requests=3 * (2 * len(rows) + 2 * len(rows) + 2 * len(skeleton['domains']) + 24),
         distill_max_requests=0, pilot_size=min(12, len(rows)), seed=20261024,
         corpus_release=str(release.resolve()), corpus_release_sha256=r.sha256_file(release),
         source_binding_sha256=p.digest(binding), selected_sha256=p.digest(rows),
@@ -86,7 +86,7 @@ def prepare(output, release, parent=None):
         isolation=p.ISOLATION_POLICY, old_rules_imported=False, old_judgments_imported=False,
         external_teacher=None, embedding_model=None, human_gold=False,
         json_policy='literal_invalid_backslashes_only_with_evidence_no_content_repair',
-        source_prediction_model=binding['generator'], fixed_context_review_rounds=1, structural_repair_rounds=1)
+        source_prediction_model=binding['generator'], fixed_context_review_rounds=0, structural_repair_rounds=1, quality_gate="unverified_candidate_collection_only")
     if inherited is not None:
         if oc['protocol']=='experience_first_120b_v3':
             p.require(not (parent/'runner.pid').exists(), 'Stop parent before freezing prefix')
@@ -134,17 +134,13 @@ def verify(output, source_check=False):
 
 class Journal(b.Journal):
     def supported_stages(self):
-        return {'taxonomy','extract_experience','review_experience','repair_experience','cluster_rules'}
+        return {'taxonomy','extract_experience','repair_experience','cluster_rules'}
 
     def messages(self, stage, payload):
         if stage=='repair_experience':
-            messages=self.messages('review_experience',payload['review_payload'])
-            return messages+[{'role':'assistant','content':json.dumps(payload['review'],ensure_ascii=False).replace('<|','\\u003c|')},
-                {'role':'user','content':'输出未通过结构校验：'+payload['validation_error']+'。仅修复单值类别、ID、行号和引用关系等结构，不修改物理结论来迎合校验，不新增规则；保留无法配规则的错误并使用正确rule_status。返回完整JSON。'}]
-        if stage=='review_experience':
             messages=flow.experience_120b_messages('extract_experience',payload['original'])
             return messages+[{'role':'assistant','content':json.dumps(payload['draft'],ensure_ascii=False).replace('<|','\\u003c|')},
-                             {'role':'user','content':REVIEW_INSTRUCTION}]
+                {'role':'user','content':'输出未通过结构校验：'+payload['validation_error']+'。仅修复单值类别、ID、行号和引用关系等结构，不修改物理结论来迎合校验，不新增规则；保留无法配规则的错误并使用正确rule_status。返回完整JSON。'}]
         return flow.experience_120b_messages(stage,payload)
 
     def decode_record(self,path,stage):
@@ -188,7 +184,8 @@ def accept_pilot(output):
     summary=output/'pilot'/'counts.json';accept=output/'pilot'/'acceptance.json'
     p.require(summary.exists() and accept.exists(),'Pilot needs Codex assistant content review')
     receipt=b.read(accept)
-    p.require(receipt.get('actor')=='Codex assistant' and receipt.get('passed') is True and
+    p.require(receipt.get('actor')=='Codex assistant' and receipt.get('engineering_passed') is True and receipt.get('collection_only') is True and
+              receipt.get('physical_quality_passed') is False and bool(receipt.get('known_quality_issues')) and
               receipt.get('counts_sha256')==r.sha256_file(summary) and
               receipt.get('experience_sha256')==r.sha256_file(output/'pilot'/'semantic_experience.json'),
               'Pilot review does not bind current evidence')
@@ -246,21 +243,15 @@ def run(output, phase):
             def call(stage,key,payload):
                 draft=raw_call(stage,key,payload)
                 if stage=='extract_experience':
-                    review_payload={'original':payload,'draft':draft}
-                    reviewed=raw_call('review_experience',key,review_payload)
-                    try:extraction.normalize_120b_experience(reviewed,**payload)
+                    try:extraction.normalize_120b_experience(draft,**payload)
                     except ValueError as exc:
-                        # One bounded, recorded same-context schema repair, not
-                        # a best-of-N physical reranking or an empty fallback.
-                        reviewed=raw_call('repair_experience',key,{'review_payload':review_payload,
-                            'review':reviewed,'validation_error':str(exc)})
-                        extraction.normalize_120b_experience(reviewed,**payload)
-                    return reviewed
+                        return raw_call('repair_experience',key,{'original':payload,
+                            'draft':draft,'validation_error':str(exc)})
                 return draft
             rows=b.read(output/'inputs.json')
             if phase=='pilot':rows=rows[:c['pilot_size']]
             built=flow.build_120b_experience_catalog(rows,b.read(output/'bench_questions.json'),call,
-                topic_skeleton=b.read(output/'topic_skeleton.json'),max_rules_per_sample=c['max_rules_per_sample'],batch_size=c['batch_size'])
+                topic_skeleton=b.read(output/'topic_skeleton.json'),max_rules_per_sample=c['max_rules_per_sample'],batch_size=c['batch_size'],retain_invalid=True)
             verify(output,source_check=phase == "full")
             target=output/'pilot' if phase=='pilot' else output
             for name,value in built.items():b.write_once(target/(name+'.json'),value)
@@ -269,8 +260,8 @@ def run(output, phase):
                 return
             paths=[x for x in output.rglob('*.json') if x.name not in {'execution_status.json','release_manifest.json','disconnect_ready.json','disconnect_acceptance.json'}]
             b.write_once(output/'release_manifest.json',{'protocol':VERSION,'configuration_sha256':plan['configuration_sha256'],
-                'status':'candidate_catalog_complete_not_default_release','human_gold':False,
-                'usable_for_runtime':built['counts']['rules']>0,'independent_test_ready':False,
+                'status':'unverified_candidates_collected_quality_not_accepted','human_gold':False,
+                'usable_for_runtime':False,'physical_quality_passed':False,'collection_only':True,'independent_test_ready':False,
                 'files':{str(x.relative_to(output)):r.sha256_file(x) for x in sorted(paths)},'counts':built['counts'],
                 'data_isolation':{'passed':True,'selected_overlap_count':0,'complete_semantic_family_isolation_proven':False}})
             r.write_json(output/'execution_status.json',{'state':'completed','counts':built['counts'],'updated_unix':time.time()})

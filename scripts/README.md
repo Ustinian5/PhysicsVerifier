@@ -109,7 +109,7 @@ nohup "$PYTHON_BIN" -u -m scripts.run_continuous_context_v2 run --output "$RUN_D
 
 10.24起在旧流程上改造：`generate_experience_rules.experience_120b_prompt`与`normalize_120b_experience`完成完整输入的审查＋提炼提示和行号取证；`unified_rules_pipeline.build_120b_experience_catalog`串联原候选去重、来源合并、120B归组及原导航叶/结构验证。`experience_topic_skeleton`只提取旧6领域/123主题的名称与层级，旧规则和摘要不传入。单来源候选保留，跨题概括不作为产出前置门槛。
 
-当前v4对每题固定执行初稿→同一120B完整上下文复查，全部规则取复查终稿；结构异常最多再做一次同上下文结构修复，仍无效则停，不空选替代失败。模型、输入及每响应预算不变，新增调用及总预算在plan中单独冻结。`prepare --parent-preparation DIR`只复用已验真的相同生成/隔离材料；父协议为v3时，额外冻结原始请求前缀，并仅在请求体逐字一致时复用目录和初稿，全部题仍必须执行复查。父批计入预算，初稿不是最终验收成果。
+当前v5只收集未验收机器候选：沿用v3逐题初稿提示，不采用试验中未解决物理误判的固定复查。结构异常最多一次完整上下文修复；仍不合规者进入invalid_outputs，不能算正确、空选或入库规则，也不阻塞其余题。技术故障、模型身份、隔离、树成员守恒仍严格停止。输出发布清单固定usable_for_runtime=false、physical_quality_passed=false，不能绕过物理验收接入默认库。试跑收集许可记录engineering_passed、collection_only与已发现的质量问题，不冒充物理验收通过。`prepare --parent-preparation DIR`复用相同生成/隔离证据；父v3已完成目录/初稿仅在请求体完全一致时重放，调用计数保留。
 
 正式入口为`python -m scripts.run_experience_first_120b`，必须在服务器个人conda环境中执行。依次使用`prepare --output DIR --corpus-release RELEASE`、后台`run --output DIR --phase pilot`、断开SSH重新连接后`confirm-detached --output DIR`。固定12题试跑输出保存在DIR/pilot，由主线审读并以`acceptance.json`绑定counts及semantic_experience的SHA；然后后台`run --output DIR --phase full`并再次断连确认。不能跳过验收，不能让执行助手自行改提示或内容门槛。
 

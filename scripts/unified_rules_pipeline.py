@@ -77,7 +77,7 @@ def experience_120b_messages(stage: str, payload: Dict[str, Any]) -> list[Dict[s
 
 def build_120b_experience_catalog(
     rows: list[Dict[str, Any]], heldout: list[Dict[str, Any]], call: Any, *,
-    topic_skeleton: Dict[str, Any], max_rules_per_sample: int = 2, batch_size: int = 12,
+    topic_skeleton: Dict[str, Any], max_rules_per_sample: int = 2, batch_size: int = 12, retain_invalid: bool = False,
 ) -> Dict[str, Any]:
     """Original extraction-first flow, with an injected evidence-journaled caller.
 
@@ -129,11 +129,15 @@ def build_120b_experience_catalog(
                   for d in taxonomy["domains"] for t in d["topics"]}
     guards.require(len(topic_keys) == sum(len(d["topics"]) for d in taxonomy["domains"]),
                    "Ambiguous taxonomy names for legacy deduplication")
-    experiences = []
+    experiences, invalid = [], []
     for row in eligible:
         payload = {"sample": row, "taxonomy": taxonomy, "max_rules_per_sample": max_rules_per_sample}
         raw = call("extract_experience", row["id"], payload)
-        experiences.append(normalize_120b_experience(raw, **payload))
+        try:experiences.append(normalize_120b_experience(raw, **payload))
+        except ValueError as exc:
+            if not retain_invalid:raise
+            invalid.append({'sample_id':row['id'],'status':'invalid_output','error':str(exc),
+                            'raw_value_sha256':guards.digest(raw),'human_gold':False})
     # Historical min_count=1 semantics: source frequency is not a quality gate.
     distilled = _build_distilled_library(experiences, min_count=1)
     support = defaultdict(list)
@@ -197,8 +201,8 @@ def build_120b_experience_catalog(
     guards.require(validation["valid"], "Experience catalog structure invalid")
     guards.require(set(guards.Corpus(catalog, tree=True).ids) == set(support), "Lost leaves during organization")
     return {"catalog": catalog, "semantic_experience": experiences, "distilled": distilled,
-            "provenance": provenance, "validation": validation,
-            "counts": {"samples": len(experiences), "audit_status": dict(Counter(
+            "provenance": provenance, "validation": validation, "invalid_outputs": invalid,
+            "counts": {"samples": len(eligible), "valid_outputs":len(experiences), "invalid_outputs":len(invalid), "audit_status": dict(Counter(
                 e["semantic_audit"]["status"] for e in experiences)),
                 "errors": sum(len(e["semantic_audit"]["key_errors"]) for e in experiences),
                 "extracted_candidates": sum(len(e["experience_rules"]) for e in experiences),

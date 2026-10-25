@@ -193,3 +193,16 @@ def test_model_cannot_delete_old_topic_or_rename_it():
     with pytest.raises(ValueError, match="Ontology"):
         build(journal=renamed)
     assert [s for s, _, _ in delegate.stages] == ["taxonomy"]
+
+
+def test_collection_quarantines_invalid_output_without_counting_it_as_no_error():
+    calls=iter([response(), {'bad':'schema'}])
+    result=build(ROWS,FakeJournal(lambda:next(calls)),retain_invalid=True)
+    assert result['counts']['samples']==2
+    assert result['counts']['valid_outputs']==1
+    assert result['counts']['invalid_outputs']==1
+    assert result['counts']['audit_status']=={'error_found':1}
+    assert result['counts']['rules']==1
+    assert result['invalid_outputs'][0]['sample_id']=='b'
+    assert result['invalid_outputs'][0]['status']=='invalid_output'
+    with pytest.raises(ValueError):build(journal=FakeJournal(lambda:{'bad':'schema'}))

@@ -39,7 +39,7 @@ def test_new_runner_dispatches_new_prompt_not_old_pair_support(tmp_path):
     j=e.Journal(tmp_path,config())
     messages=j.messages('extract_experience',{'sample':ROWS[0],'taxonomy':TAXONOMY,'max_rules_per_sample':2})
     assert '一道题足以' in messages[0]['content']
-    assert j.supported_stages()=={'taxonomy','extract_experience','review_experience','repair_experience','cluster_rules'}
+    assert j.supported_stages()=={'taxonomy','extract_experience','repair_experience','cluster_rules'}
 
 
 def test_short_topic_ids_roundtrip_without_guessing():
@@ -83,16 +83,6 @@ def test_v3_example_does_not_teach_composite_categories():
     assert '不得标included' in prompt
 
 
-def test_review_keeps_full_context_and_draft():
-    j=e.Journal(__import__('pathlib').Path('/tmp/unused'),config())
-    original={'sample':ROWS[0],'taxonomy':TAXONOMY,'max_rules_per_sample':2}
-    draft=response()
-    messages=j.messages('review_experience',{'original':original,'draft':draft})
-    assert messages[:2]==j.messages('extract_experience',original)
-    assert json.loads(messages[2]['content'])==draft
-    assert [m['role'] for m in messages]==['system','user','assistant','user']
-
-
 def test_prefix_replay_requires_identical_request(tmp_path,monkeypatch):
     c=config();parent=tmp_path/'parent';c['draft_prefix_parent']=str(parent)
     j=e.Journal(tmp_path/'new',c);key=ROWS[0]['id'];stage='extract_experience'
@@ -109,9 +99,10 @@ def test_prefix_replay_requires_identical_request(tmp_path,monkeypatch):
         e.replay_draft_prefix(j,stage,key,dict(payload,max_rules_per_sample=1))
 
 
-def test_repair_preserves_full_review_conversation():
+def test_structural_repair_keeps_original_context():
     j=e.Journal(__import__('pathlib').Path('/tmp/unused'),config())
-    payload={'original':{'sample':ROWS[0],'taxonomy':TAXONOMY,'max_rules_per_sample':2},'draft':response()}
-    messages=j.messages('repair_experience',{'review_payload':payload,'review':response(),'validation_error':'Invalid error ID/type'})
-    assert messages[:4]==j.messages('review_experience',payload)
-    assert len(messages)==6 and 'Invalid error ID/type' in messages[-1]['content']
+    original={'sample':ROWS[0],'taxonomy':TAXONOMY,'max_rules_per_sample':2}
+    messages=j.messages('repair_experience',{'original':original,'draft':response(),'validation_error':'Invalid error ID/type'})
+    assert messages[:2]==j.messages('extract_experience',original)
+    assert json.loads(messages[2]['content'])==response()
+    assert len(messages)==4 and 'Invalid error ID/type' in messages[-1]['content']
