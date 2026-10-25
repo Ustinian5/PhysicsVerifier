@@ -73,3 +73,11 @@ def test_parent_handoff_reuses_only_verified_inputs_and_detects_tampering(tmp_pa
     rows=e.b.read(parent/'inputs.json');rows[0]['prediction']+='altered'
     e.r.write_json(parent/'inputs.json',rows)
     with pytest.raises(ValueError,match='Parent frozen artifact changed'):e.verify(child)
+
+
+def test_v3_example_does_not_teach_composite_categories():
+    from scripts.generate_experience_rules import EXPERIENCE_120B_INSTRUCTION as prompt
+    assert 'concept|logic' not in prompt
+    assert '禁止使用竖线或组合标签' in prompt
+    assert '等价表达不是矛盾' in prompt
+    assert '不得标included' in prompt
