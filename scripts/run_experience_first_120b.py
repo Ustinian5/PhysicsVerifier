@@ -112,6 +112,13 @@ def verify(output, source_check=False):
     current=hashes()
     if c['source_hashes']!=current:
         fix=b.read(output/'json_control_recovery.json')
+        amendment=output/'escaped_control_recovery.json'
+        if amendment.exists():
+            follow=b.read(amendment)
+            p.require(follow['previous_receipt_sha256']==r.sha256_file(output/'json_control_recovery.json') and
+                      follow['previous_sources']==fix['replacement_sources'], 'Recovery chain changed')
+            fix=dict(fix,replacement_sources=follow['replacement_sources'],
+                     prefix_files={**fix['prefix_files'],**follow['prefix_files']})
         p.require(fix['configuration_sha256']==plan['configuration_sha256'] and
                   fix['original_sources']==c['source_hashes'] and fix['replacement_sources']==current and
                   {k for k in current if current[k]!=c['source_hashes'].get(k)}=={'scripts/run_experience_first_120b.py'},
@@ -204,7 +211,9 @@ class Journal(b.Journal):
         try:
             escaped,controls=escape_json_controls(text)
             value,normalized,positions=b.parse_json_escapes(escaped,repair=True)
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, ValueError) as exc:
+            if not isinstance(exc,json.JSONDecodeError) and str(exc)!='Ambiguous escaped control character':
+                raise
             # Preserve malformed content, including typographic quotes. The
             # existing single structural repair receives the original text.
             b.write_once(path.with_name('json_parse_failure_'+path.stem+'.json'),{

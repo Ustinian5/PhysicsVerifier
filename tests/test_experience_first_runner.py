@@ -133,3 +133,11 @@ def test_malformed_smart_quotes_are_preserved_for_structural_repair(tmp_path,mon
     messages=j.messages('repair_experience',{'original':original,'draft':draft,'validation_error':'Invalid schema'})
     assert messages[2]['content']==raw
     assert (tmp_path/'json_parse_failure_request_001.json').exists()
+
+
+def test_ambiguous_control_preserved_for_structural_repair(tmp_path,monkeypatch):
+    j=e.Journal(tmp_path,config());raw='{"x":"before'+'\\'+'\n'+'after"}'
+    f=tmp_path/'request_001.json';e.r.write_json(f,{'response':{'id':'x','model':config()['model']}})
+    monkeypatch.setattr(e.b.harmony,'decode_response',lambda *a,**kw:{'content':raw})
+    assert j.decode_record(f,'extract_experience')=={'_unparsed_response_text':raw}
+    assert (tmp_path/'json_parse_failure_request_001.json').exists()
