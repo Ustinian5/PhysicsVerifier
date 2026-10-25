@@ -109,6 +109,8 @@ nohup "$PYTHON_BIN" -u -m scripts.run_continuous_context_v2 run --output "$RUN_D
 
 10.24起在旧流程上改造：`generate_experience_rules.experience_120b_prompt`与`normalize_120b_experience`完成完整输入的审查＋提炼提示和行号取证；`unified_rules_pipeline.build_120b_experience_catalog`串联原候选去重、来源合并、120B归组及原导航叶/结构验证。`experience_topic_skeleton`只提取旧6领域/123主题的名称与层级，旧规则和摘要不传入。单来源候选保留，跨题概括不作为产出前置门槛。
 
+当前v4对每题固定执行初稿→同一120B完整上下文复查，全部规则取复查终稿；结构异常最多再做一次同上下文结构修复，仍无效则停，不空选替代失败。模型、输入及每响应预算不变，新增调用及总预算在plan中单独冻结。`prepare --parent-preparation DIR`只复用已验真的相同生成/隔离材料；父协议为v3时，额外冻结原始请求前缀，并仅在请求体逐字一致时复用目录和初稿，全部题仍必须执行复查。父批计入预算，初稿不是最终验收成果。
+
 正式入口为`python -m scripts.run_experience_first_120b`，必须在服务器个人conda环境中执行。依次使用`prepare --output DIR --corpus-release RELEASE`、后台`run --output DIR --phase pilot`、断开SSH重新连接后`confirm-detached --output DIR`。固定12题试跑输出保存在DIR/pilot，由主线审读并以`acceptance.json`绑定counts及semantic_experience的SHA；然后后台`run --output DIR --phase full`并再次断连确认。不能跳过验收，不能让执行助手自行改提示或内容门槛。
 
 prepare核对已发布的全部完整30B回答及实际生成证据，不导入旧筛错标签，重新检查所有已登记bench。Domain/Topic按领域分批补摘要，保持原名称/层级；逐题审查＋提炼和场景归组都用本地120B medium。成功调用精确重放，只有明确技术故障在同一请求最多3次尝试内恢复；模型身份、语义/结构异常停止，保存原件由主线修复。正式输出不覆盖旧83条或默认库。`execution_status.json`、`budget.json`、`runner.log`与原始arm目录分别记录状态、用量、过程和证据；release_manifest仅表示候选库构建完成，仍不是物理效果验收。

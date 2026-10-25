@@ -19,7 +19,8 @@ from scripts import generate_experience_rules as extraction
 from rule_framework import released_corpus, oss120b_construction as p
 r = b.r
 ROOT = b.ROOT
-VERSION = extraction.EXPERIENCE_120B_VERSION
+VERSION = "experience_first_120b_v4_context_review"
+REVIEW_INSTRUCTION = """现在复查上一条初稿，不将初稿当作已确认事实。重新依据完整题目和回答逐条核实：引用上下文是否支持错误主张、是否已有明确假设或后文纠正、公式是否代数等价、修正式的符号定义/量纲/边界是否正确。缺图或条件不足应保留uncertain，不能编造几何；未展示推荐步骤不是错误。删除无法证实的错误及其规则，保留确有证据的错误，不强求维持或改变初稿数量。最后核验单值类别、行号、included与规则引用一一覆盖、最多规定条数；输出与前述schema完全相同的最终JSON。不要新增外部参考或声称已由人验证。"""
 SOURCES = sorted(set(b.SOURCES + [__file__.replace(str(ROOT) + '/', ''),
     'scripts/unified_rules_pipeline.py', 'scripts/generate_experience_rules.py',
     'scripts/build_unified_catalog.py', 'scripts/analyze_semantic_experience_run.py',
@@ -76,7 +77,7 @@ def prepare(output, release, parent=None):
     config = dict(protocol=VERSION, model=r.EXPECTED_MODEL, model_files=b.existing.MODEL_FILES,
         api_base='http://127.0.0.1:18083/v1', reasoning_effort='medium', max_tokens=16384,
         max_request_input_bytes=400000, attempts_per_job=3, batch_size=12, max_rules_per_sample=2,
-        max_requests=3 * (len(rows) + 2 * len(rows) + 2 * len(skeleton['domains']) + 24),
+        max_requests=3 * (3 * len(rows) + 2 * len(rows) + 2 * len(skeleton['domains']) + 24),
         distill_max_requests=0, pilot_size=min(12, len(rows)), seed=20261024,
         corpus_release=str(release.resolve()), corpus_release_sha256=r.sha256_file(release),
         source_binding_sha256=p.digest(binding), selected_sha256=p.digest(rows),
@@ -85,8 +86,13 @@ def prepare(output, release, parent=None):
         isolation=p.ISOLATION_POLICY, old_rules_imported=False, old_judgments_imported=False,
         external_teacher=None, embedding_model=None, human_gold=False,
         json_policy='literal_invalid_backslashes_only_with_evidence_no_content_repair',
-        source_prediction_model=binding['generator'])
+        source_prediction_model=binding['generator'], fixed_context_review_rounds=1, structural_repair_rounds=1)
     if inherited is not None:
+        if oc['protocol']=='experience_first_120b_v3':
+            p.require(not (parent/'runner.pid').exists(), 'Stop parent before freezing prefix')
+            inherited['prefix_files']={str(f.relative_to(parent)):r.sha256_file(f) for f in sorted(parent.glob('arm*/*/*.json'))}
+            inherited['reuse']='verified inputs plus byte-identical taxonomy/draft requests; no accepted final judgments'
+            config['draft_prefix_parent']=str(parent.resolve())
         config['parent_preparation_sha256']=p.digest(inherited)
     output.mkdir(parents=True, exist_ok=True)
     with r.run_lock(output / 'active.lock'):
@@ -115,7 +121,7 @@ def verify(output, source_check=False):
     if 'parent_preparation_sha256' in c:
         inherited=b.read(output/'parent_preparation.json')
         p.require(p.digest(inherited)==c['parent_preparation_sha256'],'Parent preparation binding changed')
-        for name,sha in inherited['files'].items():
+        for name,sha in {**inherited['files'],**inherited.get('prefix_files',{})}.items():
             p.require(r.sha256_file(Path(inherited['parent'])/name)==sha,'Parent frozen artifact changed')
     if source_check:
         binding,rows=released_corpus.load(release,release.parent/'answers.json',complete_answers=True)
@@ -128,9 +134,17 @@ def verify(output, source_check=False):
 
 class Journal(b.Journal):
     def supported_stages(self):
-        return {'taxonomy','extract_experience','cluster_rules'}
+        return {'taxonomy','extract_experience','review_experience','repair_experience','cluster_rules'}
 
     def messages(self, stage, payload):
+        if stage=='repair_experience':
+            messages=self.messages('review_experience',payload['review_payload'])
+            return messages+[{'role':'assistant','content':json.dumps(payload['review'],ensure_ascii=False).replace('<|','\\u003c|')},
+                {'role':'user','content':'输出未通过结构校验：'+payload['validation_error']+'。仅修复单值类别、ID、行号和引用关系等结构，不修改物理结论来迎合校验，不新增规则；保留无法配规则的错误并使用正确rule_status。返回完整JSON。'}]
+        if stage=='review_experience':
+            messages=flow.experience_120b_messages('extract_experience',payload['original'])
+            return messages+[{'role':'assistant','content':json.dumps(payload['draft'],ensure_ascii=False).replace('<|','\\u003c|')},
+                             {'role':'user','content':REVIEW_INSTRUCTION}]
         return flow.experience_120b_messages(stage,payload)
 
     def decode_record(self,path,stage):
@@ -148,6 +162,25 @@ class Journal(b.Journal):
                 'literal_backslash_positions':positions,'value_sha256':p.digest(value),
                 'normalized_sha256':p.digest(normalized),'physical_content_edited':False})
         return value
+
+
+def replay_draft_prefix(journal,stage,key,payload):
+    """Reuse only an exact old request, never a changed prompt or selected best result."""
+    parent=journal.config.get('draft_prefix_parent')
+    if not parent or stage not in {'taxonomy','extract_experience'}:return None
+    folder=Path(parent)/('arm_'+stage)/p.digest(key)[:24]
+    receipt=folder/'result.json'
+    if not receipt.exists():return None
+    saved=b.read(receipt);raw=folder/saved['request_file']
+    p.require(raw.parent==folder and r.sha256_file(raw)==saved['request_sha256'],'Prefix raw changed')
+    record=b.read(raw);body=r.request_body(journal.config['model'],journal.messages(stage,payload),journal.config['max_tokens'],backend='vllm')
+    body.update(stream=False,return_token_ids=True,reasoning_effort=journal.config['reasoning_effort']);body.pop('stream_options',None)
+    p.require(record['request']==body,'Prefix request differs; cannot silently replay or regenerate')
+    value=journal.decode_record(raw,stage)
+    p.require(value==saved['value'],'Prefix decoded value changed')
+    b.write_once(journal.output/('arm_'+stage)/p.digest(key)[:24]/'prefix_replay.json',
+        {'source':str(raw),'source_sha256':r.sha256_file(raw),'value_sha256':p.digest(value),'new_model_calls':0})
+    return value
 
 
 def accept_pilot(output):
@@ -187,9 +220,11 @@ def run(output, phase):
                 'checkpoint_validation':'configuration/tokenizer/template/index hashes; not all weight shards'})
             journal=Journal(output,c,True)
             pilot_journal=Journal(output/'pilot',c,True)
-            journal.budget = b.BatchBudget(output, journal.budget.limits, prior_runs=(output/'pilot',), stop_file=output/'STOP')
+            journal.budget = b.BatchBudget(output, journal.budget.limits, prior_runs=tuple([output/'pilot']+([Path(c['draft_prefix_parent'])] if c.get('draft_prefix_parent') else [])), stop_file=output/'STOP')
             pilot_journal.budget = journal.budget
-            def call(stage,key,payload):
+            def raw_call(stage,key,payload):
+                cached=replay_draft_prefix(journal,stage,key,payload)
+                if cached is not None:return cached
                 selected=pilot_journal if phase=='pilot' and stage=='cluster_rules' else journal
                 # Only documented transient failures may be retried, within the
                 # same frozen per-job cap. Semantic/identity faults stop here.
@@ -208,6 +243,20 @@ def run(output, phase):
                             r.write_json(output/'execution_status.json',{'state':'waiting_transient','stage':stage,'key':key,
                                 'ready_unix':deadline,'updated_unix':time.time()})
                             time.sleep(min(20,max(.1,deadline-time.time())))
+            def call(stage,key,payload):
+                draft=raw_call(stage,key,payload)
+                if stage=='extract_experience':
+                    review_payload={'original':payload,'draft':draft}
+                    reviewed=raw_call('review_experience',key,review_payload)
+                    try:extraction.normalize_120b_experience(reviewed,**payload)
+                    except ValueError as exc:
+                        # One bounded, recorded same-context schema repair, not
+                        # a best-of-N physical reranking or an empty fallback.
+                        reviewed=raw_call('repair_experience',key,{'review_payload':review_payload,
+                            'review':reviewed,'validation_error':str(exc)})
+                        extraction.normalize_120b_experience(reviewed,**payload)
+                    return reviewed
+                return draft
             rows=b.read(output/'inputs.json')
             if phase=='pilot':rows=rows[:c['pilot_size']]
             built=flow.build_120b_experience_catalog(rows,b.read(output/'bench_questions.json'),call,
