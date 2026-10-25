@@ -169,13 +169,13 @@ def recover_json_controls(output):
         last=paths[-1];record=b.read(last)
         p.require(not record.get('error'),'Transport error cannot be repaired')
         value=Journal(output,c).decode_record(last,'extract_experience')
-        p.require(last.with_name('json_control_view_'+last.stem+'.json').exists(),'No literal control recovery evidence')
+        p.require(any(last.with_name(prefix+last.stem+'.json').exists() for prefix in ('json_control_view_','json_parse_failure_')),'No serialization recovery evidence')
         files=list(output.glob('arm*/*/*.json'))+list((output/'pilot').rglob('*.json'))+[output/'plan.json']
         b.write_once(output/'json_control_recovery.json',{'actor':'Codex assistant','human_gold':False,
             'configuration_sha256':plan['configuration_sha256'],'original_sources':c['source_hashes'],
             'replacement_sources':current,'prefix_files':{str(f.relative_to(output)):r.sha256_file(f) for f in files},
             'stopped_status':status,'budget_before':budget,'affected_request':str(last.relative_to(output)),
-            'policy':'JSON literal string controls encoded losslessly; no physical/schema content changes',
+            'policy':'Encode unambiguous literal controls; hand other malformed JSON unchanged to existing bounded structural repair; never infer content',
             'new_model_calls':0,'value_sha256':p.digest(value)})
         verify(output)
         print('Control-character response recovered; zero new model calls',flush=True)
@@ -188,7 +188,9 @@ class Journal(b.Journal):
     def messages(self, stage, payload):
         if stage=='repair_experience':
             messages=flow.experience_120b_messages('extract_experience',payload['original'])
-            return messages+[{'role':'assistant','content':json.dumps(payload['draft'],ensure_ascii=False).replace('<|','\\u003c|')},
+            draft=payload['draft']
+            content=(draft['_unparsed_response_text'] if set(draft)=={'_unparsed_response_text'} else json.dumps(draft,ensure_ascii=False))
+            return messages+[{'role':'assistant','content':content.replace('<|','\\u003c|')},
                 {'role':'user','content':'输出未通过结构校验：'+payload['validation_error']+'。仅修复单值类别、ID、行号和引用关系等结构，不修改物理结论来迎合校验，不新增规则；保留无法配规则的错误并使用正确rule_status。返回完整JSON。'}]
         return flow.experience_120b_messages(stage,payload)
 
@@ -199,8 +201,17 @@ class Journal(b.Journal):
         text=b.harmony.decode_response(raw,model=self.config['model'],
             max_tokens=self.config['max_tokens'],native_tools=None)['content'].strip()
         if text.startswith('```json\n') and text.endswith('```'): text=text[8:-3].strip()
-        escaped,controls=escape_json_controls(text)
-        value,normalized,positions=b.parse_json_escapes(escaped,repair=True)
+        try:
+            escaped,controls=escape_json_controls(text)
+            value,normalized,positions=b.parse_json_escapes(escaped,repair=True)
+        except json.JSONDecodeError as exc:
+            # Preserve malformed content, including typographic quotes. The
+            # existing single structural repair receives the original text.
+            b.write_once(path.with_name('json_parse_failure_'+path.stem+'.json'),{
+                'request_sha256':r.sha256_file(path),'raw_text_sha256':p.digest(text),
+                'error':str(exc),'physical_content_edited':False,
+                'disposition':'opaque raw text for bounded structural repair; never a no-error result'})
+            return {'_unparsed_response_text':text}
         if controls:
             b.write_once(path.with_name('json_control_view_'+path.stem+'.json'),{
                 'request_sha256':r.sha256_file(path),'policy':'literal_control_codepoints_inside_json_strings_only',

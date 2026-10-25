@@ -121,3 +121,15 @@ def test_escaped_controls_and_literal_backslash_not_reinterpreted():
     raw=json.dumps({'x':'\n','y':r'\n','z':'"'})
     assert e.escape_json_controls(raw)==(raw,[])
     with pytest.raises(ValueError,match='Ambiguous'):e.escape_json_controls('"x'+'\\'+'\n'+'"')
+
+
+def test_malformed_smart_quotes_are_preserved_for_structural_repair(tmp_path,monkeypatch):
+    j=e.Journal(tmp_path,config());raw='{ "cues": ["x”, “y”] }'
+    f=tmp_path/'request_001.json';e.r.write_json(f,{'response':{'id':'x','model':config()['model']}})
+    monkeypatch.setattr(e.b.harmony,'decode_response',lambda *a,**kw:{'content':raw})
+    draft=j.decode_record(f,'extract_experience')
+    assert draft=={'_unparsed_response_text':raw}
+    original={'sample':ROWS[0],'taxonomy':TAXONOMY,'max_rules_per_sample':2}
+    messages=j.messages('repair_experience',{'original':original,'draft':draft,'validation_error':'Invalid schema'})
+    assert messages[2]['content']==raw
+    assert (tmp_path/'json_parse_failure_request_001.json').exists()
