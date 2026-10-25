@@ -211,3 +211,26 @@ python -m scripts.run_built_catalog confirm-detached --build <构建目录> --ou
 ```
 
 C0p纯120B与C4规则辅助各50题，同一120B配置、每题累计12次响应/16384生成token、最多读6叶；C4保留连续上下文，不拆checker。沿用10个工程控制与工具IO探针，再做正式对照。冻结新参考输出完整P/R/F1、敏感性、失败和配对区间，同时报告实际调用/token与树/叶使用。相同预算上限不等于实际等成本，位置命中不等于物理正确，开发结果不作独立论文结论。
+
+### 累计5,000题扩容（独立入口，不修改运行中的逐题建库）
+
+`prepare_qwen30b_expansion.py`从固定版本[MegaScience/TextbookReasoning](https://huggingface.co/datasets/MegaScience/TextbookReasoning)的train/physics只导出题干，校验源SHA，做bench、旧题及新题间去重。许可CC-BY-NC-SA-4.0；上游题目曾经其他模型整理，本项目不导入其答案或解答。仅此离线导出需要pyarrow，推理端不需要。所有Python命令在个人conda环境执行。
+
+```bash
+python -m scripts.prepare_qwen30b_expansion export-source --parquet <固定源parquet> --output <题干目录>
+python -m scripts.prepare_qwen30b_expansion prepare --source <题干目录> --base-corpus <原30B发布目录> --parent <v5逐题目录> --output <扩容目录> --target 5000 --reserve 4000
+python -m scripts.run_qwen30b_expansion prepare --output <扩容目录>
+python -m scripts.run_qwen30b_expansion verify --output <扩容目录>
+```
+
+已有2,626份完整回答直接复用；120B仅按领域从固定备选顺序选2,374新题，随后冻结一次性30B作答。生成前不按预测错题率选题，生成后不补抽；截断、技术失败和bench隔离排除另计，因此完整入库回答可能不足5,000份。新来源与规模同时变化，不是严格同分布规模消融。
+
+`start_qwen30b_expansion_service.sh <扩容目录绝对路径> <空闲GPU编号> <对应UUID>`只启动本人的30B，复用个人权重SHA边界，检查GPU/端口/空间。120B沿用原服务。模型服务与下面的客户端都须在服务器nohup/tmux后台运行，客户端直连回环地址。客户端要求v5已完成发布及锁释放，条件不满足或源文件不符即停止；不改运行中的父批。退出启动SSH并重连后再confirm，首次状态为waiting_disconnect_acceptance，未确认不推理。
+
+```bash
+python -u -m scripts.run_qwen30b_expansion run --output <扩容目录绝对路径> --phase all
+# 在新的SSH会话核对存活进程后执行；不能再启动第二个run。
+python -m scripts.run_qwen30b_expansion confirm-detached --output <扩容目录绝对路径>
+```
+
+生成阶段写generation_release.json后关闭本批自己启动的30B；只对新回答提炼，父批初稿/规定结构修复按完整请求体重放，合并候选后重新组织ScenarioCluster。复用Domain/Topic名称、单来源规则保留，不调用embedding或外部教师；新库只作机器候选，build/release_manifest.json明确physical_quality_passed=false、usable_for_runtime=false，不自动接默认库或在线评测。支持collect/build分阶段及幂等恢复，所有模式均保留失败和来源证据；成功项不重跑。验证见`tests/test_qwen30b_expansion.py`。
