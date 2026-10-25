@@ -106,3 +106,18 @@ def test_structural_repair_keeps_original_context():
     assert messages[:2]==j.messages('extract_experience',original)
     assert json.loads(messages[2]['content'])==response()
     assert len(messages)==4 and 'Invalid error ID/type' in messages[-1]['content']
+
+
+def test_literal_controls_preserve_string_values_and_outside_whitespace():
+    raw='{\n"a":"first\nsecond\tthird\x01","b":"quote \\" stays"\n}'
+    escaped,positions=e.escape_json_controls(raw)
+    assert len(positions)==3
+    assert json.loads(escaped)==json.loads(raw,strict=False)
+    assert escaped.startswith('{\n')
+    with pytest.raises(json.JSONDecodeError):json.loads(e.escape_json_controls('{"x":1 "y":2}')[0])
+
+
+def test_escaped_controls_and_literal_backslash_not_reinterpreted():
+    raw=json.dumps({'x':'\n','y':r'\n','z':'"'})
+    assert e.escape_json_controls(raw)==(raw,[])
+    with pytest.raises(ValueError,match='Ambiguous'):e.escape_json_controls('"x'+'\\'+'\n'+'"')

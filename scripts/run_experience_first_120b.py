@@ -108,7 +108,16 @@ def prepare(output, release, parent=None):
 def verify(output, source_check=False):
     plan=b.read(output/'plan.json');c=plan['configuration']
     p.require(p.digest(c)==plan['configuration_sha256'], 'Plan changed')
-    p.require(c['protocol']==VERSION and c['source_hashes']==hashes(), 'Frozen implementation changed')
+    p.require(c['protocol']==VERSION, 'Frozen protocol changed')
+    current=hashes()
+    if c['source_hashes']!=current:
+        fix=b.read(output/'json_control_recovery.json')
+        p.require(fix['configuration_sha256']==plan['configuration_sha256'] and
+                  fix['original_sources']==c['source_hashes'] and fix['replacement_sources']==current and
+                  {k for k in current if current[k]!=c['source_hashes'].get(k)}=={'scripts/run_experience_first_120b.py'},
+                  'Unregistered implementation change')
+        for name,sha in fix['prefix_files'].items():
+            p.require(r.sha256_file(output/name)==sha,'Recovery prefix changed')
     p.require(c['model']==r.EXPECTED_MODEL and c['reasoning_effort']=='medium' and
               c['api_base']=='http://127.0.0.1:18083/v1', 'Model/service changed')
     for name,key in [('inputs','selected_sha256'),('bench_questions','bench_questions_sha256'),
@@ -132,6 +141,46 @@ def verify(output, source_check=False):
     return plan
 
 
+def escape_json_controls(text):
+    """Encode only literal U+0000..001F inside JSON strings; preserve their value."""
+    inside=False; escaped=False; pieces=[]; positions=[]
+    for i,char in enumerate(text):
+        if inside and ord(char)<32:
+            # A control following a backslash is not an unambiguous literal.
+            if escaped:raise ValueError('Ambiguous escaped control character')
+            pieces.append('\\u%04x'%ord(char));positions.append(i);continue
+        pieces.append(char)
+        if escaped:escaped=False
+        elif inside and char=='\\':escaped=True
+        elif char=='"':inside=not inside
+    return ''.join(pieces),positions
+
+
+def recover_json_controls(output):
+    with r.run_lock(output/'active.lock'):
+        p.require(not (output/'runner.pid').exists(),'Runner must be stopped')
+        plan=b.read(output/'plan.json');c=plan['configuration'];current=hashes()
+        p.require(p.digest(c)==plan['configuration_sha256'],'Plan changed')
+        p.require({k for k in current if current[k]!=c['source_hashes'].get(k)}=={'scripts/run_experience_first_120b.py'},'Unrelated source changes')
+        status=b.read(output/'execution_status.json');budget=b.read(output/'budget.json')
+        p.require(status.get('state')=='stopped' and status.get('error_type')=='JSONDecodeError' and
+                  'Invalid control character' in status.get('error','') and not budget.get('in_flight'),'Not a completed control-character failure')
+        paths=sorted(output.glob('arm*/*/request_*.json'),key=lambda f:f.stat().st_mtime)
+        last=paths[-1];record=b.read(last)
+        p.require(not record.get('error'),'Transport error cannot be repaired')
+        value=Journal(output,c).decode_record(last,'extract_experience')
+        p.require(last.with_name('json_control_view_'+last.stem+'.json').exists(),'No literal control recovery evidence')
+        files=list(output.glob('arm*/*/*.json'))+list((output/'pilot').rglob('*.json'))+[output/'plan.json']
+        b.write_once(output/'json_control_recovery.json',{'actor':'Codex assistant','human_gold':False,
+            'configuration_sha256':plan['configuration_sha256'],'original_sources':c['source_hashes'],
+            'replacement_sources':current,'prefix_files':{str(f.relative_to(output)):r.sha256_file(f) for f in files},
+            'stopped_status':status,'budget_before':budget,'affected_request':str(last.relative_to(output)),
+            'policy':'JSON literal string controls encoded losslessly; no physical/schema content changes',
+            'new_model_calls':0,'value_sha256':p.digest(value)})
+        verify(output)
+        print('Control-character response recovered; zero new model calls',flush=True)
+
+
 class Journal(b.Journal):
     def supported_stages(self):
         return {'taxonomy','extract_experience','repair_experience','cluster_rules'}
@@ -150,7 +199,13 @@ class Journal(b.Journal):
         text=b.harmony.decode_response(raw,model=self.config['model'],
             max_tokens=self.config['max_tokens'],native_tools=None)['content'].strip()
         if text.startswith('```json\n') and text.endswith('```'): text=text[8:-3].strip()
-        value,normalized,positions=b.parse_json_escapes(text,repair=True)
+        escaped,controls=escape_json_controls(text)
+        value,normalized,positions=b.parse_json_escapes(escaped,repair=True)
+        if controls:
+            b.write_once(path.with_name('json_control_view_'+path.stem+'.json'),{
+                'request_sha256':r.sha256_file(path),'policy':'literal_control_codepoints_inside_json_strings_only',
+                'positions':controls,'raw_text_sha256':p.digest(text),'value_sha256':p.digest(value),
+                'physical_content_edited':False})
         p.require(isinstance(value,dict),'Expected JSON object')
         if positions:
             b.write_once(path.with_name('json_escape_view_'+path.stem+'.json'),{
@@ -281,7 +336,7 @@ def confirm(output):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode',choices=['prepare','verify','run','confirm-detached'])
+    parser.add_argument('mode',choices=['prepare','verify','run','confirm-detached','recover-json-controls'])
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--corpus-release',type=Path)
     parser.add_argument('--parent-preparation',type=Path,help='Reuse only a verified identical generation/isolation handoff')
@@ -292,6 +347,7 @@ def main():
         prepare(output,args.corpus_release.resolve(),args.parent_preparation.resolve() if args.parent_preparation else None)
     elif args.mode=='verify':print(json.dumps(verify(output,source_check=True)['configuration_sha256']))
     elif args.mode=='confirm-detached':confirm(output)
+    elif args.mode=='recover-json-controls':recover_json_controls(output)
     else:run(output,args.phase)
 
 
