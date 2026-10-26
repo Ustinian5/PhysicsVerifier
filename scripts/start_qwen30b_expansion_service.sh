@@ -4,10 +4,10 @@ set -euo pipefail
 RUN=${1:?Pass the prepared expansion directory}
 GPU=${2:?Pass an available GPU index}
 UUID=${3:?Pass its matching GPU UUID}
-ENV=/home/visitor/huhengyuan/envs/physicsverifier
+PV_ENV=/home/visitor/huhengyuan/envs/physicsverifier
 MODEL=/slow_share2/huhengyuan/models/Qwen3-30B-A3B-Instruct-2507
-SITE=/home/visitor/huhengyuan/runtime/vllm_gptoss120b/lib/python3.10/site-packages
-export CONDA_PREFIX="$ENV" PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
+SITE=/home/visitor/huhengyuan/envs/vllm_gptoss120b/lib/python3.10/site-packages
+export CONDA_PREFIX="$PV_ENV" PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$SITE" CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$GPU"
 export NO_PROXY=127.0.0.1,localhost
 export TMPDIR=/home/visitor/huhengyuan/tmp/q30_expansion
@@ -22,7 +22,7 @@ exec 9>"$RUN/service/active.lock"
 flock -n 9 || { echo 'This expansion service already has a launcher'; exit 1; }
 echo "$$" > "$RUN/service/launcher.pid"
 trap 'code=$?; echo "$code" > "$RUN/service/exit_code"; rm -f "$RUN/service/launcher.pid"' EXIT
-"$ENV/bin/python" - "$RUN" "$UUID" "$MODEL" <<'PY'
+"$PV_ENV/bin/python" - "$RUN" "$UUID" "$MODEL" <<'PY'
 import hashlib,json,os,pathlib,shutil,socket,subprocess,sys
 root=pathlib.Path(sys.argv[1]);expected_uuid=sys.argv[2];model=pathlib.Path(sys.argv[3])
 config=json.loads((root/'selection.json').read_text())
@@ -44,7 +44,7 @@ if out.exists():assert json.loads(out.read_text())==data,'Checkpoint receipt dri
 else:out.write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n')
 print('Verified prior full-SHA checkpoint boundary and current metadata; free GPU admitted.',flush=True)
 PY
-"$ENV/bin/python" -u -m vllm.entrypoints.openai.api_server \
+"$PV_ENV/bin/python" -u -m vllm.entrypoints.openai.api_server \
   --model "$MODEL" --served-model-name Qwen3-30B-A3B-Instruct-2507 \
   --host 127.0.0.1 --port 18084 --dtype bfloat16 --tensor-parallel-size 1 \
   --gpu-memory-utilization 0.90 --max-model-len 32768 --max-num-seqs 8 \
