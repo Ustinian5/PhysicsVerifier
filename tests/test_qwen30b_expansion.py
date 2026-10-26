@@ -85,11 +85,12 @@ def test_parent_cached_empty_result_replays_without_network(tmp_path,monkeypatch
         run.parent_value(j,parent,stage,key,dict(payload,max_rules_per_sample=1))
 
 
-def test_prefix_receipt_and_bad_json_keep_invalid_content(tmp_path,monkeypatch):
+@pytest.mark.parametrize('text',['{"invalid“: unclosed', '{"x":"'+chr(92)+chr(10)+'"}'])
+def test_prefix_receipt_and_bad_json_keep_invalid_content(tmp_path,monkeypatch,text):
     parent=tmp_path/'parent';target=tmp_path/'child';key='x';stage='taxonomy'
     c={'model':'test','reasoning_effort':'medium','max_tokens':16384,'max_requests':20,
        'max_request_input_bytes':400000,'attempts_per_job':3,'distill_max_requests':0,'api_base':'http://127.0.0.1:18083/v1'}
-    j=run.e.Journal(target,c);payload={'domains':[]};text='{"invalid“: unclosed'
+    j=run.e.Journal(target,c);payload={'domains':[]}
     value={'_unparsed_response_text':text}
     body=run.r.request_body(c['model'],j.messages(stage,payload),16384,backend='vllm')
     body.update(stream=False,return_token_ids=True,reasoning_effort='medium');body.pop('stream_options',None)

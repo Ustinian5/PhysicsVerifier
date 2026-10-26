@@ -256,7 +256,12 @@ def parent_value(journal,parent,stage,key,payload):
     text=b.harmony.decode_response(raw,model=c['model'],max_tokens=c['max_tokens'],native_tools=None)['content'].strip()
     if text.startswith('```json\n') and text.endswith('```'):text=text[8:-3].strip()
     try:value=b.parse_json_escapes(e.escape_json_controls(text)[0],repair=True)[0]
-    except json.JSONDecodeError:value={'_unparsed_response_text':text}
+    except (json.JSONDecodeError, ValueError) as exc:
+        if not isinstance(exc,json.JSONDecodeError) and str(exc)!='Ambiguous escaped control character':
+            raise
+        # Match the completed v5 parser exactly; replay the original malformed
+        # text into its existing repair response, never alter or regenerate it.
+        value={'_unparsed_response_text':text}
     p.require((value==saved['value']) if receipt.exists() else (p.digest(value)==saved['value_sha256']),
               'Parent parsed result changed')
     b.write_once(journal.output/('arm_'+stage)/p.digest(key)[:24]/'prefix_replay.json',
