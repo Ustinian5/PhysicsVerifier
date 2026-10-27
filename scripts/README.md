@@ -234,3 +234,20 @@ python -m scripts.run_qwen30b_expansion confirm-detached --output <扩容目录�
 ```
 
 生成阶段写generation_release.json后关闭本批自己启动的30B；只对新回答提炼，父批初稿/规定结构修复按完整请求体重放，合并候选后重新组织ScenarioCluster。复用Domain/Topic名称、单来源规则保留，不调用embedding或外部教师；新库只作机器候选，build/release_manifest.json明确physical_quality_passed=false、usable_for_runtime=false，不自动接默认库或在线评测。支持collect/build分阶段及幂等恢复，所有模式均保留失败和来源证据；成功项不重跑。验证见`tests/test_qwen30b_expansion.py`。
+
+#### 大目录建树与快速恢复
+
+已完成提炼的扩容批次使用`reorganize_qwen30b_expansion.py`：逐规则重新分配Topic，再以每批4规则、每页16已有簇完成场景归组；全部语义步骤仍为120B。旧规则正文/来源不变，旧归组原件保留，新产物在同批`tree_v2/`。这是导航协议调整，不能当作旧归组无损重放或仅规模变化的消融。
+
+```bash
+python -m scripts.reorganize_qwen30b_expansion prepare --root <已有扩容目录>
+python -m scripts.reorganize_qwen30b_expansion verify --root <已有扩容目录>
+# run须在服务器后台运行；退出启动SSH后，在新会话confirm-detached。
+python -u -m scripts.reorganize_qwen30b_expansion run --root <已有扩容目录>
+python -m scripts.reorganize_qwen30b_expansion confirm-detached --root <已有扩容目录>
+python -m scripts.reorganize_qwen30b_expansion status --root <已有扩容目录>
+```
+
+迁入前先让旧客户端保存当前请求后停止并释放锁；保留根STOP，新的停止文件为`tree_v2/STOP`。prepare一次性导入并核验全部历史；恢复使用原子检查点及内容绑定的证据缓存，不重新解析全批响应或重算相同输入/bench的隔离。首次导入、最终发布全量SHA；平时核查清单、当前bench/代码/配置和变更文件，可用`verify --full`强制全量核验。每页均被访问后才允许新建簇，超出64页或判断不清保留未决；每次输入≤48,000字节，短编号精确映射，响应预算不增加。分页限制单次负载，最坏总比较量仍可能二次增长。
+
+仅漏编号可一次补齐，成功分配不能推翻；内容失败隔离，连续三次内容失败停止。历史用量与崩溃预留不清零。发布同时保留`unplaced_rules.json`，所有输入候选必须守恒；`physical_quality_passed=false`、`usable_for_runtime=false`，不自动替换默认库。工程覆盖见`tests/test_bounded_tree.py`，工程通过不代表物理质量验收。
