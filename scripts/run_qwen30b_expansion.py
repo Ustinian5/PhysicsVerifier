@@ -29,6 +29,10 @@ VERSION = 'qwen30b_cumulative5000_experience_v1'
 CLUSTER_RECOVERY = 'cluster_batch4_recovery.json'
 MISSING_RECOVERY = 'cluster_missing_recovery.json'
 MISSING_STAGE = 'complete_cluster_members'
+PROMPT_RECOVERY = 'cluster_prompt_recovery.json'
+PROMPT_STAGE = 'cluster_rules_item_focused'
+PROMPT_MISSING_STAGE = 'complete_cluster_members_item_focused'
+CLUSTER_INSTRUCTION = '围绕本批items逐项寻找与其物理前提和检查场景相容的已有组。已有groups是查找目录，不要逐条复述其名称或摘要，也不要反复列举与当前item无关或已排除的组。找到明确相容的已有组即记录该item的分配并处理下一项；不为节省输出而跳过候选比较，也不放宽“仅在确实不同场景时新建”的标准。保留原有编号、成员守恒和已有组不可修改要求，最后直接给出本批完整new_groups与assignments JSON；不要输出目录清单或讨论过程。'
 MISSING_INSTRUCTION = '''上一份归组JSON遗漏了以下编号：{missing}。
 这是本小批唯一一次补齐。保留上一份JSON的全部new_groups和assignments，不重新判断或返回已分配编号，不修改任何规则正文。
 仅给遗漏编号分配ScenarioCluster；可以使用原groups中的id、上一份new_groups中的key，或在确实需要时新增组。
@@ -38,13 +42,17 @@ MISSING_INSTRUCTION = '''上一份归组JSON遗漏了以下编号：{missing}。
 
 class ExpansionJournal(e.Journal):
     def supported_stages(self):
-        return super().supported_stages() | {MISSING_STAGE}
+        return super().supported_stages() | {MISSING_STAGE, PROMPT_STAGE, PROMPT_MISSING_STAGE}
 
     def messages(self, stage, payload):
-        if stage != MISSING_STAGE:
+        if stage == PROMPT_STAGE:
+            messages=super().messages('cluster_rules',payload)
+            messages[0]={**messages[0],'content':messages[0]['content']+'\n'+CLUSTER_INSTRUCTION}
+            return messages
+        if stage not in {MISSING_STAGE,PROMPT_MISSING_STAGE}:
             return super().messages(stage, payload)
         draft=json.dumps(payload['draft'],ensure_ascii=False,sort_keys=True).replace('<|','\\u003c|')
-        messages=super().messages('cluster_rules',payload['original'])+[
+        messages=self.messages(PROMPT_STAGE if stage==PROMPT_MISSING_STAGE else 'cluster_rules',payload['original'])+[
             {'role':'assistant','content':draft},
             {'role':'user','content':MISSING_INSTRUCTION.format(missing=json.dumps(payload['missing_ids']))}]
         r.assert_no_control_tokens(messages)
@@ -110,7 +118,8 @@ def verify_cluster_recovery(output, plan, proposed=None):
         p.require(original==current,'Frozen code/configuration changed')
         return None
     fix=b.read(receipt)
-    follow=proposed or (b.read(output/MISSING_RECOVERY) if (output/MISSING_RECOVERY).exists() else None)
+    follow=(proposed if proposed and proposed['policy']=='cluster_missing_only_once_v1' else
+            (b.read(output/MISSING_RECOVERY) if (output/MISSING_RECOVERY).exists() else None))
     replacement=fix['replacement_sources'];prefix=dict(fix['prefix_files'])
     if follow:
         p.require(follow['policy']=='cluster_missing_only_once_v1' and
@@ -123,6 +132,23 @@ def verify_cluster_recovery(output, plan, proposed=None):
             p.require(name not in prefix or prefix[name]==sha,'Recovery prefix conflict')
             prefix[name]=sha
         replacement=follow['replacement_sources']
+    concise=(proposed if proposed and proposed['policy']=='cluster_item_focused_after_prefix_v1' else
+             (b.read(output/PROMPT_RECOVERY) if (output/PROMPT_RECOVERY).exists() else None))
+    if concise:
+        p.require(follow is not None and
+                  concise['policy']=='cluster_item_focused_after_prefix_v1' and
+                  concise['previous_receipt_sha256']==r.sha256_file(output/MISSING_RECOVERY) and
+                  concise['previous_sources']==replacement and
+                  concise['configuration_sha256']==plan['configuration_sha256'] and
+                  concise['instruction_sha256']==p.digest(CLUSTER_INSTRUCTION) and
+                  concise['instruction']==CLUSTER_INSTRUCTION and
+                  concise['new_stage']==PROMPT_STAGE,'Invalid cluster prompt recovery binding')
+        for name,sha in concise['prefix_files'].items():
+            p.require(name not in prefix or prefix[name]==sha,'Recovery prefix conflict')
+            prefix[name]=sha
+        p.require(all(name in prefix for name in concise['completed_cluster_results']) and
+                  concise['failed_request'] in prefix,'Unbound prompt recovery evidence')
+        replacement=concise['replacement_sources']
     p.require(fix['policy']=='cluster_batch4_after_completed_prefix_v1' and
               fix['configuration_sha256']==plan['configuration_sha256'] and
               fix['original_sources']==original and replacement==current and
@@ -158,10 +184,10 @@ def missing_cluster_ids(value, payload):
     return [key for key in expected if key not in seen]
 
 
-def complete_cluster_members(key, payload, draft, call):
+def complete_cluster_members(key, payload, draft, call, stage=MISSING_STAGE):
     missing=missing_cluster_ids(draft,payload)
     p.require(bool(missing),'No missing members to complete')
-    addition=call(MISSING_STAGE,key,{'original':payload,'draft':draft,'missing_ids':missing})
+    addition=call(stage,key,{'original':payload,'draft':draft,'missing_ids':missing})
     repair_payload={**payload,'items':[x for x in payload['items'] if x['id'] in missing],
         'groups':payload['groups']+[{'id':g['key'],'name':g['name'],'summary':g['summary']}
                                    for g in draft['new_groups']]}
@@ -223,6 +249,83 @@ def register_cluster_missing(output):
         verify_cluster_recovery(output,plan,proposed=follow)
         b.write_once(output/MISSING_RECOVERY,follow)
         verify(output)
+
+
+def cluster_request(journal, stage, payload):
+    c=journal.config
+    body=r.request_body(c['model'],journal.messages(stage,payload),c['max_tokens'],backend='vllm')
+    body.update(stream=False,return_token_ids=True,reasoning_effort=c['reasoning_effort'])
+    body.pop('stream_options',None)
+    return body
+
+
+def register_cluster_prompt(output):
+    """Append the approved prompt amendment; never replace a prior receipt."""
+    plan=b.read(output/'plan.json');c=plan['configuration']
+    parent=Path(b.read(output/'selection.json')['parent_build'])
+    with r.run_lock(output/'active.lock'),r.run_lock(parent/'active.lock'):
+        if (output/PROMPT_RECOVERY).exists():verify(output);return
+        p.require(not (output/'runner.pid').exists() and not (output/'build/release_manifest.json').exists(),
+                  'Stop runner before registering recovery')
+        state=b.read(output/'execution_status.json');last=b.read(output/'build/execution_status.json')
+        p.require(state['state']=='stopped' and state.get('error')=='Incomplete model output' and
+                  last['stage']=='cluster_rules' and
+                  last['key']=='mechanics/kinematics_in_1d_2d_3d:492:batch4:0',
+                  'Not the approved prompt boundary')
+        folder=output/'build/arm_cluster_rules'/p.digest(last['key'])[:24]
+        paths=sorted(folder.glob('request_*.json'))
+        p.require(len(paths)==1 and not (folder/'result.json').exists(),'Unexpected boundary evidence')
+        rawpath=paths[0];raw=b.read(rawpath)
+        p.require(r.sha256_file(rawpath)=='a7358cdf2bfc8cf1176f42794551e111147c00d659976c76b34b65de82a9f753' and
+                  raw.get('http_status')==200 and not raw.get('error') and
+                  raw['response']['model']==c['construction']['model'] and
+                  raw['response']['choices'][0]['finish_reason']=='length' and
+                  not raw['response']['choices'][0]['message'].get('content') and
+                  c['construction']['max_tokens']==16384,'Unexpected truncated response')
+        payload=json.loads(raw['request']['messages'][-1]['content'])
+        journal=ExpansionJournal(output/'build',c['construction'],True)
+        p.require(cluster_request(journal,'cluster_rules',payload)==raw['request'] and
+                  len(payload['items'])==4 and len(payload['groups'])==370,'Truncated input changed')
+        budget=b.read(output/'build/budget.json');p.require(budget['in_flight']==0,'In-flight request')
+        prefix={str(f.relative_to(output)):r.sha256_file(f)
+                for f in sorted((output/'build').glob('arm_*/*/*.json'))}
+        for name in ('plan.json',CLUSTER_RECOVERY,MISSING_RECOVERY,'cluster_batch4_replay.json',
+                     'cluster_missing_replay.json','generation_release.json','build/inputs.json',
+                     'build/extraction_checkpoint.json'):
+            prefix[name]=r.sha256_file(output/name)
+        completed=sorted(n for n in prefix if n.startswith('build/arm_cluster_rules/') and n.endswith('/result.json'))
+        completions=sum(n.startswith('build/arm_'+MISSING_STAGE+'/') and n.endswith('/result.json') for n in prefix)
+        p.require(len(completed)==69 and completions==1,'Unexpected successful prefix')
+        follow={'policy':'cluster_item_focused_after_prefix_v1','actor':'Codex assistant','human_gold':False,
+            'authorization':'User approved prompt revision only at failed 492 sub-batch and afterwards on 2026-10-27',
+            'configuration_sha256':plan['configuration_sha256'],
+            'previous_receipt_sha256':r.sha256_file(output/MISSING_RECOVERY),
+            'previous_sources':b.read(output/MISSING_RECOVERY)['replacement_sources'],
+            'replacement_sources':hashes(),'prefix_files':prefix,'completed_cluster_results':completed,
+            'completed_missing_records':completions,'failed_key':last['key'],
+            'failed_request':str(rawpath.relative_to(output)),'instruction':CLUSTER_INSTRUCTION,
+            'instruction_sha256':p.digest(CLUSTER_INSTRUCTION),'new_stage':PROMPT_STAGE,
+            'budget_before':budget,'previous_status':state,'previous_build_status':last,
+            'previous_exit_code':(output/'runner.exit_code').read_text().strip(),
+            'registered_unix':time.time(),'new_model_calls':0,
+            'unchanged':['full_groups','items','batch_size_4','model','reasoning_effort','response_token_cap',
+                         'source_cohort','extraction','physical_standards','one_missing_completion_limit']}
+        verify_cluster_recovery(output,plan,proposed=follow)
+        b.write_once(output/PROMPT_RECOVERY,follow)
+        verify(output)
+
+
+def cluster_stage(output, key, fix):
+    if not fix:return 'cluster_rules'
+    relative='build/arm_cluster_rules/'+p.digest(key)[:24]+'/result.json'
+    if relative in fix['completed_cluster_results']:return 'cluster_rules'
+    folder=(output/relative).parent
+    if key==fix['failed_key']:
+        p.require(not (folder/'result.json').exists(),'Truncated boundary unexpectedly has a result')
+    else:
+        p.require(not list(folder.glob('request_*.json')) and not (folder/'result.json').exists(),
+                  'Unregistered old-prompt response')
+    return PROMPT_STAGE
 
 
 def register_cluster_batch4(output):
@@ -528,7 +631,9 @@ def build(output,c,parent,offline=False):
     baseline_ids={x['id'] for x in baseline}
     amendment=b.read(output/CLUSTER_RECOVERY) if (output/CLUSTER_RECOVERY).exists() else None
     missing_fix=b.read(output/MISSING_RECOVERY) if (output/MISSING_RECOVERY).exists() else None
+    prompt_fix=b.read(output/PROMPT_RECOVERY) if (output/PROMPT_RECOVERY).exists() else None
     replay_counts=Counter()
+    prompt_boundary_seen=False
     def raw_call(stage,key,payload):
         if stage=='taxonomy' or (stage in {'extract_experience','repair_experience'} and key in baseline_ids):
             found,value=parent_value(journal,parent,stage,key,payload)
@@ -549,14 +654,29 @@ def build(output,c,parent,offline=False):
                     p.require(not (output/'STOP').exists(),'STOP requested')
                     status(output,'waiting_transient',stage=stage,key=key,ready_unix=deadline)
                     time.sleep(min(10,max(.1,deadline-time.time())))
+    def child_call(stage,key,payload):
+        nonlocal prompt_boundary_seen
+        actual=cluster_stage(output,key,prompt_fix)
+        if actual==PROMPT_STAGE:
+            if key==prompt_fix['failed_key']:
+                failed=b.read(output/prompt_fix['failed_request'])
+                p.require(cluster_request(journal,'cluster_rules',payload)==failed['request'],
+                          'Prompt amendment boundary input differs from frozen failure')
+                prompt_boundary_seen=True
+            p.require(prompt_boundary_seen,'New prompt requested before approved boundary')
+        return raw_call(actual,key,payload)
     def complete(key,payload,draft):
-        value=complete_cluster_members(key,payload,draft,raw_call)
-        folder=target/'arm_cluster_rules'/p.digest(key)[:24]
-        b.write_once(folder/'missing_completion.json',{
+        actual=cluster_stage(output,key,prompt_fix)
+        completion_stage=PROMPT_MISSING_STAGE if actual==PROMPT_STAGE else MISSING_STAGE
+        value=complete_cluster_members(key,payload,draft,raw_call,stage=completion_stage)
+        folder=target/('arm_'+actual)/p.digest(key)[:24]
+        evidence={
             'amendment_sha256':r.sha256_file(output/MISSING_RECOVERY),
             'original_result_sha256':r.sha256_file(folder/'result.json'),
-            'completion_result_sha256':r.sha256_file(target/('arm_'+MISSING_STAGE)/p.digest(key)[:24]/'result.json'),
-            'payload_sha256':p.digest(payload),'value':value,'not_a_model_response':True})
+            'completion_result_sha256':r.sha256_file(target/('arm_'+completion_stage)/p.digest(key)[:24]/'result.json'),
+            'payload_sha256':p.digest(payload),'value':value,'not_a_model_response':True}
+        if actual==PROMPT_STAGE:evidence['prompt_amendment_sha256']=r.sha256_file(output/PROMPT_RECOVERY)
+        b.write_once(folder/'missing_completion.json',evidence)
         return value
     def call(stage,key,payload):
         if stage=='cluster_rules' and amendment:
@@ -574,11 +694,15 @@ def build(output,c,parent,offline=False):
             else:
                 p.require(not list(folder.glob('request_*.json')) and not (folder/'result.json').exists(),
                           'Unregistered original cluster response')
-            value,children=split_cluster_batch(key,payload,raw_call,complete if missing_fix else None)
-            b.write_once(folder/'split4_result.json',{'amendment_sha256':r.sha256_file(output/CLUSTER_RECOVERY),
+            value,children=split_cluster_batch(key,payload,child_call,complete if missing_fix else None)
+            stages={child:cluster_stage(output,child,prompt_fix) for child in children}
+            evidence={'amendment_sha256':r.sha256_file(output/CLUSTER_RECOVERY),
                 'payload_sha256':p.digest(payload),'value':value,'not_a_model_response':True,
-                'children':{child:r.sha256_file(target/'arm_cluster_rules'/p.digest(child)[:24]/'result.json')
-                            for child in children}})
+                'children':{child:r.sha256_file(target/('arm_'+stages[child])/p.digest(child)[:24]/'result.json')
+                            for child in children}}
+            if PROMPT_STAGE in stages.values():
+                evidence.update(child_stages=stages,prompt_amendment_sha256=r.sha256_file(output/PROMPT_RECOVERY))
+            b.write_once(folder/'split4_result.json',evidence)
             return value
         draft=raw_call(stage,key,payload)
         if stage=='extract_experience':
@@ -598,6 +722,7 @@ def build(output,c,parent,offline=False):
         'generation_release_sha256':r.sha256_file(output/'generation_release.json'),
         'clustering_amendment_sha256':r.sha256_file(output/CLUSTER_RECOVERY) if amendment else None,
         'missing_member_amendment_sha256':r.sha256_file(output/MISSING_RECOVERY) if missing_fix else None,
+        'cluster_prompt_amendment_sha256':r.sha256_file(output/PROMPT_RECOVERY) if prompt_fix else None,
         'files':{str(x.relative_to(target)):r.sha256_file(x) for x in sorted(target.rglob('*.json'))
                  if x.name not in {'execution_status.json','release_manifest.json'}}})
     status(output,'completed_candidate_collection',counts=built['counts'])
@@ -611,6 +736,19 @@ def replay_cluster_prefix(output):
         parent_ready(output)
         try:build(output,plan['configuration'],parent,offline=True)
         except OfflineReplayComplete as exc:
+            if (output/PROMPT_RECOVERY).exists():
+                follow=b.read(output/PROMPT_RECOVERY)
+                p.require(exc.stage==PROMPT_STAGE and exc.key==follow['failed_key'] and
+                          exc.counts.get('cluster_rules')==len(follow['completed_cluster_results']) and
+                          exc.counts.get(MISSING_STAGE)==follow['completed_missing_records'] and
+                          exc.counts.get('extract_experience')==len(b.read(output/'build/inputs.json')),
+                          'Replay did not reach the exact prompt amendment boundary')
+                b.write_once(output/'cluster_prompt_replay.json',{'passed':True,'new_model_calls':0,
+                    'amendment_sha256':r.sha256_file(output/PROMPT_RECOVERY),
+                    'configuration_sha256':plan['configuration_sha256'],'replayed_calls':exc.counts,
+                    'first_new_stage':exc.stage,'first_new_key':exc.key,'failed_payload_exactly_matched':True})
+                print('Prompt amendment prefix replay passed; zero model calls.',flush=True)
+                return
             if (output/MISSING_RECOVERY).exists():
                 follow=b.read(output/MISSING_RECOVERY)
                 p.require(exc.stage==MISSING_STAGE and exc.key==follow['failed_key'] and
@@ -659,6 +797,12 @@ def run(output,phase):
                     p.require(proof.get('passed') and proof.get('new_model_calls')==0 and
                               proof['amendment_sha256']==r.sha256_file(output/MISSING_RECOVERY),
                               'Missing-member recovery requires its own offline replay')
+                if (output/PROMPT_RECOVERY).exists():
+                    proof=b.read(output/'cluster_prompt_replay.json')
+                    p.require(proof.get('passed') and proof.get('new_model_calls')==0 and
+                              proof.get('failed_payload_exactly_matched') and
+                              proof['amendment_sha256']==r.sha256_file(output/PROMPT_RECOVERY),
+                              'Prompt recovery requires its own offline replay')
                 (output/'runner.exit_code').unlink(missing_ok=True)
             # Verify every complete original generation before any new inference.
             released_corpus.load(Path(s['base_corpus'])/'release_manifest.json',Path(s['base_corpus'])/'answers.json',full=True,complete_answers=True)
@@ -685,7 +829,8 @@ def confirm(output):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode',choices=['prepare','verify','run','confirm-detached','status',
-                                       'register-cluster-batch4','register-cluster-missing','replay-cluster-prefix'])
+                                       'register-cluster-batch4','register-cluster-missing',
+                                       'register-cluster-prompt','replay-cluster-prefix'])
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--phase',choices=['collect','build','all'],default='all')
     a=parser.parse_args()
@@ -695,6 +840,7 @@ def main():
     elif a.mode=='confirm-detached':confirm(a.output)
     elif a.mode=='register-cluster-batch4':register_cluster_batch4(a.output)
     elif a.mode=='register-cluster-missing':register_cluster_missing(a.output)
+    elif a.mode=='register-cluster-prompt':register_cluster_prompt(a.output)
     elif a.mode=='replay-cluster-prefix':replay_cluster_prefix(a.output)
     else:print(json.dumps(b.read(a.output/'execution_status.json'),ensure_ascii=False))
 

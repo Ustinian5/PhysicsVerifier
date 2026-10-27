@@ -310,3 +310,82 @@ def test_missing_amendment_chains_old_receipt_without_replacing_it(tmp_path,monk
     with pytest.raises(ValueError,match='binding'):run.verify_cluster_recovery(tmp_path,plan,proposed=follow)
     follow['max_completion_rounds']=1;follow['previous_sources']={}
     with pytest.raises(ValueError,match='binding'):run.verify_cluster_recovery(tmp_path,plan,proposed=follow)
+
+
+def test_prompt_revision_preserves_old_messages_full_catalog_and_completion_context():
+    journal=object.__new__(run.ExpansionJournal)
+    payload={'topic_key':'t','groups':[{'id':f'G{i}','name':f'n{i}','summary':f's{i}'} for i in range(370)],
+             'items':[{'id':f'I{i}','rule':{'text':f'leaf {i}'}} for i in range(4)]}
+    before=copy.deepcopy(payload)
+    old=run.e.Journal.messages(journal,'cluster_rules',payload)
+    new=journal.messages(run.PROMPT_STAGE,payload)
+    assert journal.messages('cluster_rules',payload)==old
+    assert new[0]['content']==old[0]['content']+'\n'+run.CLUSTER_INSTRUCTION
+    assert new[1:]==old[1:] and payload==before
+    draft={'new_groups':[],'assignments':[{'item_id':'I0','group_id':'G0'}]}
+    wire={'original':payload,'draft':draft,'missing_ids':['I1','I2','I3']}
+    assert journal.messages(run.MISSING_STAGE,wire)[:2]==old
+    assert journal.messages(run.PROMPT_MISSING_STAGE,wire)[:2]==new
+    assert journal.messages(run.MISSING_STAGE,wire)[2:]==journal.messages(run.PROMPT_MISSING_STAGE,wire)[2:]
+    assert {run.PROMPT_STAGE,run.PROMPT_MISSING_STAGE}<=journal.supported_stages()
+
+
+def test_prompt_routing_replays_all_old_results_and_never_overwrites_failed_raw(tmp_path):
+    old_key='t:480:batch4:8';failed_key='t:492:batch4:0';next_key='t:492:batch4:4'
+    old_rel='build/arm_cluster_rules/'+p.digest(old_key)[:24]+'/result.json'
+    failed_folder=tmp_path/'build/arm_cluster_rules'/p.digest(failed_key)[:24]
+    run.r.write_json(tmp_path/old_rel,{'value':'old'})
+    run.r.write_json(failed_folder/'request_001.json',{'finish_reason':'length'})
+    before=run.r.sha256_file(failed_folder/'request_001.json')
+    fix={'completed_cluster_results':[old_rel],'failed_key':failed_key}
+    assert run.cluster_stage(tmp_path,old_key,fix)=='cluster_rules'
+    assert run.cluster_stage(tmp_path,failed_key,fix)==run.PROMPT_STAGE
+    assert run.cluster_stage(tmp_path,next_key,fix)==run.PROMPT_STAGE
+    assert run.r.sha256_file(failed_folder/'request_001.json')==before
+    unexpected=tmp_path/'build/arm_cluster_rules'/p.digest(next_key)[:24]/'result.json'
+    run.r.write_json(unexpected,{'value':'unregistered'})
+    with pytest.raises(ValueError,match='Unregistered'):run.cluster_stage(tmp_path,next_key,fix)
+
+
+def test_new_prompt_completion_retains_once_only_validation():
+    payload={'groups':[{'id':'G1','name':'old','summary':'s'}],'items':[{'id':'I1'},{'id':'I2'}]}
+    draft={'new_groups':[],'assignments':[{'item_id':'I1','group_id':'G1'}]};calls=[]
+    def call(stage,key,wire):
+        calls.append((stage,key,wire))
+        return {'new_groups':[],'assignments':[]}
+    with pytest.raises(ValueError,match='still omits'):
+        run.complete_cluster_members('k',payload,draft,call,stage=run.PROMPT_MISSING_STAGE)
+    assert len(calls)==1 and calls[0][0]==run.PROMPT_MISSING_STAGE
+    assert calls[0][2]['draft']==draft and calls[0][2]['original']==payload
+
+
+def test_prompt_amendment_appends_third_source_binding(tmp_path,monkeypatch):
+    old={'scripts/run_qwen30b_expansion.py':'old','prompt.py':'same'}
+    batch={**old,'scripts/run_qwen30b_expansion.py':'batch'}
+    missing={**old,'scripts/run_qwen30b_expansion.py':'missing'}
+    current={**old,'scripts/run_qwen30b_expansion.py':'prompt'}
+    monkeypatch.setattr(run,'hashes',lambda:current)
+    plan={'configuration':{'source_hashes':old},'configuration_sha256':'config'}
+    run.r.write_json(tmp_path/'failure.json',{'original':'length'})
+    prefix={'failure.json':run.r.sha256_file(tmp_path/'failure.json')}
+    fix={'policy':'cluster_batch4_after_completed_prefix_v1','configuration_sha256':'config',
+         'original_sources':old,'replacement_sources':batch,'old_batch_size':12,'new_batch_size':4,'prefix_files':prefix}
+    run.r.write_json(tmp_path/run.CLUSTER_RECOVERY,fix)
+    follow={'policy':'cluster_missing_only_once_v1','configuration_sha256':'config',
+            'previous_receipt_sha256':run.r.sha256_file(tmp_path/run.CLUSTER_RECOVERY),
+            'previous_sources':batch,'replacement_sources':missing,
+            'instruction_sha256':p.digest(run.MISSING_INSTRUCTION),'max_completion_rounds':1,'prefix_files':prefix}
+    run.r.write_json(tmp_path/run.MISSING_RECOVERY,follow)
+    previous_sha=run.r.sha256_file(tmp_path/run.MISSING_RECOVERY)
+    concise={'policy':'cluster_item_focused_after_prefix_v1','configuration_sha256':'config',
+             'previous_receipt_sha256':previous_sha,'previous_sources':missing,'replacement_sources':dict(current),
+             'instruction_sha256':p.digest(run.CLUSTER_INSTRUCTION),'instruction':run.CLUSTER_INSTRUCTION,
+             'new_stage':run.PROMPT_STAGE,'prefix_files':prefix,'failed_request':'failure.json',
+             'completed_cluster_results':[]}
+    assert run.verify_cluster_recovery(tmp_path,plan,proposed=concise)==fix
+    assert run.r.sha256_file(tmp_path/run.MISSING_RECOVERY)==previous_sha
+    for field,value in [('instruction','changed'),('previous_sources',batch),('instruction_sha256','changed')]:
+        bad={**concise,field:value}
+        with pytest.raises(ValueError,match='binding'):run.verify_cluster_recovery(tmp_path,plan,proposed=bad)
+    run.r.write_json(tmp_path/'failure.json',{'original':'overwritten'})
+    with pytest.raises(ValueError,match='prefix changed'):run.verify_cluster_recovery(tmp_path,plan,proposed=concise)
