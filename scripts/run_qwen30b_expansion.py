@@ -26,6 +26,7 @@ from rule_framework import released_corpus
 
 b, p, r = e.b, e.p, e.r
 VERSION = 'qwen30b_cumulative5000_experience_v1'
+CLUSTER_RECOVERY = 'cluster_batch4_recovery.json'
 SOURCES = sorted(set(e.SOURCES + g.SOURCES + ['scripts/prepare_qwen30b_expansion.py',
                                  'scripts/run_qwen30b_expansion.py',
                                  'scripts/start_qwen30b_expansion_service.sh']))
@@ -59,7 +60,8 @@ def initialize(output):
 def verify(output, replay=False):
     plan = b.read(output/'plan.json'); c = plan['configuration']; s = b.read(output/'selection.json')
     p.require(p.digest(c)==plan['configuration_sha256'] and c['protocol']==VERSION and
-              c['source_hashes']==hashes() and c['target_questions']==5000, 'Frozen code/configuration changed')
+              c['target_questions']==5000, 'Frozen code/configuration changed')
+    verify_cluster_recovery(output, plan)
     p.require(p.digest(s)==c['selection_sha256'],'Selection changed')
     for name,sha in {**s['source_files'],**s['base_bindings']}.items():
         p.require(r.sha256_file(Path(name))==sha,'Source binding changed: '+name)
@@ -76,6 +78,119 @@ def verify(output, replay=False):
         p.require(p.digest(selected)==s['reserve_sha256'] and p.digest(isolation)==s['isolation_sha256'],
                   'Source isolation does not replay')
     return plan
+
+
+def verify_cluster_recovery(output, plan):
+    """Only an explicit amendment can replace this runner; old plan stays intact."""
+    original=plan['configuration']['source_hashes'];current=hashes()
+    receipt=output/CLUSTER_RECOVERY
+    if not receipt.exists():
+        p.require(original==current,'Frozen code/configuration changed')
+        return None
+    fix=b.read(receipt)
+    p.require(fix['policy']=='cluster_batch4_after_completed_prefix_v1' and
+              fix['configuration_sha256']==plan['configuration_sha256'] and
+              fix['original_sources']==original and fix['replacement_sources']==current and
+              set(original)==set(current) and
+              {k for k in current if current[k]!=original[k]}=={'scripts/run_qwen30b_expansion.py'} and
+              fix['new_batch_size']==4 and fix['old_batch_size']==12,
+              'Invalid cluster recovery binding')
+    for name,sha in fix['prefix_files'].items():
+        rel=Path(name)
+        p.require(not rel.is_absolute() and '..' not in rel.parts,'Unsafe recovery path')
+        p.require(r.sha256_file(output/rel)==sha,'Recovery prefix changed: '+name)
+    return fix
+
+
+def register_cluster_batch4(output):
+    """Register the user-approved batching amendment without changing old evidence."""
+    plan=b.read(output/'plan.json');c=plan['configuration'];current=hashes()
+    parent=Path(b.read(output/'selection.json')['parent_build'])
+    with r.run_lock(output/'active.lock'),r.run_lock(parent/'active.lock'):
+        if (output/CLUSTER_RECOVERY).exists():verify(output);return
+        p.require(p.digest(c)==plan['configuration_sha256'] and c['protocol']==VERSION and
+                  set(current)==set(c['source_hashes']) and
+                  {k for k in current if current[k]!=c['source_hashes'][k]}=={'scripts/run_qwen30b_expansion.py'},
+                  'Unexpected source change before amendment')
+        p.require(not (output/'runner.pid').exists() and not (output/'build/release_manifest.json').exists(),
+                  'Stop runner before registering recovery')
+        state=b.read(output/'execution_status.json');last=b.read(output/'build/execution_status.json')
+        p.require(state['state']=='stopped' and state.get('error')=='Incomplete model output' and
+                  last.get('stage')=='cluster_rules' and c['construction']['batch_size']==12,
+                  'Not the stopped cluster truncation')
+        folder=output/'build/arm_cluster_rules'/p.digest(last['key'])[:24]
+        paths=sorted(folder.glob('request_*.json'))
+        p.require(len(paths)==1 and not (folder/'result.json').exists(),'Unexpected failed job history')
+        raw=b.read(paths[0]);resp=raw.get('response') or {};choices=resp.get('choices') or []
+        p.require(raw.get('http_status')==200 and not raw.get('error') and
+                  resp.get('model')==c['construction']['model'] and len(choices)==1 and
+                  choices[0].get('finish_reason')=='length' and
+                  (resp.get('usage') or {}).get('completion_tokens')==c['construction']['max_tokens'] and
+                  not (choices[0].get('message') or {}).get('content'), 'Failure is not the reviewed truncation')
+        budget=b.read(output/'build/budget.json')
+        p.require(budget['in_flight']==0,'In-flight request at recovery')
+        prefix={str(f.relative_to(output)):r.sha256_file(f) for f in sorted((output/'build').glob('arm_*/*/*.json'))}
+        for name in ('plan.json','generation_release.json','build/inputs.json','build/extraction_checkpoint.json'):
+            prefix[name]=r.sha256_file(output/name)
+        completed=sorted(str(f.relative_to(output)) for f in (output/'build/arm_cluster_rules').glob('*/result.json'))
+        p.require(len(completed)==27,'Unexpected completed cluster prefix')
+        b.write_once(output/CLUSTER_RECOVERY,{'policy':'cluster_batch4_after_completed_prefix_v1',
+            'authorization':'User approved subsequent clustering batch 12 to 4 on 2026-10-27',
+            'actor':'Codex assistant','human_gold':False,'configuration_sha256':plan['configuration_sha256'],
+            'original_sources':c['source_hashes'],'replacement_sources':current,'prefix_files':prefix,
+            'completed_cluster_results':completed,'failed_key':last['key'],
+            'failed_request':str(paths[0].relative_to(output)),'old_batch_size':12,'new_batch_size':4,
+            'previous_status':state,'previous_build_status':last,'budget_before':budget,
+            'previous_exit_code':(output/'runner.exit_code').read_text().strip(),
+            'protocol_change':'Remaining original batches split in original order into at most four items; full registry retained; incremental new groups visible to the next sub-batch. Old successes replayed exactly.',
+            'unchanged':['models','prompts','response_token_cap','source_cohort','extraction','physical_standards'],
+            'new_model_calls':0,'registered_unix':time.time()})
+        verify(output)
+
+
+def split_cluster_batch(key, payload, call):
+    """Lossless ID projection across sequential four-item calls, no leaf edits."""
+    items=payload['items'];groups=[dict(g) for g in payload['groups']]
+    p.require(0<len(items)<=12 and len({x['id'] for x in items})==len(items),'Invalid original batch')
+    aliases={g['id']:g['id'] for g in groups}
+    p.require(len(aliases)==len(groups),'Duplicate existing cluster')
+    new_groups=[];assignments=[];keys=[]
+    for start in range(0,len(items),4):
+        batch=items[start:start+4];child_key=f'{key}:batch4:{start}'
+        value=call('cluster_rules',child_key,{**payload,'items':batch,'groups':[dict(g) for g in groups]})
+        p.require(isinstance(value,dict) and isinstance(value.get('new_groups'),list) and
+                  isinstance(value.get('assignments'),list),'Invalid split cluster response')
+        local={}
+        for group in value['new_groups']:
+            p.text_fields(group,('key','name','summary'))
+            p.require(group['key'] not in local and group['key'] not in aliases,'Split group ID collision')
+            local[group['key']]=group
+        for a in value['assignments']:p.text_fields(a,('item_id','group_id'))
+        p.require(Counter(a['item_id'] for a in value['assignments'])==Counter(x['id'] for x in batch),
+                  'Missing or duplicate split member')
+        p.require(all(a['group_id'] in aliases or a['group_id'] in local for a in value['assignments']),
+                  'Unknown split group ID')
+        mapped={}
+        for i,(name,group) in enumerate(local.items()):
+            p.require(any(a['group_id']==name for a in value['assignments']),'Empty new split group')
+            target=f'batch4_{start}_{i+1}'
+            p.require(target not in aliases,'Split aggregate ID collision')
+            mapped[name]=target
+            new_groups.append({'key':target,'name':group['name'],'summary':group['summary']})
+        assignments.extend({'item_id':a['item_id'],'group_id':mapped[a['group_id']] if a['group_id'] in mapped
+                            else aliases[a['group_id']]} for a in value['assignments'])
+        for name,group in local.items():
+            alias=f'G{len(groups)+1}'
+            p.require(alias not in aliases,'Split navigation ID collision')
+            aliases[alias]=mapped[name];groups.append({'id':alias,'name':group['name'],'summary':group['summary']})
+        keys.append(child_key)
+    return {'new_groups':new_groups,'assignments':assignments},keys
+
+
+class OfflineReplayComplete(RuntimeError):
+    def __init__(self,stage,key,counts):
+        self.stage,self.key,self.counts=stage,key,dict(counts)
+        super().__init__('Offline replay stops before the first new request')
 
 
 def checked_release(root, name):
@@ -269,7 +384,7 @@ def parent_value(journal,parent,stage,key,payload):
     return True,value
 
 
-def build(output,c,parent):
+def build(output,c,parent,offline=False):
     target=output/'build';target.mkdir(exist_ok=True)
     if (target/'release_manifest.json').exists():checked_release(target,'release_manifest.json');return
     generation=checked_release(output,'generation_release.json');s=b.read(output/'selection.json')
@@ -285,14 +400,20 @@ def build(output,c,parent):
     if pc.get('draft_prefix_parent'):ancestors.append(Path(pc['draft_prefix_parent']))
     journal.budget=b.BatchBudget(target,journal.budget.limits,prior_runs=tuple(ancestors),stop_file=output/'STOP')
     baseline_ids={x['id'] for x in baseline}
+    amendment=b.read(output/CLUSTER_RECOVERY) if (output/CLUSTER_RECOVERY).exists() else None
+    replay_counts=Counter()
     def raw_call(stage,key,payload):
         if stage=='taxonomy' or (stage in {'extract_experience','repair_experience'} and key in baseline_ids):
             found,value=parent_value(journal,parent,stage,key,payload)
             p.require(found,'Missing completed base result; do not rerun old rows')
+            replay_counts[stage]+=1
             return value
+        if offline and not (target/('arm_'+stage)/p.digest(key)[:24]/'result.json').exists():
+            raise OfflineReplayComplete(stage,key,replay_counts)
         while True:
             p.require(not (output/'STOP').exists(),'STOP requested')
-            try:return journal(stage,key,payload)
+            try:
+                value=journal(stage,key,payload);replay_counts[stage]+=1;return value
             except Exception:
                 paths=sorted((target/('arm_'+stage)/p.digest(key)[:24]).glob('request_*.json'))
                 if not paths or len(paths)>=config['attempts_per_job'] or not b.retryable_transport_failure(b.read(paths[-1])):raise
@@ -302,12 +423,33 @@ def build(output,c,parent):
                     status(output,'waiting_transient',stage=stage,key=key,ready_unix=deadline)
                     time.sleep(min(10,max(.1,deadline-time.time())))
     def call(stage,key,payload):
+        if stage=='cluster_rules' and amendment:
+            folder=target/'arm_cluster_rules'/p.digest(key)[:24]
+            if str((folder/'result.json').relative_to(output)) in amendment['completed_cluster_results']:
+                return raw_call(stage,key,payload)
+            if key==amendment['failed_key']:
+                # The original truncated request must be the exact next input,
+                # including the registry reconstructed from all 27 successes.
+                failed=b.read(output/amendment['failed_request'])
+                body=r.request_body(config['model'],journal.messages(stage,payload),config['max_tokens'],backend='vllm')
+                body.update(stream=False,return_token_ids=True,reasoning_effort=config['reasoning_effort'])
+                body.pop('stream_options',None)
+                p.require(body==failed['request'],'Failed cluster input or successful prefix changed')
+            else:
+                p.require(not list(folder.glob('request_*.json')) and not (folder/'result.json').exists(),
+                          'Unregistered original cluster response')
+            value,children=split_cluster_batch(key,payload,raw_call)
+            b.write_once(folder/'split4_result.json',{'amendment_sha256':r.sha256_file(output/CLUSTER_RECOVERY),
+                'payload_sha256':p.digest(payload),'value':value,'not_a_model_response':True,
+                'children':{child:r.sha256_file(target/'arm_cluster_rules'/p.digest(child)[:24]/'result.json')
+                            for child in children}})
+            return value
         draft=raw_call(stage,key,payload)
         if stage=='extract_experience':
             try:e.extraction.normalize_120b_experience(draft,**payload)
             except ValueError as exc:return raw_call('repair_experience',key,{'original':payload,'draft':draft,'validation_error':str(exc)})
         return draft
-    auditor_ready(config)
+    if not offline:auditor_ready(config)
     built=e.flow.build_120b_experience_catalog(rows,b.read(output/'bench_questions.json'),call,
         topic_skeleton=b.read(parent/'topic_skeleton.json'),max_rules_per_sample=config['max_rules_per_sample'],
         batch_size=config['batch_size'],retain_invalid=True)
@@ -318,9 +460,31 @@ def build(output,c,parent):
         'physical_quality_passed':False,'usable_for_runtime':False,'human_gold':False,'counts':built['counts'],
         'parent_release_sha256':r.sha256_file(parent/'release_manifest.json'),
         'generation_release_sha256':r.sha256_file(output/'generation_release.json'),
+        'clustering_amendment_sha256':r.sha256_file(output/CLUSTER_RECOVERY) if amendment else None,
         'files':{str(x.relative_to(target)):r.sha256_file(x) for x in sorted(target.rglob('*.json'))
                  if x.name not in {'execution_status.json','release_manifest.json'}}})
     status(output,'completed_candidate_collection',counts=built['counts'])
+
+
+def replay_cluster_prefix(output):
+    plan=verify(output);parent=Path(b.read(output/'selection.json')['parent_build'])
+    with r.run_lock(output/'active.lock'),r.run_lock(parent/'active.lock'):
+        fix=verify_cluster_recovery(output,plan)
+        p.require(fix is not None,'Register the amendment first')
+        parent_ready(output)
+        try:build(output,plan['configuration'],parent,offline=True)
+        except OfflineReplayComplete as exc:
+            p.require(exc.stage=='cluster_rules' and exc.key==fix['failed_key']+':batch4:0' and
+                      exc.counts.get('cluster_rules')==len(fix['completed_cluster_results']) and
+                      exc.counts.get('extract_experience')==len(b.read(output/'build/inputs.json')),
+                      'Replay did not reach the exact approved boundary')
+            b.write_once(output/'cluster_batch4_replay.json',{'passed':True,'new_model_calls':0,
+                'amendment_sha256':r.sha256_file(output/CLUSTER_RECOVERY),
+                'configuration_sha256':plan['configuration_sha256'],'replayed_calls':exc.counts,
+                'first_new_key':exc.key,'failed_payload_exactly_matched':True})
+            print('Offline prefix replay passed; zero model calls.',flush=True)
+            return
+        raise ValueError('Unexpected completion during pre-resume replay')
 
 
 def run(output,phase):
@@ -336,6 +500,12 @@ def run(output,phase):
                 print('Already completed; zero new requests.');return
             parent=parent_ready(output)
             verify(output,replay=True)
+            if (output/CLUSTER_RECOVERY).exists():
+                proof=b.read(output/'cluster_batch4_replay.json')
+                p.require(phase=='build' and proof.get('passed') and proof.get('new_model_calls')==0 and
+                          proof['amendment_sha256']==r.sha256_file(output/CLUSTER_RECOVERY),
+                          'Batch4 recovery requires offline replay and build-only resume')
+                (output/'runner.exit_code').unlink(missing_ok=True)
             # Verify every complete original generation before any new inference.
             released_corpus.load(Path(s['base_corpus'])/'release_manifest.json',Path(s['base_corpus'])/'answers.json',full=True,complete_answers=True)
             b.wait_detached(output,plan['configuration_sha256'])
@@ -360,7 +530,8 @@ def confirm(output):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode',choices=['prepare','verify','run','confirm-detached','status'])
+    parser.add_argument('mode',choices=['prepare','verify','run','confirm-detached','status',
+                                       'register-cluster-batch4','replay-cluster-prefix'])
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--phase',choices=['collect','build','all'],default='all')
     a=parser.parse_args()
@@ -368,6 +539,8 @@ def main():
     elif a.mode=='verify':print(json.dumps(verify(a.output)['configuration_sha256']))
     elif a.mode=='run':run(a.output,a.phase)
     elif a.mode=='confirm-detached':confirm(a.output)
+    elif a.mode=='register-cluster-batch4':register_cluster_batch4(a.output)
+    elif a.mode=='replay-cluster-prefix':replay_cluster_prefix(a.output)
     else:print(json.dumps(b.read(a.output/'execution_status.json'),ensure_ascii=False))
 
 

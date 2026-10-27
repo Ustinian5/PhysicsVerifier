@@ -166,3 +166,56 @@ def test_build_reuses_base_and_only_calls_new_extraction_and_new_tree(tmp_path,m
 
 def test_all_reused_generation_code_is_frozen():
     assert set(run.g.SOURCES).issubset(run.SOURCES)
+
+
+def test_split_cluster_preserves_members_and_exposes_new_groups_without_editing_input():
+    payload={'topic_key':'mechanics/topic','groups':[{'id':'G1','name':'old','summary':'old boundary'}],
+             'items':[{'id':f'I{i+1}','rule':{'text':f'leaf {i}'}} for i in range(10)]}
+    original=copy.deepcopy(payload);seen=[]
+    def call(stage,key,wire):
+        seen.append(copy.deepcopy(wire))
+        assert stage=='cluster_rules' and len(wire['items'])<=4
+        if len(seen)==1:
+            return {'new_groups':[{'key':'new1','name':'created','summary':'new boundary'}],
+                    'assignments':[{'item_id':x['id'],'group_id':'new1'} for x in wire['items']]}
+        assert wire['groups'][-1]=={'id':'G2','name':'created','summary':'new boundary'}
+        return {'new_groups':[], 'assignments':[{'item_id':x['id'],'group_id':'G2'} for x in wire['items']]}
+    result,keys=run.split_cluster_batch('topic:324',payload,call)
+    assert payload==original and [len(x['items']) for x in seen]==[4,4,2]
+    assert [a['item_id'] for a in result['assignments']]==[x['id'] for x in payload['items']]
+    assert {a['group_id'] for a in result['assignments']}=={result['new_groups'][0]['key']}
+    assert keys==['topic:324:batch4:0','topic:324:batch4:4','topic:324:batch4:8']
+
+
+@pytest.mark.parametrize('kind',['duplicate_member','unknown_group','collision','empty_group'])
+def test_split_cluster_rejects_invalid_subbatch_without_next_call(kind):
+    payload={'topic_key':'t','groups':[{'id':'G1','name':'old','summary':'s'}],
+             'items':[{'id':f'I{i}'} for i in range(8)]};calls=[]
+    def call(*args):
+        calls.append(args)
+        value={'new_groups':[], 'assignments':[{'item_id':f'I{i}','group_id':'G1'} for i in range(4)]}
+        if kind=='duplicate_member':value['assignments'][1]['item_id']='I0'
+        if kind=='unknown_group':value['assignments'][0]['group_id']='G9'
+        if kind=='collision':value['new_groups']=[{'key':'G1','name':'x','summary':'x'}]
+        if kind=='empty_group':value['new_groups']=[{'key':'unused','name':'x','summary':'x'}]
+        return value
+    with pytest.raises(ValueError):run.split_cluster_batch('t:0',payload,call)
+    assert len(calls)==1
+
+
+def test_recovery_binding_does_not_accept_changed_prompt_or_prefix(tmp_path,monkeypatch):
+    old={'scripts/run_qwen30b_expansion.py':'old','prompt.py':'same'}
+    current={**old,'scripts/run_qwen30b_expansion.py':'new'}
+    monkeypatch.setattr(run,'hashes',lambda:current)
+    plan={'configuration':{'source_hashes':old},'configuration_sha256':'config'}
+    run.r.write_json(tmp_path/'raw.json',{'original':'failure'})
+    fix={'policy':'cluster_batch4_after_completed_prefix_v1','configuration_sha256':'config',
+         'original_sources':old,'replacement_sources':dict(current),'old_batch_size':12,'new_batch_size':4,
+         'prefix_files':{'raw.json':run.r.sha256_file(tmp_path/'raw.json')}}
+    run.r.write_json(tmp_path/run.CLUSTER_RECOVERY,fix)
+    assert run.verify_cluster_recovery(tmp_path,plan)==fix
+    current['prompt.py']='changed'
+    with pytest.raises(ValueError,match='binding'):run.verify_cluster_recovery(tmp_path,plan)
+    current['prompt.py']='same'
+    run.r.write_json(tmp_path/'raw.json',{'original':'overwritten'})
+    with pytest.raises(ValueError,match='prefix changed'):run.verify_cluster_recovery(tmp_path,plan)
