@@ -27,6 +27,28 @@ from rule_framework import released_corpus
 b, p, r = e.b, e.p, e.r
 VERSION = 'qwen30b_cumulative5000_experience_v1'
 CLUSTER_RECOVERY = 'cluster_batch4_recovery.json'
+MISSING_RECOVERY = 'cluster_missing_recovery.json'
+MISSING_STAGE = 'complete_cluster_members'
+MISSING_INSTRUCTION = '''上一份归组JSON遗漏了以下编号：{missing}。
+这是本小批唯一一次补齐。保留上一份JSON的全部new_groups和assignments，不重新判断或返回已分配编号，不修改任何规则正文。
+仅给遗漏编号分配ScenarioCluster；可以使用原groups中的id、上一份new_groups中的key，或在确实需要时新增组。
+返回JSON：{{"new_groups":[{{"key":"补充组唯一编号","name":"名称","summary":"范围"}}],"assignments":[{{"item_id":"遗漏编号","group_id":"组编号"}}]}}。
+每个遗漏编号恰好出现一次，不能返回其他编号。new_groups只列本次新增组，key不得与原groups或上一份new_groups冲突；不能重命名、修改或重复列出已有组。不判断或修正规则的物理质量。'''
+
+
+class ExpansionJournal(e.Journal):
+    def supported_stages(self):
+        return super().supported_stages() | {MISSING_STAGE}
+
+    def messages(self, stage, payload):
+        if stage != MISSING_STAGE:
+            return super().messages(stage, payload)
+        draft=json.dumps(payload['draft'],ensure_ascii=False,sort_keys=True).replace('<|','\\u003c|')
+        messages=super().messages('cluster_rules',payload['original'])+[
+            {'role':'assistant','content':draft},
+            {'role':'user','content':MISSING_INSTRUCTION.format(missing=json.dumps(payload['missing_ids']))}]
+        r.assert_no_control_tokens(messages)
+        return messages
 SOURCES = sorted(set(e.SOURCES + g.SOURCES + ['scripts/prepare_qwen30b_expansion.py',
                                  'scripts/run_qwen30b_expansion.py',
                                  'scripts/start_qwen30b_expansion_service.sh']))
@@ -80,7 +102,7 @@ def verify(output, replay=False):
     return plan
 
 
-def verify_cluster_recovery(output, plan):
+def verify_cluster_recovery(output, plan, proposed=None):
     """Only an explicit amendment can replace this runner; old plan stays intact."""
     original=plan['configuration']['source_hashes'];current=hashes()
     receipt=output/CLUSTER_RECOVERY
@@ -88,18 +110,119 @@ def verify_cluster_recovery(output, plan):
         p.require(original==current,'Frozen code/configuration changed')
         return None
     fix=b.read(receipt)
+    follow=proposed or (b.read(output/MISSING_RECOVERY) if (output/MISSING_RECOVERY).exists() else None)
+    replacement=fix['replacement_sources'];prefix=dict(fix['prefix_files'])
+    if follow:
+        p.require(follow['policy']=='cluster_missing_only_once_v1' and
+                  follow['previous_receipt_sha256']==r.sha256_file(receipt) and
+                  follow['previous_sources']==replacement and
+                  follow['configuration_sha256']==plan['configuration_sha256'] and
+                  follow['instruction_sha256']==p.digest(MISSING_INSTRUCTION) and
+                  follow['max_completion_rounds']==1,'Invalid missing-member recovery binding')
+        for name,sha in follow['prefix_files'].items():
+            p.require(name not in prefix or prefix[name]==sha,'Recovery prefix conflict')
+            prefix[name]=sha
+        replacement=follow['replacement_sources']
     p.require(fix['policy']=='cluster_batch4_after_completed_prefix_v1' and
               fix['configuration_sha256']==plan['configuration_sha256'] and
-              fix['original_sources']==original and fix['replacement_sources']==current and
+              fix['original_sources']==original and replacement==current and
               set(original)==set(current) and
               {k for k in current if current[k]!=original[k]}=={'scripts/run_qwen30b_expansion.py'} and
               fix['new_batch_size']==4 and fix['old_batch_size']==12,
               'Invalid cluster recovery binding')
-    for name,sha in fix['prefix_files'].items():
+    for name,sha in prefix.items():
         rel=Path(name)
         p.require(not rel.is_absolute() and '..' not in rel.parts,'Unsafe recovery path')
         p.require(r.sha256_file(output/rel)==sha,'Recovery prefix changed: '+name)
     return fix
+
+
+def missing_cluster_ids(value, payload):
+    """Permit omissions only; reject all other invalid decisions before a call."""
+    p.require(isinstance(value,dict) and set(value)=={'new_groups','assignments'} and
+              isinstance(value['new_groups'],list) and isinstance(value['assignments'],list),
+              'Invalid missing-member draft')
+    known={g['id'] for g in payload['groups']};local=set()
+    for group in value['new_groups']:
+        p.text_fields(group,('key','name','summary'))
+        p.require(group['key'] not in known|local,'Split group ID collision')
+        local.add(group['key'])
+    expected=[x['id'] for x in payload['items']];seen=[]
+    for a in value['assignments']:
+        p.text_fields(a,('item_id','group_id'))
+        p.require(a['item_id'] in expected and a['item_id'] not in seen,'Invalid or duplicate split member')
+        p.require(a['group_id'] in known|local,'Unknown split group ID')
+        seen.append(a['item_id'])
+    p.require(all(any(a['group_id']==key for a in value['assignments']) for key in local),
+              'Empty new split group')
+    return [key for key in expected if key not in seen]
+
+
+def complete_cluster_members(key, payload, draft, call):
+    missing=missing_cluster_ids(draft,payload)
+    p.require(bool(missing),'No missing members to complete')
+    addition=call(MISSING_STAGE,key,{'original':payload,'draft':draft,'missing_ids':missing})
+    repair_payload={**payload,'items':[x for x in payload['items'] if x['id'] in missing],
+        'groups':payload['groups']+[{'id':g['key'],'name':g['name'],'summary':g['summary']}
+                                   for g in draft['new_groups']]}
+    p.require(not missing_cluster_ids(addition,repair_payload),'Completion still omits members')
+    # Only concatenate. Never replace an accepted decision or leaf content.
+    merged={'new_groups':draft['new_groups']+addition['new_groups'],
+            'assignments':draft['assignments']+addition['assignments']}
+    p.require(not missing_cluster_ids(merged,payload),'Invalid completed cluster')
+    return merged
+
+
+def register_cluster_missing(output):
+    plan=b.read(output/'plan.json');c=plan['configuration']
+    parent=Path(b.read(output/'selection.json')['parent_build'])
+    with r.run_lock(output/'active.lock'),r.run_lock(parent/'active.lock'):
+        if (output/MISSING_RECOVERY).exists():verify(output);return
+        p.require(not (output/'runner.pid').exists() and not (output/'build/release_manifest.json').exists(),
+                  'Stop runner before registering recovery')
+        state=b.read(output/'execution_status.json');last=b.read(output/'build/execution_status.json')
+        p.require(state['state']=='stopped' and state.get('error')=='Missing or duplicate split member' and
+                  last['stage']=='cluster_rules' and ':batch4:' in last['key'],'Not the reviewed missing member')
+        folder=output/'build/arm_cluster_rules'/p.digest(last['key'])[:24]
+        saved=b.read(folder/'result.json');rawpath=folder/saved['request_file'];raw=b.read(rawpath)
+        p.require(rawpath.parent==folder and r.sha256_file(rawpath)==saved['request_sha256'] and
+                  raw.get('http_status')==200 and not raw.get('error') and
+                  raw['response']['model']==c['construction']['model'] and
+                  raw['response']['choices'][0]['finish_reason']=='stop','Unexpected failed response')
+        payload=json.loads(raw['request']['messages'][-1]['content'])
+        journal=ExpansionJournal(output/'build',c['construction'],True)
+        body=r.request_body(c['construction']['model'],journal.messages('cluster_rules',payload),
+                            c['construction']['max_tokens'],backend='vllm')
+        body.update(stream=False,return_token_ids=True,reasoning_effort=c['construction']['reasoning_effort'])
+        body.pop('stream_options',None)
+        p.require(body==raw['request'] and journal.decode_record(rawpath,'cluster_rules')==saved['value'],
+                  'Failed input or decoded evidence changed')
+        missing=missing_cluster_ids(saved['value'],payload)
+        p.require(bool(missing) and len(payload['items'])<=4,'Not a missing-only small batch')
+        budget=b.read(output/'build/budget.json');p.require(budget['in_flight']==0,'In-flight request')
+        old=b.read(output/CLUSTER_RECOVERY)
+        prefix={str(f.relative_to(output)):r.sha256_file(f)
+                for f in sorted((output/'build').glob('arm_*/*/*.json'))}
+        for name in ('plan.json',CLUSTER_RECOVERY,'cluster_batch4_replay.json','generation_release.json',
+                     'build/inputs.json','build/extraction_checkpoint.json'):
+            prefix[name]=r.sha256_file(output/name)
+        follow={'policy':'cluster_missing_only_once_v1','actor':'Codex assistant','human_gold':False,
+            'authorization':'User approved one missing-ID-only completion per sub-batch on 2026-10-27',
+            'configuration_sha256':plan['configuration_sha256'],
+            'previous_receipt_sha256':r.sha256_file(output/CLUSTER_RECOVERY),
+            'previous_sources':old['replacement_sources'],'replacement_sources':hashes(),'prefix_files':prefix,
+            'failed_key':last['key'],'failed_request':str(rawpath.relative_to(output)),
+            'missing_ids':missing,'max_completion_rounds':1,'instruction':MISSING_INSTRUCTION,
+            'instruction_sha256':p.digest(MISSING_INSTRUCTION),'budget_before':budget,
+            'previous_status':state,'previous_build_status':last,
+            'previous_exit_code':(output/'runner.exit_code').read_text().strip(),
+            'completed_cluster_records':len(list((output/'build/arm_cluster_rules').glob('*/result.json'))),
+            'new_model_calls':0,'registered_unix':time.time(),
+            'protocol_change':'One new missing-ID-only completion stage per small batch; preserve all existing decisions and evidence; stop on any invalid completion.',
+            'unchanged':['model','reasoning_effort','response_token_cap','source_cohort','extraction','physical_standards']}
+        verify_cluster_recovery(output,plan,proposed=follow)
+        b.write_once(output/MISSING_RECOVERY,follow)
+        verify(output)
 
 
 def register_cluster_batch4(output):
@@ -148,7 +271,7 @@ def register_cluster_batch4(output):
         verify(output)
 
 
-def split_cluster_batch(key, payload, call):
+def split_cluster_batch(key, payload, call, complete=None):
     """Lossless ID projection across sequential four-item calls, no leaf edits."""
     items=payload['items'];groups=[dict(g) for g in payload['groups']]
     p.require(0<len(items)<=12 and len({x['id'] for x in items})==len(items),'Invalid original batch')
@@ -157,7 +280,10 @@ def split_cluster_batch(key, payload, call):
     new_groups=[];assignments=[];keys=[]
     for start in range(0,len(items),4):
         batch=items[start:start+4];child_key=f'{key}:batch4:{start}'
-        value=call('cluster_rules',child_key,{**payload,'items':batch,'groups':[dict(g) for g in groups]})
+        child_payload={**payload,'items':batch,'groups':[dict(g) for g in groups]}
+        value=call('cluster_rules',child_key,child_payload)
+        if complete and missing_cluster_ids(value,child_payload):
+            value=complete(child_key,child_payload,value)
         p.require(isinstance(value,dict) and isinstance(value.get('new_groups'),list) and
                   isinstance(value.get('assignments'),list),'Invalid split cluster response')
         local={}
@@ -395,12 +521,13 @@ def build(output,c,parent,offline=False):
     rows=baseline+new;p.require(len({x['id'] for x in rows})==len(rows),'Duplicate generation ID')
     rows.sort(key=lambda x:p.digest([20261024,x['id']]))
     b.write_once(target/'inputs.json',rows)
-    config=c['construction'];journal=e.Journal(target,config,True)
+    config=c['construction'];journal=ExpansionJournal(target,config,True)
     ancestors=[parent];pc=b.read(parent/'plan.json')['configuration']
     if pc.get('draft_prefix_parent'):ancestors.append(Path(pc['draft_prefix_parent']))
     journal.budget=b.BatchBudget(target,journal.budget.limits,prior_runs=tuple(ancestors),stop_file=output/'STOP')
     baseline_ids={x['id'] for x in baseline}
     amendment=b.read(output/CLUSTER_RECOVERY) if (output/CLUSTER_RECOVERY).exists() else None
+    missing_fix=b.read(output/MISSING_RECOVERY) if (output/MISSING_RECOVERY).exists() else None
     replay_counts=Counter()
     def raw_call(stage,key,payload):
         if stage=='taxonomy' or (stage in {'extract_experience','repair_experience'} and key in baseline_ids):
@@ -422,6 +549,15 @@ def build(output,c,parent,offline=False):
                     p.require(not (output/'STOP').exists(),'STOP requested')
                     status(output,'waiting_transient',stage=stage,key=key,ready_unix=deadline)
                     time.sleep(min(10,max(.1,deadline-time.time())))
+    def complete(key,payload,draft):
+        value=complete_cluster_members(key,payload,draft,raw_call)
+        folder=target/'arm_cluster_rules'/p.digest(key)[:24]
+        b.write_once(folder/'missing_completion.json',{
+            'amendment_sha256':r.sha256_file(output/MISSING_RECOVERY),
+            'original_result_sha256':r.sha256_file(folder/'result.json'),
+            'completion_result_sha256':r.sha256_file(target/('arm_'+MISSING_STAGE)/p.digest(key)[:24]/'result.json'),
+            'payload_sha256':p.digest(payload),'value':value,'not_a_model_response':True})
+        return value
     def call(stage,key,payload):
         if stage=='cluster_rules' and amendment:
             folder=target/'arm_cluster_rules'/p.digest(key)[:24]
@@ -438,7 +574,7 @@ def build(output,c,parent,offline=False):
             else:
                 p.require(not list(folder.glob('request_*.json')) and not (folder/'result.json').exists(),
                           'Unregistered original cluster response')
-            value,children=split_cluster_batch(key,payload,raw_call)
+            value,children=split_cluster_batch(key,payload,raw_call,complete if missing_fix else None)
             b.write_once(folder/'split4_result.json',{'amendment_sha256':r.sha256_file(output/CLUSTER_RECOVERY),
                 'payload_sha256':p.digest(payload),'value':value,'not_a_model_response':True,
                 'children':{child:r.sha256_file(target/'arm_cluster_rules'/p.digest(child)[:24]/'result.json')
@@ -461,6 +597,7 @@ def build(output,c,parent,offline=False):
         'parent_release_sha256':r.sha256_file(parent/'release_manifest.json'),
         'generation_release_sha256':r.sha256_file(output/'generation_release.json'),
         'clustering_amendment_sha256':r.sha256_file(output/CLUSTER_RECOVERY) if amendment else None,
+        'missing_member_amendment_sha256':r.sha256_file(output/MISSING_RECOVERY) if missing_fix else None,
         'files':{str(x.relative_to(target)):r.sha256_file(x) for x in sorted(target.rglob('*.json'))
                  if x.name not in {'execution_status.json','release_manifest.json'}}})
     status(output,'completed_candidate_collection',counts=built['counts'])
@@ -474,6 +611,18 @@ def replay_cluster_prefix(output):
         parent_ready(output)
         try:build(output,plan['configuration'],parent,offline=True)
         except OfflineReplayComplete as exc:
+            if (output/MISSING_RECOVERY).exists():
+                follow=b.read(output/MISSING_RECOVERY)
+                p.require(exc.stage==MISSING_STAGE and exc.key==follow['failed_key'] and
+                          exc.counts.get('cluster_rules')==follow['completed_cluster_records'] and
+                          exc.counts.get('extract_experience')==len(b.read(output/'build/inputs.json')),
+                          'Replay did not reach the exact missing-member boundary')
+                b.write_once(output/'cluster_missing_replay.json',{'passed':True,'new_model_calls':0,
+                    'amendment_sha256':r.sha256_file(output/MISSING_RECOVERY),
+                    'configuration_sha256':plan['configuration_sha256'],'replayed_calls':exc.counts,
+                    'first_new_stage':exc.stage,'first_new_key':exc.key})
+                print('Missing-member prefix replay passed; zero model calls.',flush=True)
+                return
             p.require(exc.stage=='cluster_rules' and exc.key==fix['failed_key']+':batch4:0' and
                       exc.counts.get('cluster_rules')==len(fix['completed_cluster_results']) and
                       exc.counts.get('extract_experience')==len(b.read(output/'build/inputs.json')),
@@ -505,6 +654,11 @@ def run(output,phase):
                 p.require(phase=='build' and proof.get('passed') and proof.get('new_model_calls')==0 and
                           proof['amendment_sha256']==r.sha256_file(output/CLUSTER_RECOVERY),
                           'Batch4 recovery requires offline replay and build-only resume')
+                if (output/MISSING_RECOVERY).exists():
+                    proof=b.read(output/'cluster_missing_replay.json')
+                    p.require(proof.get('passed') and proof.get('new_model_calls')==0 and
+                              proof['amendment_sha256']==r.sha256_file(output/MISSING_RECOVERY),
+                              'Missing-member recovery requires its own offline replay')
                 (output/'runner.exit_code').unlink(missing_ok=True)
             # Verify every complete original generation before any new inference.
             released_corpus.load(Path(s['base_corpus'])/'release_manifest.json',Path(s['base_corpus'])/'answers.json',full=True,complete_answers=True)
@@ -531,7 +685,7 @@ def confirm(output):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode',choices=['prepare','verify','run','confirm-detached','status',
-                                       'register-cluster-batch4','replay-cluster-prefix'])
+                                       'register-cluster-batch4','register-cluster-missing','replay-cluster-prefix'])
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--phase',choices=['collect','build','all'],default='all')
     a=parser.parse_args()
@@ -540,6 +694,7 @@ def main():
     elif a.mode=='run':run(a.output,a.phase)
     elif a.mode=='confirm-detached':confirm(a.output)
     elif a.mode=='register-cluster-batch4':register_cluster_batch4(a.output)
+    elif a.mode=='register-cluster-missing':register_cluster_missing(a.output)
     elif a.mode=='replay-cluster-prefix':replay_cluster_prefix(a.output)
     else:print(json.dumps(b.read(a.output/'execution_status.json'),ensure_ascii=False))
 

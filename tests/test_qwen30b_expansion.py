@@ -219,3 +219,94 @@ def test_recovery_binding_does_not_accept_changed_prompt_or_prefix(tmp_path,monk
     current['prompt.py']='same'
     run.r.write_json(tmp_path/'raw.json',{'original':'overwritten'})
     with pytest.raises(ValueError,match='prefix changed'):run.verify_cluster_recovery(tmp_path,plan)
+
+
+def test_missing_completion_preserves_accepted_decisions_and_full_context():
+    payload={'topic_key':'t','groups':[{'id':'G1','name':'old','summary':'old'}],
+             'items':[{'id':f'I{i}','rule':{'text':f'full leaf {i}'}} for i in range(4)]}
+    draft={'new_groups':[{'key':'new1','name':'created','summary':'unchanged'}],
+           'assignments':[{'item_id':'I0','group_id':'new1'},
+                          {'item_id':'I1','group_id':'G1'},{'item_id':'I3','group_id':'G1'}]}
+    before=copy.deepcopy((payload,draft));calls=[]
+    def complete(stage,key,wire):
+        calls.append((stage,key,wire))
+        assert wire=={'original':payload,'draft':draft,'missing_ids':['I2']}
+        return {'new_groups':[], 'assignments':[{'item_id':'I2','group_id':'new1'}]}
+    result=run.complete_cluster_members('t:0:batch4:0',payload,draft,complete)
+    assert len(calls)==1 and calls[0][0]==run.MISSING_STAGE
+    assert (payload,draft)==before
+    assert result['new_groups']==draft['new_groups']
+    assert result['assignments'][:3]==draft['assignments']
+    assert not run.missing_cluster_ids(result,payload)
+
+
+@pytest.mark.parametrize('kind',['missing','overwrite','collision','unknown_group','duplicate','unused'])
+def test_completion_failure_is_terminal_no_second_call(kind):
+    payload={'groups':[{'id':'G1','name':'old','summary':'s'}], 'items':[{'id':'I1'},{'id':'I2'}]}
+    draft={'new_groups':[],'assignments':[{'item_id':'I1','group_id':'G1'}]};calls=[]
+    def call(*args):
+        calls.append(args)
+        result={'new_groups':[],'assignments':[{'item_id':'I2','group_id':'G1'}]}
+        if kind=='missing':result['assignments']=[]
+        if kind=='overwrite':result['assignments'][0]['item_id']='I1'
+        if kind=='collision':result['new_groups']=[{'key':'G1','name':'changed','summary':'s'}]
+        if kind=='unknown_group':result['assignments'][0]['group_id']='G2'
+        if kind=='duplicate':result['assignments']*=2
+        if kind=='unused':result['new_groups']=[{'key':'new','name':'unused','summary':'s'}]
+        return result
+    with pytest.raises(ValueError):run.complete_cluster_members('key',payload,draft,call)
+    assert len(calls)==1
+
+
+def test_invalid_original_does_not_get_completion_and_success_does_not_call_it():
+    payload={'groups':[{'id':'G1','name':'old','summary':'s'}], 'items':[{'id':'I1'},{'id':'I2'}]}
+    def never(*args):raise AssertionError('unauthorized extra completion')
+    bad={'new_groups':[],'assignments':[{'item_id':'I1','group_id':'G1'}]*2}
+    with pytest.raises(ValueError):run.split_cluster_batch('k',payload,lambda *a:bad,never)
+    good={'new_groups':[],'assignments':[{'item_id':x['id'],'group_id':'G1'} for x in payload['items']]}
+    assert run.split_cluster_batch('k',payload,lambda *a:good,never)[0]==good
+
+
+def test_completion_can_create_group_without_renaming_existing_group():
+    payload={'groups':[], 'items':[{'id':'I1'},{'id':'I2'}]}
+    draft={'new_groups':[{'key':'a','name':'A','summary':'A'}],
+           'assignments':[{'item_id':'I1','group_id':'a'}]}
+    add={'new_groups':[{'key':'b','name':'B','summary':'B'}],
+         'assignments':[{'item_id':'I2','group_id':'b'}]}
+    result=run.complete_cluster_members('k',payload,draft,lambda *a:add)
+    assert result['new_groups']==draft['new_groups']+add['new_groups']
+
+
+def test_completion_messages_keep_original_context_and_only_request_missing():
+    journal=object.__new__(run.ExpansionJournal)
+    original={'topic_key':'t','groups':[], 'items':[{'id':'I1','text':'<|literal|>'}]}
+    draft={'new_groups':[],'assignments':[]}
+    messages=journal.messages(run.MISSING_STAGE,{'original':original,'draft':draft,'missing_ids':['I1']})
+    assert messages[:2]==journal.messages('cluster_rules',original)
+    assert json.loads(messages[2]['content'])==draft
+    assert 'I1' in messages[-1]['content'] and '唯一一次' in messages[-1]['content']
+    assert run.MISSING_STAGE in journal.supported_stages()
+
+
+def test_missing_amendment_chains_old_receipt_without_replacing_it(tmp_path,monkeypatch):
+    old={'scripts/run_qwen30b_expansion.py':'old','prompt.py':'same'}
+    previous={**old,'scripts/run_qwen30b_expansion.py':'batch4'}
+    current={**old,'scripts/run_qwen30b_expansion.py':'missing'}
+    monkeypatch.setattr(run,'hashes',lambda:current)
+    plan={'configuration':{'source_hashes':old},'configuration_sha256':'config'}
+    run.r.write_json(tmp_path/'raw.json',{'raw':'unchanged'})
+    fix={'policy':'cluster_batch4_after_completed_prefix_v1','configuration_sha256':'config',
+         'original_sources':old,'replacement_sources':previous,'old_batch_size':12,'new_batch_size':4,
+         'prefix_files':{'raw.json':run.r.sha256_file(tmp_path/'raw.json')}}
+    run.r.write_json(tmp_path/run.CLUSTER_RECOVERY,fix)
+    oldsha=run.r.sha256_file(tmp_path/run.CLUSTER_RECOVERY)
+    follow={'policy':'cluster_missing_only_once_v1','configuration_sha256':'config',
+            'previous_receipt_sha256':oldsha,'previous_sources':previous,'replacement_sources':dict(current),
+            'instruction_sha256':p.digest(run.MISSING_INSTRUCTION),'max_completion_rounds':1,
+            'prefix_files':{run.CLUSTER_RECOVERY:oldsha}}
+    assert run.verify_cluster_recovery(tmp_path,plan,proposed=follow)==fix
+    assert run.r.sha256_file(tmp_path/run.CLUSTER_RECOVERY)==oldsha
+    follow['max_completion_rounds']=2
+    with pytest.raises(ValueError,match='binding'):run.verify_cluster_recovery(tmp_path,plan,proposed=follow)
+    follow['max_completion_rounds']=1;follow['previous_sources']={}
+    with pytest.raises(ValueError,match='binding'):run.verify_cluster_recovery(tmp_path,plan,proposed=follow)
