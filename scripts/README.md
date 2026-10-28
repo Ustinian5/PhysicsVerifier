@@ -99,6 +99,7 @@ nohup "$PYTHON_BIN" -u -m scripts.run_continuous_context_v2 run --output "$RUN_D
 | `build_120b_rules.py` | 已完成83条库的原构建器，保留两题支持协议与恢复证据，不用于新逐题方案 |
 | `rebuild_qwen30b_corpus.py` | 冻结训练题与bench隔离，原版30B每题生成一次，120B medium独立筛错；保存原始响应与可恢复断点 |
 | `run_built_catalog.py` | 新构建库的C0p/C4连续会话对照，各50题；原120B预算、无独立checker、新参考位置计分 |
+| `run_rule_skill_comparison.py` | 新规则树 vs 120B自主解题skill；同源4,995题建知识、两组各50题连续检查、配对P/R/F1与双向案例；不修改默认库 |
 | `prepare_incremental_update.py` | 建立增量工作区并冻结范围、配置和预算 |
 | `finalize_incremental_update.py` | 校验来源、变化范围及产物依赖，生成待审目录 |
 | `validate_unified_catalog_structure.py` | 校验 ID、引用和可达性 |
@@ -247,6 +248,34 @@ python -u -m scripts.reorganize_qwen30b_expansion run --root <已有扩容目录
 python -m scripts.reorganize_qwen30b_expansion confirm-detached --root <已有扩容目录>
 python -m scripts.reorganize_qwen30b_expansion status --root <已有扩容目录>
 ```
+
+### 新规则树与自主解题skill对照
+
+`run_rule_skill_comparison.py`比较完整知识生成方案：A为30B错答经120B审查提炼的新规则树；B为120B独立解答相同4,995道建库题，再在原上下文中提炼skill。B不读取30B答案、原规则或测试标签；最多两项skill/题、仅精确去重，全部来源与失败保留。skill的目标、条件、步骤、陷阱、自检方法机械映射到旧叶接口，正文不改写为判错规则。两组共享6领域/123主题目录和同一120B分页归组机制；不使用embedding。
+
+测试继续检查原50份固定解答。两组采用相同120B medium、连续上下文、工具、提示和每题预算（最多12响应、总16,384生成token含推理及引文修正、最多6张完整知识卡）。可独立发现未被库覆盖的错误；不使用规则不重抽。两组共100项，按题交替先后顺序。原库质量标记不翻转，明确只允许原样含噪声库用于本次开发对照。比较包含30B错答与120B自解的经验来源差异，不能单独证明树形结构的因果效果；建库计算量另行记账，不声称相等。
+
+以下按顺序执行，Python必须来自个人conda。`build-pilot`、`build`、`run-eval`均须在服务器后台执行，退出启动SSH后重新连接并调用对应`confirm-detached`；不能在本机经隧道运行。先核验个人服务、占用和锁，不部署第二个模型。
+
+```bash
+python -m scripts.run_rule_skill_comparison prepare --rule-tree <5000批次/tree_v2> --output <对照目录>
+python -u -m scripts.run_rule_skill_comparison build-pilot --output <对照目录>
+# 新SSH会话：
+python -m scripts.run_rule_skill_comparison confirm-detached --phase skills --output <对照目录>
+# 固定12题完成后，只验工程结构；失败留在主线处理，不修改prompt后混用旧响应。
+python -m scripts.run_rule_skill_comparison accept-pilot --output <对照目录>
+python -u -m scripts.run_rule_skill_comparison build --output <对照目录>
+# 再次新SSH确认，phase仍为skills；成功试跑原样复用。
+python -m scripts.run_rule_skill_comparison prepare-eval --output <对照目录>
+python -u -m scripts.run_rule_skill_comparison run-eval --output <对照目录>
+# 新SSH会话：
+python -m scripts.run_rule_skill_comparison confirm-detached --phase evaluation --output <对照目录>
+python -m scripts.run_rule_skill_comparison score --output <对照目录>
+```
+
+每次启动前确认没有同目录客户端，完整环境和后台启动方式见项目运行约定。`skills/`保留逐题自解、skill、导航、未入树项及请求；`evaluation/metrics.json`给出P/R/F1、全50题状态、实际调用/token、知识读取和配对差值区间。未完成组不输出完整分数，技术失败不记为成功空结果。沿用新bench位置匹配代理，不称为语义正确率或人工金标。
+
+`evaluation/case_review.json`按预先固定的哈希顺序，分别抽取规则组独有命中、skill组独有命中、共同漏检、命中相同但诊断数量不同的题，最多4个不同题；不存在的类别不补造。保存原题/原答、两组诊断、实际工具记录、已确认及未决参考，由主线Codex assistant补充物理解释和知识实际贡献，再整理为人类可读案例。自动抽样完成不等于案例复核完成。两组各50题均是开发对照，论文独立验证另留隔离测试集。
 
 迁入前先让旧客户端保存当前请求后停止并释放锁；保留根STOP，新的停止文件为`tree_v2/STOP`。prepare一次性导入并核验全部历史；恢复使用原子检查点及内容绑定的证据缓存，不重新解析全批响应或重算相同输入/bench的隔离。首次导入、最终发布全量SHA；平时核查清单、当前bench/代码/配置和变更文件，可用`verify --full`强制全量核验。每页均被访问后才允许新建簇，超出64页或判断不清保留未决；每次输入≤48,000字节，短编号精确映射，响应预算不增加。分页限制单次负载，最坏总比较量仍可能二次增长。
 
