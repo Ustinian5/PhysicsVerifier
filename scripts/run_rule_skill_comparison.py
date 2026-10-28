@@ -1,4 +1,4 @@
-"""Build self-solved skills, then compare them with the frozen 5000-question tree.
+"""Build skills from the same 30B wrong answers and compare with the frozen tree.
 
 All inference is explicit, server-local and detached. prepare/verify/score are
 offline. Existing libraries, prompts and quality flags are never rewritten.
@@ -28,6 +28,7 @@ b, p, r = navigation.b, navigation.p, navigation.r
 runtime = comparison.runner
 ROOT = b.ROOT
 SOURCE_QUESTIONS = 4995
+SKILL_SOURCES = 1726
 TREE_RELEASE_SHA = 'f9be4a0e591a577432789ce69c2a0b86a2e08fac7e987e18252d9348dc5a92f4'
 TREE_CONFIG_SHA = '8b0a22606f6de0c8269611e015fcd5c3abdd000cf127703400c377c9ec204a5c'
 SOURCES = sorted(set(navigation.source_hashes()) | set(runtime.SOURCE_FILES) | {
@@ -86,32 +87,40 @@ def prepare(output, rule_tree):
         receipt = vr.read(rule_tree / 'isolation_receipt.json')
         require(len(rows) == SOURCE_QUESTIONS and p.digest(rows) == receipt['inputs_sha256'] and not receipt['excluded'],
                 'Construction cohort/isolation mismatch')
-        questions = protocol.questions_only(rows)
-        original_taxonomy = vr.read(rule_tree / 'materials.json')['taxonomy']
+        material_path = rule_tree / 'materials.json'
+        require(release['files'].get(str(material_path)) == vr.sha(material_path), 'Unbound source provenance')
+        materials = vr.read(material_path)
+        sources = protocol.wrong_answer_sources(rows, materials)
+        require(len(sources) == SKILL_SOURCES, 'Wrong-answer source count changed')
+        original_taxonomy = materials['taxonomy']
         taxonomy = {'domains': [dict({k: d[k] for k in ('id', 'name', 'summary')},
             topics=[{k: t[k] for k in ('id', 'name', 'summary')} for t in d['topics']])
             for d in original_taxonomy['domains']]}
         require(len(tree.topic_list(taxonomy)) == 123, 'Fixed taxonomy changed')
         # The inherited isolation covers every visible question/context field.
         # New generated content is screened once again before publication.
-        vr.atomic(output / 'questions.json', questions)
+        vr.atomic(output / 'sources.json', sources)
         vr.atomic(output / 'taxonomy.json', taxonomy)
         model = dict(original['model'], protocol=protocol.VERSION, max_requests=60000)
         config = {'protocol': protocol.VERSION, 'rules': asset, 'source_input': str(source),
-            'source_input_sha256': vr.sha(source), 'questions_sha256': vr.sha(output / 'questions.json'),
+            'source_input_sha256': vr.sha(source), 'sources_sha256': vr.sha(output / 'sources.json'),
+            'source_materials': str(material_path), 'source_materials_sha256': vr.sha(material_path),
+            'source_questions': len(sources), 'parent_complete_questions': len(rows),
+            'source_selection': 'all 120B-error-found 30B answers before navigation; exact original question/answer/context; no old rule or audit text',
             'taxonomy_sha256': vr.sha(output / 'taxonomy.json'), 'model': model,
             'bench_sha256': original['bench_sha256'], 'benchmarks': original['benchmarks'],
-            'source_hashes': source_hashes(), 'solver': protocol.SOLVER, 'distill': protocol.DISTILL,
+            'source_hashes': source_hashes(), 'distill': protocol.DISTILL,
             'navigation_policy': tree.POLICY, 'navigation_prompts_sha256': vr.digest(tree.PROMPTS),
-            'pilot_ids': [x['id'] for x in questions[:protocol.PILOT_SIZE]],
+            'pilot_ids': [x['id'] for x in sources[:protocol.PILOT_SIZE]],
             'budget_limits': {'requests': 60000, 'input_tokens': 24000000000, 'output_tokens': 983040000},
             'prior_usage': ZERO_USAGE, 'semantic_content_retries': 0,
             'human_gold': False, 'independent_test': False,
-            'construction_compute': 'same source cohort; actual tokens/calls reported, not equal training compute',
-            'hypothesis': 'compare 30B-error-derived rules against 120B-self-solved skills; no guaranteed winner'}
+            'construction_compute': 'same 30B wrong answers; 120B distills rules or skills; report actual tokens/calls, not equal construction compute',
+            'hypothesis': 'compare rule and skill construction from identical 30B wrong answers, all semantic stages use 120B; no guaranteed winner'}
         vr.atomic(output / 'plan.json', {'configuration': config, 'configuration_sha256': vr.digest(config)})
-        vr.atomic(output / 'execution_status.json', {'state': 'prepared_no_model_calls', 'source_questions': len(rows)})
-    print('Prepared 4995 question-only sources; 12-source pilot precedes full construction; zero model calls.')
+        vr.atomic(output / 'execution_status.json', {'state': 'prepared_no_model_calls',
+            'source_questions': len(sources), 'parent_complete_questions': len(rows)})
+    print('Prepared 1726 complete 30B wrong answers; 12-source pilot precedes skill construction; zero model calls.')
 
 
 def verify(output, *, full=False):
@@ -119,9 +128,10 @@ def verify(output, *, full=False):
     c = plan['configuration']
     require(plan['configuration_sha256'] == vr.digest(c) and c['protocol'] == protocol.VERSION and
             c['source_hashes'] == source_hashes(), 'Plan/code binding changed')
-    for name, expected in [('questions.json', c['questions_sha256']), ('taxonomy.json', c['taxonomy_sha256'])]:
+    for name, expected in [('sources.json', c['sources_sha256']), ('taxonomy.json', c['taxonomy_sha256'])]:
         require(vr.sha(output / name) == expected, 'Prepared input changed: ' + name)
     require(vr.sha(c['source_input']) == c['source_input_sha256'], 'Parent construction input changed')
+    require(vr.sha(c['source_materials']) == c['source_materials_sha256'], 'Source provenance changed')
     require(rules_asset(Path(c['rules']['path']), full=full) == c['rules'], 'Rule-tree handoff changed')
     if (output / 'skills/request_index.json').exists():
         index = vr.unseal(output / 'skills/request_index.json')
@@ -132,14 +142,14 @@ def verify(output, *, full=False):
 
 class SkillJournal(navigation.TreeJournal):
     def supported_stages(self):
-        return super().supported_stages() | {'solve_own', 'extract_skill'}
+        return super().supported_stages() | {'extract_skill'}
 
     def messages(self, stage, payload):
-        return (protocol.skill_messages(stage, payload) if stage in {'solve_own', 'extract_skill'}
+        return (protocol.skill_messages(stage, payload) if stage == 'extract_skill'
                 else super().messages(stage, payload))
 
     def decode_record(self, path, stage):
-        if stage not in {'solve_own', 'extract_skill'}:
+        if stage != 'extract_skill':
             return super().decode_record(path, stage)
         raw = vr.read(path)
         response = raw.get('response') or {}
@@ -155,12 +165,10 @@ class SkillJournal(navigation.TreeJournal):
                     max_tokens=self.config['max_tokens'], native_tools=None)['content'].strip()
         if not text:
             raise tree.ContentFailure('empty_final; no resampling')
-        if stage == 'solve_own':
-            return {'solution': text}
         return super().decode_record(path, stage)
 
     def __call__(self, stage, key, payload):
-        cap = self.config['max_request_input_bytes'] if stage in {'solve_own', 'extract_skill'} else tree.POLICY['max_input_bytes']
+        cap = self.config['max_request_input_bytes'] if stage == 'extract_skill' else tree.POLICY['max_input_bytes']
         if len(json.dumps(self.messages(stage, payload), ensure_ascii=False).encode()) > cap:
             raise tree.ContentFailure('input_too_large; no truncation')
         try:
@@ -174,18 +182,14 @@ class SkillJournal(navigation.TreeJournal):
 
 def collect_one(journal, row):
     try:
-        solved = journal('solve_own', row['id'], {'row': row})
-    except tree.ContentFailure as exc:
-        return {'id': row['id'], 'status': 'invalid_solution', 'reason': str(exc)}
-    try:
-        value = journal('extract_skill', row['id'], {'row': row, 'solution': solved['solution']})
+        value = journal('extract_skill', row['id'], {'row': row})
         try:
             protocol.validate_skills(value)
         except (ValueError, TypeError, KeyError) as exc:
             raise tree.ContentFailure(str(exc)) from exc
     except tree.ContentFailure as exc:
-        return {'id': row['id'], 'status': 'invalid_skills', 'solution': solved['solution'], 'reason': str(exc)}
-    return {'id': row['id'], 'status': 'collected', 'solution': solved['solution'], 'value': value}
+        return {'id': row['id'], 'status': 'invalid_skills', 'reason': str(exc)}
+    return {'id': row['id'], 'status': 'collected', 'value': value}
 
 
 def outcome_path(folder, row):
@@ -197,7 +201,7 @@ def read_outcomes(folder, rows, binding):
     for row in rows:
         record = vr.read(outcome_path(folder, row))
         require(record['configuration_sha256'] == binding and
-                record['question_sha256'] == vr.digest(row) and record['outcome']['id'] == row['id'],
+                record['source_sha256'] == vr.digest(row) and record['outcome']['id'] == row['id'],
                 'Collected outcome source/plan changed')
         outcomes.append(record['outcome'])
         chain = vr.digest([chain, vr.digest(record)])
@@ -249,7 +253,7 @@ def build_skills(output, *, pilot):
             b.wait_detached(folder, binding)
             journal = SkillJournal(folder, c)
             progress = vr.Progress(folder / 'collection_checkpoint.json', binding, {'cursor': 0, 'outcome_chain': ''})
-            rows = vr.read(output / 'questions.json')
+            rows = vr.read(output / 'sources.json')
             stop = protocol.PILOT_SIZE if pilot else len(rows)
             while progress.state['cursor'] < stop:
                 require(not (folder / 'STOP').exists(), 'STOP requested')
@@ -257,10 +261,10 @@ def build_skills(output, *, pilot):
                 path = outcome_path(folder, row)
                 if path.exists():
                     record = vr.read(path)
-                    require(record['configuration_sha256'] == binding and record['question_sha256'] == vr.digest(row)
+                    require(record['configuration_sha256'] == binding and record['source_sha256'] == vr.digest(row)
                             and record['outcome']['id'] == row['id'], 'Uncommitted outcome source changed')
                 else:
-                    record = {'configuration_sha256': binding, 'question_sha256': vr.digest(row),
+                    record = {'configuration_sha256': binding, 'source_sha256': vr.digest(row),
                               'outcome': collect_one(journal, row)}
                     vr.atomic(path, record)
                 journal.index['files'][str(path)] = vr.sha(path)
@@ -292,7 +296,7 @@ def accept_pilot(output):
         plan = verify(output)
         folder = output / 'skills'
         saved = vr.unseal(folder / 'collection_checkpoint.json')
-        questions = vr.read(output / 'questions.json')[:protocol.PILOT_SIZE]
+        questions = vr.read(output / 'sources.json')[:protocol.PILOT_SIZE]
         rows, _ = read_outcomes(folder, questions, plan['configuration_sha256'])
         summary = vr.read(folder / 'pilot_summary.json')
         vr.EvidenceCache(folder / 'evidence_cache.json').check(
@@ -312,9 +316,9 @@ def accept_pilot(output):
 def publish_skills(output, plan, journal):
     folder = output / 'skills'
     c, binding = plan['configuration'], plan['configuration_sha256']
-    rows = vr.read(output / 'questions.json')
+    rows = vr.read(output / 'sources.json')
     # Collection writes one immutable outcome at a time. Summarize once, not
-    # 4995 complete solutions on every checkpoint or navigation request.
+    # all source answers on every checkpoint or navigation request.
     prepared_names = ('materials', 'isolation', 'collection_summary')
     prepared = all(str(folder / (name + '.json')) in journal.index['files'] for name in prepared_names)
     if not prepared:
@@ -323,7 +327,7 @@ def publish_skills(output, plan, journal):
         require(checkpoint == {'cursor': len(rows), 'outcome_chain': chain}, 'Source outcome chain mismatch')
         heldout, files = b.benchmark_questions()
         require(files == c['benchmarks'] and p.digest(heldout) == c['bench_sha256'], 'Benchmark registry changed')
-        visible = [dict(row, prediction=json.dumps(outcome, ensure_ascii=False), answer='')
+        visible = [dict(row, prediction=row['prediction'] + '\n' + json.dumps(outcome, ensure_ascii=False), answer='')
                    for row, outcome in zip(rows, outcomes)]
         eligible, excluded = p.isolate_sources(visible, heldout)
         vr.atomic(folder / 'isolation.json', {'generated_content_sha256': vr.digest(visible),
@@ -335,6 +339,8 @@ def publish_skills(output, plan, journal):
         vr.atomic(folder / 'collection_summary.json', {'source_questions': len(rows),
             'outcome_chain': chain, 'collection_checkpoint_sha256': vr.sha(folder / 'collection_checkpoint.json'),
             'collection_statuses': dict(Counter(x['status'] for x in outcomes)),
+            'source_assessments': dict(Counter(x['value']['source_assessment'] for x in outcomes if x['status'] == 'collected')),
+            'valid_empty_skills': sum(not x['value']['skills'] for x in outcomes if x['status'] == 'collected'),
             'generated_skills_before_exact_dedup': sum(len(x.get('value', {}).get('skills', [])) for x in outcomes)})
         vr.atomic(folder / 'materials.json', materials)
         for name in prepared_names:
@@ -374,9 +380,9 @@ def publish_skills(output, plan, journal):
     for name, value in products.items():
         vr.atomic(folder / (name + '.json'), value)
     counts = dict(products['counts'], **{k: collection_summary[k] for k in
-        ('source_questions', 'collection_statuses', 'generated_skills_before_exact_dedup')})
+        ('source_questions', 'collection_statuses', 'source_assessments', 'valid_empty_skills', 'generated_skills_before_exact_dedup')})
     vr.atomic(folder / 'counts.json', counts)
-    files = {str(path): vr.sha(path) for path in [output / 'plan.json', output / 'questions.json',
+    files = {str(path): vr.sha(path) for path in [output / 'plan.json', output / 'sources.json',
         output / 'taxonomy.json', *[folder / (n + '.json') for n in
         ['materials', 'isolation', 'runtime', 'collection_summary', 'collection_checkpoint', 'checkpoint', 'budget_checkpoint',
          'request_index', 'pilot_summary', 'pilot_acceptance', *products]] ]}
@@ -385,7 +391,8 @@ def publish_skills(output, plan, journal):
     vr.atomic(folder / 'release_manifest.json', {'protocol': protocol.VERSION, 'configuration_sha256': binding,
         'files': files, 'counts': counts, 'human_gold': False, 'physical_quality_passed': False,
         'usable_for_runtime': False, 'collection_only': True,
-        'semantic_models': {'solve': r.EXPECTED_MODEL, 'skills': r.EXPECTED_MODEL, 'navigation': r.EXPECTED_MODEL},
+        'semantic_models': {'skills': r.EXPECTED_MODEL, 'navigation': r.EXPECTED_MODEL},
+        'source_generator': 'Qwen3-30B-A3B-Instruct-2507', 'source_is_human_gold': False,
         'external_teacher': None, 'embedding_calls': 0})
     emit(folder, 'completed_skill_collection', counts=counts)
 
@@ -399,11 +406,12 @@ def skill_asset(output, *, full=False):
             release['physical_quality_passed'] is False and release['usable_for_runtime'] is False and
             release['collection_only'] is True and release['embedding_calls'] == 0 and
             release['external_teacher'] is None and release['semantic_models'] ==
-            {stage: r.EXPECTED_MODEL for stage in ('solve', 'skills', 'navigation')},
+            {stage: r.EXPECTED_MODEL for stage in ('skills', 'navigation')} and
+            release['source_generator'] == 'Qwen3-30B-A3B-Instruct-2507' and release['source_is_human_gold'] is False,
             'Skill release contract changed')
-    require(release['counts']['source_questions'] == SOURCE_QUESTIONS and release['counts']['placed_rules'] > 0 and
+    require(release['counts']['source_questions'] == SKILL_SOURCES and release['counts']['placed_rules'] > 0 and
             release['counts']['all_candidates_preserved'] is True, 'Incomplete skill cohort/library')
-    required = {str(output / n) for n in ('plan.json', 'questions.json', 'taxonomy.json')} | {
+    required = {str(output / n) for n in ('plan.json', 'sources.json', 'taxonomy.json')} | {
         str(folder / (n + '.json')) for n in ('materials', 'isolation', 'runtime', 'collection_checkpoint',
         'checkpoint', 'collection_summary', 'budget_checkpoint', 'request_index', 'pilot_summary', 'pilot_acceptance',
         'catalog', 'validation', 'topic_mapping', 'unplaced_rules', 'counts')}
