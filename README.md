@@ -1,69 +1,56 @@
 # PhysicsVerifier
 
-PhysicsVerifier 用于检查物理竞赛题的模型解答。系统根据题目背景检索适用规则，再对待检查答案进行语义和可选符号核查。
+检查物理竞赛题的模型解答，输出对应规则、错误说明和原文位置，并提供训练奖励接口。
 
-## 当前主流程
+当前科研主线：GPT-OSS-120B在连续上下文中完成全文检查、规则检索和诊断，使用冻结C4提示比较旧1,123叶与新2,065叶。入口是[run_catalog_comparison.py](scripts/run_catalog_comparison.py)，实际状态与对照边界见[项目进展](docs/项目进展.md)。
+
+现有默认verifier及训练接口保留分段流程；下方示例属于这一入口：
 
 ```text
-题目与上下文
-  → 背景分析与 Domain
-  → Topic
-  → Scenario Cluster
-  → Rule
-  → 语义检查
-  → 可选符号核查
-  → 最终诊断
+题目与上下文 → 背景分析 → Domain → Topic → Scenario Cluster → Rule
+                                                    ↓
+候选解答 ──────────────────────────────────────────→ Checker → 定位与发布
 ```
 
-正式检索使用 API 语义导航。题目背景负责规则适用性，`prediction` 负责答案证据，参考答案不进入 verifier。
+参考答案不进入 verifier。符号核查可选；规则可达、流程完成和诊断正确是不同的验收项目。
 
-## 快速入口
+## 运行
 
-- 运行检查：`scripts/run_verifier.py`
-- 效果测评主流程：`scripts/run_physics_eval_pipeline.py`
-- P3 规则级机制数据：`scripts/build_checker_mechanism_dataset.py`
-- P3 条件 Checker 门禁：`scripts/evaluate_checker_mechanism_gate.py`
-- P3 semantic retrieval 审计：`scripts/audit_checker_mechanism_semantic_retrieval.py`
-- 语义导航：`core/unified_semantic_matcher.py`
-- 检查主流程：`core/physics_rule_verifier.py`
-- 当前 development 基线：`catalogs/rules_unified_3000.json`（1123 条）
-- 增量规则治理：`scripts/prepare_incremental_update.py` / `scripts/finalize_incremental_update.py`（manifest v2 + 配置/来源/拓扑预注册门禁）
-- 历史运行时参考库：`catalogs/rules_unified_3000_runtime_backfilled.json`（4875 条，当前效果消融已否决）
-- 共享文档：[文档索引](docs/文档索引.md)
-- 目录职责与清理边界：[项目结构](docs/项目结构.md)
-
-两个 catalog 不是纯 metadata 变体。当前保留 1123 条库作为高召回开发基线；4875 条库仅作历史参考。`run_verifier.py` 不会自动选择 unified catalog，所有正式实验必须显式传入路径并记录 SHA-256，禁止静默回退到旧 catalog。
-
-正式测评统一使用 `run_physics_eval_pipeline.py`。它强制 conda 解释器和 `unified_rules_v2` catalog，自动生成包含 Git、源码、数据、catalog、Prompt、输出及失败阶段指纹的 manifest；validation/final 启动时要求 clean worktree。受版本控制的冻结清单放在 [`experiments/manifests/`](experiments/README.md)。
-
-所有 Python 命令统一通过 conda `physicsverifier` 环境执行，不直接使用本机 Python。
+Python 统一使用 conda `physicsverifier` 环境：
 
 ```bash
 conda env create -f environment.yml
 conda run -n physicsverifier python scripts/run_verifier.py --help
 ```
 
-只运行语义检索：
+按 [.env.example](.env.example) 配置 API。运行前将 `PHYSICSVERIFIER_LLM_MODEL` 设为实际可用的模型 ID，并按服务商支持情况选择结构化输出协议。以下为参数模板：
 
 ```bash
 conda run -n physicsverifier python scripts/run_verifier.py \
-  --retrieval-only \
-  --continue-on-semantic-error \
-  --unified-retrieval-mode semantic \
   --input data/input.json \
-  --output results/background_retrieval/semantic_tree_results.json \
+  --output results/run/results.json \
+  --model "$PHYSICSVERIFIER_LLM_MODEL" \
   --unified-catalog catalogs/rules_unified_3000.json \
-  --model qwen3-30b-a3b-instruct-2507 \
-  --semantic-output-adapter forced_tool_call \
-  --semantic-json-attempts 3 \
-  --unified-rule-top-n 6 \
+  --unified-retrieval-mode semantic \
+  --no-symbolic-check \
+  --continue-on-semantic-error \
   --checkpoint-every 1
 ```
+
+增加 `--retrieval-only` 可只运行检索。规则库必须显式指定；文件名中的 3000 不代表规则数，当前该文件实际包含 1,123 条规则。
+
+## 文档与入口
+
+- [项目状态](docs/项目进展.md)：已完成工作、证据边界和当前方向。
+- [共享文档索引](docs/文档索引.md)：结构、规则维护和评测说明。
+- [脚本入口](scripts/README.md)：检索、检查、评测和规则构建。
+- [训练接入](training/README.md)：OpenRLHF、Swift 与奖励服务。
+- [实验清单](experiments/README.md)：可复现运行需要保存的配置。
+
+`data/`、`results/`、`private_docs/` 和 `.env` 不进入 Git；复现时需要另外提供相应数据和运行产物。
 
 ## 测试
 
 ```bash
 conda run -n physicsverifier python -m unittest discover -s tests -p 'test_*.py'
 ```
-
-当前 P3 主实验使用 honest target binding，估计目标规则已提供时的 Checker + release gate 性能。最终协议的单规则 Gemini 与三臂各一次 Qwen30B development smoke 已闭环，但正式 300 例与九格回放尚未运行，没有新效果结论。semantic retrieval 当前只做 secondary trace schema audit，尚不提供 production provenance。项目状态和下一步见[项目进展](docs/项目进展.md)，数据隔离、完整命令和当前结果见[效果测评](docs/效果测评.md)。
