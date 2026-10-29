@@ -2,7 +2,39 @@
 
 所有 Python 入口通过 conda `physicsverifier` 执行。完整参数以各脚本 `--help` 为准；方法和指标见 [效果测评](../docs/效果测评.md)。
 
-换标签离线重评使用 `rescore_frozen_bench.py`。主线以 `prepare --scope all39 --data-root <原材料目录> --plan <新清单路径>` 冻结E01–E39、原50题、修订参考及输出哈希，复现旧成绩并运行已知案例合成探针；不传scope时仍为近期连续上下文4组。执行工作区使用同一代码与清单依次 `verify --data-root <原材料目录> --plan <清单路径>`、`run --data-root <原材料目录> --plan <清单路径> --output <新结果目录>`。verify返回2表示原件缺失，返回1表示哈希/计分等异常，须回主线核查，不用指标摘要代替原件。
+## 当前主线：C4提示下新旧规则库对照
+
+入口为[run_catalog_comparison.py](run_catalog_comparison.py)。固定历史E39的C4原文、120B medium、完整50题、工具与预算，旧1,123叶和新2,065叶各重新运行50题。检索与诊断保持同一会话，无独立checker。E39仅提供选定提示，不复用其输出；近期规则/skills通用提示也不混入。
+
+服务器个人conda环境及只读运行库按既有配置设置，`PV_PY`是环境内Python绝对路径，`PV_CATALOG_RUN`是独立个人结果目录，`PV_NEW_TREE`指向已冻结tree_v2。只在确认无同批客户端和锁后启动：
+
+```bash
+"$PV_PY" -m scripts.run_catalog_comparison prepare --output "$PV_CATALOG_RUN" --rule-tree "$PV_NEW_TREE"
+nohup "$PV_PY" -u -m scripts.run_catalog_comparison run --output "$PV_CATALOG_RUN" >> "$PV_CATALOG_RUN/runner.log" 2>&1 < /dev/null &
+# 退出启动SSH，在新SSH会话核对进程和waiting_disconnect_acceptance后：
+"$PV_PY" -m scripts.run_catalog_comparison confirm-detached --output "$PV_CATALOG_RUN"
+```
+
+prepare/verify/score不调用模型。两库各一次原生工具验证与5个集外控制通过后，按题交替执行100项正式任务，自动输出metrics.json和固定选样的case_review.json；原始请求、响应、结果、进度与退出状态均落服务器盘。成功、真实空结果和已审计完整格式失败不重抽；传输、身份及未知协议异常停止。每题仍为12响应、16,384累计输出token、6张完整叶，不因新库更大加预算。
+
+新旧库同时存在来源、规模及隔离差异；旧材料与23/50题同题干，不能把分差单独归因于建库方法。分数使用新参考的位置代理，并报告全部发布作分母、计算量和实际读库情况。选C4属于开发集历史选优，不是独立论文验证。新库候选质量标记和默认库不改。
+
+## 历史入口导航
+
+下列已结束路线只用于追溯或明确的新实验，不代表待执行队列。公共依赖保留代码位置；独立工作区/服务器中的历史执行版本按各批冻结清单追溯，不复制到主线冒充当前入口。
+
+| 路线 | 主要入口 | 状态 |
+|---|---|---|
+| 原树检索→独立checker→原发布链 | run_retrieval_comparison.py、run_retrieval_checker.py；提示迭代按原批清单 | 早期实验，归档 |
+| 交接、定位、规则正文消融 | terra_candidate_checker_20261006/anchor_handoff中的冻结清单 | 归因证据，保留 |
+| 分段全流程联合提示 | joint_prompt_iteration_20261008中的冻结计划及执行版本 | 已结束，不是当前主线 |
+| 连续C3/C4提示及纯模型 | run_continuous_context_v2.py、run_continuous_context_v3.py | 已完成，C4原文由本轮复用 |
+| Jev | jev_checker_50_20261005中的冻结计划及执行版本 | 独立支线已结束，暂不接主线 |
+| 39组新bench重评 | rescore_frozen_bench.py | 离线完成，无需重新调用模型 |
+| 120B新库及分页建树 | run_qwen30b_expansion.py、reorganize_qwen30b_expansion.py | 累计5,000题已完成 |
+| 同源规则与skills | run_rule_skill_comparison.py | 两组50题已完成，skills形式暂缓 |
+
+换标签离线重评使用 `rescore_frozen_bench.py`。原批以 `prepare --scope all39 --data-root <原材料目录> --plan <新清单路径>` 冻结E01–E39、原50题、修订参考及输出哈希，复现旧成绩并运行已知案例合成探针；不传scope时仍为近期连续上下文4组。执行工作区使用同一代码与清单依次 `verify --data-root <原材料目录> --plan <清单路径>`、`run --data-root <原材料目录> --plan <清单路径> --output <新结果目录>`。verify返回2表示原件缺失，返回1表示哈希/计分等异常，须回主线核查，不用指标摘要代替原件。
 
 只有run计算保存终稿的新标签成绩，输出report.json、summary.csv及带哈希的completion.json。全量报告包括78行旧/新完整P/R/F1、28项原定对照与配对区间、跨轮纯模型波动，以及按固定哈希抽取的最多8条变分样例；样例附原文和两版标签，默认未裁定。错误理由但相同位置的负控用于揭示评分器局限，不算被测模型输出。原失败与协议不合规保留，不能为读取失败外层样本ID而伪造检查完成。源文件只读、目标目录不覆盖；不调用模型、不需要凭据/GPU。新旧指标均为位置代理，不能仅凭涨分确认bench物理准确性。
 
@@ -42,7 +74,7 @@ API 先行时使用 `run_retrieval_comparison.py --phase retrieval_batch --input
 
 接续预算/网络中断时使用新的结果子目录，追加 `--retry-transient-from 原运行目录 --continue-pending --replay-prefix`。原始失败保留；在全部关联记录中跳过已成功项，未启动任务继续执行。已收到的成功响应只在完整请求逐项相同时重放以恢复运行状态，不重复付费；实际新请求、重放数量和历史用量分开记录，全批预算累计计算。没有明确完成状态的在途请求仍须先核对，不能覆盖重跑。
 
-## 连续会话对照：C0p / C3
+## 历史连续会话对照：C0p / C3（已完成）
 
 完整提示在 [continuous_context_v2.py](continuous_context_v2.py) 的 `BASE`、`RULES` 和 `repair_message`；实验调度和冻结参数在 [run_continuous_context_v2.py](run_continuous_context_v2.py)。被测模型固定 GPT-OSS-120B medium，两组共用全文检查提示，C3 增加按具体疑点检索、查询无进展时换路线、核对规则前提及返回全文查漏。检索和诊断在同一会话完成，不另接 checker。
 
@@ -65,13 +97,13 @@ nohup "$PYTHON_BIN" -u -m scripts.run_continuous_context_v2 run --output "$RUN_D
 
 查看 `execution_status.json`、`formal/progress.json` 和 `runner.log`。最终 `metrics_automatic_proxy_unreviewed.json` 包含完整三指标、修正前后分数、未定位数、用量和位置命中增减。未完成组不给伪完整分数；旧位置分数不是物理正确率。只读重计分用同入口 `score` 模式。配置发生变化时拒绝混入同批次，不能删除原文件绕过校验。
 
-## Bench 重标
+## Bench 重标（已完成，不重启生成）
 
 重标入口使用 `conda run -n physicsverifier python scripts/run_bench_reannotation.py --source <99题历史输入> --output <原结果目录> --env .env --mode pilot|formal|audit --recover-technical`，`.env` 使用 `OPENAI_BASE_URL/OPENAI_API_KEY`，实际模型固定 `gpt-6.1-sol`、high。先做固定 5 题四轮试跑；`supervise_bench_reannotation.py` 可在工程验收后接续正式 396 项，同协议试跑结果复用。正式续跑先核实进程和锁，已有终稿不重抽。整批技术退避为 5/10/20/30 分钟并跨重启保留；新未知 429、鉴权、余额或内容协议异常停止，成功响应与原文哈希不符也停止。历史 HTTP 发出前的连接失败可在一次性凭据下补回请求计数，原始记录及未知 token 预留不清零；后续重启不自动加额度。查看 `progress.json`、`budget.json`、`scheduler.json` 和 `quality_audit.json`；创建 `STOP` 或发送 SIGTERM 后当前请求先落盘，再停止。
 
 本批99题四轮已完成。2026-10-18先冻结原机器参考v1，随后按用户要求由主线Codex助手处理未决、引文、遗漏与来源标记，0新增API实验。当前入口为结果目录 `assistant_review/release_manifest.json`，对应 `reference.json` 和含逐项理由、原值及可重放补丁的 `review_decisions.json`；原四轮记录、`machine_reference.json` 和根目录v1清单保持不变。修订参考含402条confirmed、7条unresolved及1条合并记录；404条唯一引文、5条遗漏证据，未决不作正负金标，遗漏不伪造位置。各方案重评必须使用同一版本与口径，旧分数保留。助手复核不等于人工金标；原采集pending字段和质量审核是历史状态，不应据此重启生成。全量 `audit` 会重写原质量审核；检查冻结原记录应只读调用 `validate_saved`，不要对冻结目录重新运行会写文件的模式。
 
-## Checker 回放
+## 历史Checker回放
 
 `run_checker_replay.py` 从冻结候选运行 checker 与发布流程，不重新检索。候选可来自真实检索或显式指定规则，二者不能混称。
 
@@ -106,7 +138,7 @@ nohup "$PYTHON_BIN" -u -m scripts.run_continuous_context_v2 run --output "$RUN_D
 
 流程见 [增量规则说明](../docs/增量规则流程.md)。`legacy/` 仅用于复现旧实验，不能直接沿用其中的路径、环境或模型配置。
 
-## 120B逐题建库
+## 120B逐题建库（实现与历史复现）
 
 10.24起在旧流程上改造：`generate_experience_rules.experience_120b_prompt`与`normalize_120b_experience`完成完整输入的审查＋提炼提示和行号取证；`unified_rules_pipeline.build_120b_experience_catalog`串联原候选去重、来源合并、120B归组及原导航叶/结构验证。`experience_topic_skeleton`只提取旧6领域/123主题的名称与层级，旧规则和摘要不传入。单来源候选保留，跨题概括不作为产出前置门槛。
 
@@ -213,7 +245,7 @@ python -m scripts.run_built_catalog confirm-detached --build <构建目录> --ou
 
 C0p纯120B与C4规则辅助各50题，同一120B配置、每题累计12次响应/16384生成token、最多读6叶；C4保留连续上下文，不拆checker。沿用10个工程控制与工具IO探针，再做正式对照。冻结新参考输出完整P/R/F1、敏感性、失败和配对区间，同时报告实际调用/token与树/叶使用。相同预算上限不等于实际等成本，位置命中不等于物理正确，开发结果不作独立论文结论。
 
-### 累计5,000题扩容（独立入口，不修改运行中的逐题建库）
+### 累计5,000题扩容（已完成，以下为复现方法）
 
 `prepare_qwen30b_expansion.py`从固定版本[MegaScience/TextbookReasoning](https://huggingface.co/datasets/MegaScience/TextbookReasoning)的train/physics只导出题干，校验源SHA，做bench、旧题及新题间去重。许可CC-BY-NC-SA-4.0；上游题目曾经其他模型整理，本项目不导入其答案或解答。仅此离线导出需要pyarrow，推理端不需要。所有Python命令在个人conda环境执行。
 
@@ -253,7 +285,7 @@ python -m scripts.reorganize_qwen30b_expansion status --root <已有扩容目录
 
 仅漏编号可一次补齐，成功分配不能推翻；内容失败隔离，连续三次内容失败停止。历史用量与崩溃预留不清零。发布同时保留`unplaced_rules.json`，所有输入候选必须守恒；`physical_quality_passed=false`、`usable_for_runtime=false`，不自动替换默认库。工程覆盖见`tests/test_bounded_tree.py`，工程通过不代表物理质量验收。
 
-### 同一批30B错答生成规则树与skills的对照
+### 同一批30B错答生成规则树与skills的对照（已完成）
 
 `run_rule_skill_comparison.py`比较同一错题材料的知识生成方式：A为已有30B错答经120B审查提炼的新规则树；B为120B直接读取同一批1,726份完整30B错答，在连续上下文中核查并凝练skills，不另让120B重新解题。1,726份由原4,995份完整回答的机器筛错结果确定，覆盖入树前全部候选来源，不只取2,065条已入树叶的来源；准备时核验来源守恒。B只见原题、30B原答和题设上下文，不提供原判词、规则或参考答案/测试标签。每题最多两项skill，仅精确去重；无法证实错误、信息不足、有效空提炼、技术失败和未入树分别记账。skill的目标、条件、步骤、陷阱、自检方法无损映射到旧叶接口，正文不改写为判错规则。两组共享6领域/123主题目录和同一120B分页归组机制；不使用embedding或外部教师。
 
