@@ -87,7 +87,15 @@ def verify(output):
     plan = vr.read(output / 'plan.json'); c = plan['configuration']
     require(vr.digest(c) == plan['configuration_sha256'] and c['protocol'] == p.VERSION,
             'Frozen configuration changed')
-    require(c['source_hashes'] == source_hashes(), 'Code changed after freeze')
+    if c['source_hashes'] != source_hashes():
+        recovery = vr.read(output / 'content_failure_recovery.json')
+        require(recovery['configuration_sha256'] == plan['configuration_sha256'] and
+                recovery['plan_sha256'] == vr.sha(output / 'plan.json') and
+                recovery['original_sources'] == c['source_hashes'] and
+                recovery['replacement_sources'] == source_hashes() and
+                recovery['policy'] == 'retain_complete_malformed_json_as_failed_no_regeneration',
+                'Code changed without matching scheduling recovery')
+        vr.EvidenceCache(output/'recovery_evidence_cache.json').check(recovery['prefix_files'])
     require(c['sources_sha256'] == vr.sha(output / 'sources.json') and
             c['input_sha256'] == vr.sha(runtime.INPUT), 'Frozen inputs changed')
     parent = Path(c['source_parent'])
@@ -255,6 +263,58 @@ def reference_audit(value, provided):
             'provided_complete_ids': list(provided), 'adherence_only': True}
 
 
+def complete_content_failure(value):
+    """Retain a correctly identified, complete response with invalid final JSON.
+
+    This does not retry, repair contents, accept unknown envelopes, or skip
+    transport failures and failed quote-repair calls.
+    """
+    if (value.get('status') != 'failed' or value.get('diagnostics') != [] or
+            not value.get('failure_reason','').startswith('JSONDecodeError:')):
+        return False
+    runtime.audit_result(value)
+    evidence = value.get('trace',{}).get('response_evidence',[])
+    if not evidence:return False
+    record = vr.read(Path(evidence[-1]['response_path']))
+    if (record.get('error') or record.get('model_ids') != [r.EXPECTED_MODEL] or
+            record.get('finish_reasons') != ['stop'] or not record.get('usage')):
+        return False
+    try:
+        r.parse_json(record['content'])
+    except json.JSONDecodeError:
+        return True
+    return False
+
+
+def register_content_failure_recovery(output):
+    """Bind the existing prefix before applying a scheduling-only correction."""
+    with r.run_lock(output/'active.lock'):
+        require(not (output/'runner.pid').exists(), 'Inspect live runner before recovery')
+        plan=vr.read(output/'plan.json'); c=plan['configuration']; current=source_hashes()
+        require(vr.digest(c)==plan['configuration_sha256'], 'Frozen plan drift')
+        changed={n for n,h in current.items() if c['source_hashes'].get(n)!=h}
+        require(changed=={'scripts/run_organization_comparison.py'}, 'Unexpected code change')
+        affected=[]
+        for path in sorted((output/'formal').rglob('result.json')):
+            value=vr.read(path)
+            if not runtime.healthy_result(value):
+                require(complete_content_failure(value), 'Unknown failure remains blocking')
+                affected.append({'id':value['id'],'file':str(path),'sha256':vr.sha(path)})
+        require(affected, 'No complete content failure to register')
+        prefix=[output/n for n in ('plan.json','sources.json','runtime.json')]
+        for part in ('controls','formal','queries'):
+            prefix.extend(f for f in (output/part).rglob('*') if f.is_file() and f.suffix in {'.json','.sse'})
+        receipt={'configuration_sha256':plan['configuration_sha256'],'plan_sha256':vr.sha(output/'plan.json'),
+            'original_sources':c['source_hashes'],'replacement_sources':current,
+            'policy':'retain_complete_malformed_json_as_failed_no_regeneration',
+            'prefix_files':{str(f):vr.sha(f) for f in prefix},'affected':affected,
+            'stopped_status':vr.read(output/'execution_status.json'),
+            'prompts_inputs_budgets_and_scoring_changed':False,'new_model_calls':0,'unix':time.time()}
+        require(not (output/'content_failure_recovery.json').exists(), 'Recovery already registered')
+        vr.atomic(output/'content_failure_recovery.json',receipt)
+        verify(output)
+
+
 @contextmanager
 def checking(row, arm, packet, prefix):
     provided = packet['retrieval']['provided_complete_ids']
@@ -301,7 +361,8 @@ def run_condition(output, row, phase, arm, memory, plan, tokenizer, client):
         saved = vr.read(path)
         require(saved['configuration_sha256'] == plan['configuration_sha256'], 'Existing result plan changed')
         runtime.audit_result(saved)
-        require(runtime.healthy_result(saved), 'Preserved failed result requires audited recovery')
+        require(runtime.healthy_result(saved) or (phase=='formal' and complete_content_failure(saved)),
+                'Preserved failed result requires audited recovery')
         return saved
     prefix = query(output, row, plan, tokenizer, client)
     count = lambda m: len(tokenizer.apply_chat_template(m, tokenize=True, add_generation_prompt=True))
@@ -317,7 +378,8 @@ def run_condition(output, row, phase, arm, memory, plan, tokenizer, client):
             endpoint=plan['configuration']['api_base']+'/chat/completions', model=r.EXPECTED_MODEL,
             root=output/phase/arm, signature=plan['configuration_sha256'], limits=plan['configuration']['limits'])
     runtime.audit_result(result)
-    require(runtime.healthy_result(result), 'Technical failure retained; no reroll')
+    require(runtime.healthy_result(result) or (phase=='formal' and complete_content_failure(result)),
+            'Technical failure retained; no reroll')
     require(phase != 'controls' or result['protocol_audit']['passed'], 'Engineering reference protocol failure')
     old.emit(output, phase, arm=arm, sample_id=row['id'], result_status=result['status'])
     return result
@@ -425,7 +487,7 @@ def confirm(output):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode',choices=['prepare','verify','run','confirm-detached','score','status'])
+    parser.add_argument('mode',choices=['prepare','verify','run','confirm-detached','score','status','register-content-failure'])
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--source-parent',type=Path)
     args=parser.parse_args();out=args.output.resolve()
@@ -435,6 +497,7 @@ def main():
     elif args.mode=='run':run(out)
     elif args.mode=='confirm-detached':confirm(out)
     elif args.mode=='score':print(json.dumps(score(out)['recorded_tasks']))
+    elif args.mode=='register-content-failure':register_content_failure_recovery(out)
     else:print(json.dumps(vr.read(out/'execution_status.json'),ensure_ascii=False))
 
 

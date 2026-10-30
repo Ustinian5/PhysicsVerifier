@@ -161,3 +161,30 @@ def test_experience_checkpoint_and_material_release(tmp_path,monkeypatch,bad_pil
         assert len(materials['flat_skills'].docs)==1
         again=run.build(tmp_path,plan,Tokenizer())
         assert calls==['first','second'] and again['flat_skills'].docs==materials['flat_skills'].docs
+
+
+@pytest.mark.parametrize('finish,model,error,allowed',[
+    ('stop',run.r.EXPECTED_MODEL,None,True),('length',run.r.EXPECTED_MODEL,None,False),
+    ('stop','wrong-model',None,False),('stop',run.r.EXPECTED_MODEL,'transport-error',False)])
+def test_only_known_complete_json_failure_can_continue(tmp_path,monkeypatch,finish,model,error,allowed):
+    response=tmp_path/'response.json'
+    run.vr.atomic(response,{'model_ids':[model],'finish_reasons':[finish],'usage':{'completion_tokens':5},
+                           'error':error,'content':'{"diagnostics":['})
+    monkeypatch.setattr(run.runtime,'audit_result',lambda value:None)
+    value={'status':'failed','diagnostics':[],'failure_reason':'JSONDecodeError: malformed',
+           'trace':{'response_evidence':[{'response_path':str(response)}]}}
+    assert run.complete_content_failure(value)==allowed
+    value['failure_reason']='RuntimeError: unexpected payload'
+    assert not run.complete_content_failure(value)
+
+
+def test_preserved_content_failure_is_not_called_again_and_controls_still_stop(tmp_path,monkeypatch):
+    plan={'configuration_sha256':'binding'}
+    value={'configuration_sha256':'binding','status':'failed','diagnostics':[]}
+    monkeypatch.setattr(run.runtime,'audit_result',lambda value:None)
+    monkeypatch.setattr(run,'complete_content_failure',lambda value:True)
+    for phase in ('formal','controls'):
+        run.vr.atomic(run.path_for(tmp_path,phase,'pure',ROW),value)
+    assert run.run_condition(tmp_path,ROW,'formal','pure',None,plan,None,None)==value
+    with pytest.raises(ValueError,match='requires audited recovery'):
+        run.run_condition(tmp_path,ROW,'controls','pure',None,plan,None,None)
