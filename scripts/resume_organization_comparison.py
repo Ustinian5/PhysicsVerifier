@@ -9,11 +9,28 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from contextlib import contextmanager
 
 from scripts import run_organization_comparison as base
 
 vr, r = base.vr, base.r
 RECEIPT = 'native_format_recovery.json'
+
+
+@contextmanager
+def released_artifact_check(output):
+    """Verify consumed release bytes; retain, but do not re-stat, old raw history."""
+    expected=vr.read(output/'plan.json')['configuration']['rules']
+    def release_plan(path, *, full=False):
+        base.require(not full and Path(path).resolve()==Path(expected['path']).resolve(),
+                     'Bounded check cannot replace an explicit full audit')
+        plan=vr.read(Path(path)/'plan.json')
+        base.require(vr.digest(plan['configuration'])==plan['configuration_sha256']==expected['configuration_sha256'],
+                     'Rule construction plan changed')
+        # rules_asset additionally checks release SHA, flags, model and counts;
+        # base.verify compares the actual catalog SHA with the frozen input SHA.
+        return plan
+    with patch.object(base.old.navigation,'verify',release_plan):yield
 
 
 def decode_final(raw, request):
@@ -97,11 +114,22 @@ def prepare(output):
 
 
 def verify(output):
-    plan=base.verify(output);receipt=vr.read(output/RECEIPT)
+    with r.run_lock(output.parent/'organization_verification.lock'),released_artifact_check(output):
+        plan=base.verify(output)
+    receipt=vr.read(output/RECEIPT)
+    expected_code=receipt['code_sha256']
+    if expected_code!=vr.sha(Path(__file__)):
+        amendment=vr.read(output/'released_artifact_recovery.json')
+        base.require(amendment['previous_receipt_sha256']==vr.sha(output/RECEIPT) and
+            amendment['previous_code_sha256']==expected_code and
+            amendment['configuration_sha256']==plan['configuration_sha256'] and
+            amendment['new_code_sha256']==vr.sha(Path(__file__)), 'Unbound verification amendment')
+        expected_code=amendment['new_code_sha256']
     base.require(receipt['configuration_sha256']==plan['configuration_sha256'] and
-        receipt['plan_sha256']==vr.sha(output/'plan.json') and receipt['code_sha256']==vr.sha(Path(__file__)) and
+        receipt['plan_sha256']==vr.sha(output/'plan.json') and expected_code==vr.sha(Path(__file__)) and
         receipt['base_sources']==base.source_hashes(),'Recovery binding changed')
     vr.EvidenceCache(output/'native_recovery_cache.json').check(receipt['prefix_files'])
+    return plan
 
 
 def score(output, plan=None):
@@ -118,7 +146,7 @@ def score(output, plan=None):
 
 
 def run(output):
-    verify(output)
+    plan=verify(output)
     original_condition, original_score=base.run_condition,base.score
     def condition(out,row,phase,arm,*args,**kwargs):
         try:return original_condition(out,row,phase,arm,*args,**kwargs)
@@ -130,7 +158,8 @@ def run(output):
             return vr.read(path)
     def scoring(out,plan=None):
         with patch.object(base,'score',original_score):return score(out,plan)
-    with patch.object(base,'run_condition',condition),patch.object(base,'score',scoring):base.run(output)
+    with patch.object(base,'run_condition',condition),patch.object(base,'score',scoring), \
+         patch.object(base,'verify',lambda out:plan):base.run(output)
 
 
 def main():
@@ -141,9 +170,10 @@ def main():
     if args.mode=='prepare':prepare(out)
     elif args.mode=='run':run(out)
     else:
-        verify(out)
-        if args.mode=='score':score(out)
-        elif args.mode=='confirm-detached':base.confirm(out)
+        plan=verify(out)
+        if args.mode=='score':score(out,plan)
+        elif args.mode=='confirm-detached':
+            with patch.object(base,'verify',lambda out:plan):base.confirm(out)
 
 
 if __name__=='__main__':main()

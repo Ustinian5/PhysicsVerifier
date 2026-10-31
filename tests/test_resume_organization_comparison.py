@@ -46,3 +46,17 @@ def test_valid_content_cannot_be_discarded(tmp_path,monkeypatch):
     monkeypatch.setattr(x,'decode_final',lambda *a:{'content':'{"diagnostics":[]}',
         'model_ids':[x.r.EXPECTED_MODEL],'finish_reasons':['stop']})
     with pytest.raises(ValueError,match='separate review'):x.account(p)
+
+
+def test_release_check_preserves_catalog_sha_and_rejects_changed_plan(tmp_path):
+    library=tmp_path/'library';library.mkdir()
+    c={'model':{'model':x.r.EXPECTED_MODEL,'reasoning_effort':'medium'}}
+    digest=x.vr.digest(c)
+    x.vr.atomic(library/'plan.json',{'configuration':c,'configuration_sha256':digest})
+    x.vr.atomic(tmp_path/'plan.json',{'configuration':{'rules':{'path':str(library),'configuration_sha256':digest}}})
+    with x.released_artifact_check(tmp_path):
+        assert x.base.old.navigation.verify(library)['configuration']==c
+        with pytest.raises(ValueError,match='explicit full audit'):x.base.old.navigation.verify(library,full=True)
+        c['model']['model']='wrong'
+        x.vr.atomic(library/'plan.json',{'configuration':c,'configuration_sha256':digest})
+        with pytest.raises(ValueError,match='plan changed'):x.base.old.navigation.verify(library)
