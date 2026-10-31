@@ -1,8 +1,9 @@
-"""Continue complete malformed native finals without rerolling frozen samples.
+"""Retain audited model-output failures and continue without resampling.
 
 The original runner/results remain immutable. A sidecar accounts for responses
 whose JSON-format label failed before the original engine recorded their usage.
-Unknown transport, identity, native channel, length and semantic errors stop.
+An explicit amendment permits known output failures in controls and formal
+tasks. Failed controls remain failed; identity, transport and unknown errors stop.
 """
 import argparse
 import json
@@ -15,6 +16,24 @@ from scripts import run_organization_comparison as base
 
 vr, r = base.vr, base.r
 RECEIPT = 'native_format_recovery.json'
+OUTPUT_AMENDMENT = 'output_failure_recovery.json'
+
+
+def missing_final_usage(raw, request):
+    """Validate a terminated analysis-only response; never extract an answer."""
+    from vllm.entrypoints import harmony_utils as h
+    from scripts.gpt_oss_harmony_transport import decode_response
+    try:
+        decode_response(raw, model=request['model'], max_tokens=request['max_tokens'], native_tools=None)
+    except ValueError as exc:
+        base.require(str(exc) == 'Missing final message', 'Unknown native output failure')
+    else:
+        raise ValueError('Valid final requires separate review, not discard')
+    parsed = h.parse_output_into_messages(raw['choices'][0]['token_ids'])
+    base.require(not parsed.current_content and bool(parsed.messages) and
+                 all(m.channel == 'analysis' and not m.recipient for m in parsed.messages),
+                 'Not an analysis-only terminated response')
+    return raw['usage']
 
 
 @contextmanager
@@ -50,8 +69,10 @@ def decode_final(raw, request):
 def inspect_failure(path):
     value = vr.read(path)
     base.runtime.audit_result(value)
+    reason = value.get('failure_reason', '')
+    missing = reason == 'ValueError: Missing final message'
     base.require(value['status']=='failed' and value.get('diagnostics')==[] and
-                 value.get('failure_reason','').startswith('JSONDecodeError:'), 'Not an audited JSON failure')
+                 (reason.startswith('JSONDecodeError:') or missing), 'Not an audited output failure')
     state = vr.read(path.with_name('state.json')); pending = state['pending']
     request_path, raw_path, response_path = [Path(pending[k]) for k in ('request_path','raw_path','response_path')]
     saved, raw, record = [vr.read(p) for p in (request_path, raw_path, response_path)]
@@ -60,30 +81,35 @@ def inspect_failure(path):
         request['model']==r.EXPECTED_MODEL and not request.get('tools') and
         request['max_tokens']==pending['max_tokens'] and 0 < request['max_tokens'] <= 16384,
         'Unexpected failed request')
-    base.require(record.get('http_status')==200 and record.get('error','').startswith('JSONDecodeError:') and
+    error_matches = (record.get('error') == reason if missing else
+                     record.get('error','').startswith('JSONDecodeError:'))
+    base.require(record.get('http_status')==200 and error_matches and
         record['raw_sse_sha256']==vr.sha(raw_path) and raw.get('model')==r.EXPECTED_MODEL and
         record.get('model_ids')==[r.EXPECTED_MODEL] and len(raw.get('choices',[]))==1 and
         raw['choices'][0]['finish_reason']=='stop' and raw.get('usage')==record.get('usage'),
         'Transport, identity or completion failure is not eligible')
-    decoded = decode_final(raw, request)
-    base.require(not decoded.get('tool_calls') and decoded['model_ids']==[r.EXPECTED_MODEL] and
-                 decoded['finish_reasons']==['stop'], 'Not a complete plain final')
-    try:
-        # Match the native format-label gate exactly. Do not apply the later
-        # permissive parser to rescue a response rejected by the frozen gate.
-        json.loads(decoded['content'])
-    except json.JSONDecodeError:
-        pass
+    if missing:
+        usage = missing_final_usage(raw, request)
     else:
-        raise ValueError('Valid final requires separate review, not discard')
+        decoded = decode_final(raw, request)
+        base.require(not decoded.get('tool_calls') and decoded['model_ids']==[r.EXPECTED_MODEL] and
+                     decoded['finish_reasons']==['stop'], 'Not a complete plain final')
+        try:
+            # Match the frozen native format-label gate, not a permissive parser.
+            json.loads(decoded['content'])
+        except json.JSONDecodeError:
+            pass
+        else:
+            raise ValueError('Valid final requires separate review, not discard')
+        usage = decoded['usage']
     base.require(str(request_path) not in {e['request_path'] for e in value['trace']['response_evidence']},
                  'Response already accounted')
-    usage = decoded['usage']
     base.require(0 <= usage['completion_tokens'] <= request['max_tokens'] and usage['prompt_tokens'] > 0,
                  'Invalid usage')
     return {'id':value['id'], 'result_sha256':vr.sha(path), 'request_path':str(request_path),
             'usage':usage, 'files':{str(p):vr.sha(p) for p in (path,path.with_name('state.json'),request_path,raw_path,response_path)},
-            'status':'failed_content_preserved','new_model_calls':0,'content_modified':False}
+            'status':'failed_content_preserved','failure_reason':reason,
+            'new_model_calls':0,'content_modified':False}
 
 
 def account(path):
@@ -117,19 +143,55 @@ def verify(output):
     with r.run_lock(output.parent/'organization_verification.lock'),released_artifact_check(output):
         plan=base.verify(output)
     receipt=vr.read(output/RECEIPT)
-    expected_code=receipt['code_sha256']
-    if expected_code!=vr.sha(Path(__file__)):
-        amendment=vr.read(output/'released_artifact_recovery.json')
-        base.require(amendment['previous_receipt_sha256']==vr.sha(output/RECEIPT) and
+    expected_code=receipt['code_sha256']; previous=output/RECEIPT
+    prefix_files=dict(receipt['prefix_files'])
+    for name in ('released_artifact_recovery.json', OUTPUT_AMENDMENT):
+        path=output/name
+        if not path.exists():continue
+        amendment=vr.read(path)
+        base.require(amendment['previous_receipt_sha256']==vr.sha(previous) and
             amendment['previous_code_sha256']==expected_code and
-            amendment['configuration_sha256']==plan['configuration_sha256'] and
-            amendment['new_code_sha256']==vr.sha(Path(__file__)), 'Unbound verification amendment')
-        expected_code=amendment['new_code_sha256']
+            amendment['configuration_sha256']==plan['configuration_sha256'], 'Unbound verification amendment')
+        for filename,sha in amendment.get('prefix_files',{}).items():
+            base.require(filename not in prefix_files or prefix_files[filename]==sha,'Conflicting prefix hashes')
+            prefix_files[filename]=sha
+        expected_code=amendment['new_code_sha256'];previous=path
     base.require(receipt['configuration_sha256']==plan['configuration_sha256'] and
         receipt['plan_sha256']==vr.sha(output/'plan.json') and expected_code==vr.sha(Path(__file__)) and
         receipt['base_sources']==base.source_hashes(),'Recovery binding changed')
-    vr.EvidenceCache(output/'native_recovery_cache.json').check(receipt['prefix_files'])
+    vr.EvidenceCache(output/'native_recovery_cache.json').check(prefix_files)
     return plan
+
+
+def retained_failure(path, *, output_amended):
+    """Return a failed record only after evidence classification, never a pass."""
+    value=vr.read(path)
+    base.runtime.audit_result(value)
+    base.require(value.get('status')=='failed', 'Successful protocol violation must stop')
+    if base.complete_content_failure(value):return value
+    base.require(output_amended or value.get('failure_reason','').startswith('JSONDecodeError:'),
+                 'Missing-final handling needs the explicit amendment')
+    account(path)
+    return value
+
+
+def control_summary(output):
+    groups={}
+    for arm in base.p.ARMS:
+        paths=list((output/'controls'/arm).rglob('result.json'))
+        values=[vr.read(p) for p in paths]
+        passed=sum(base.runtime.healthy_result(v) and v.get('protocol_audit',{}).get('passed',False)
+                   for v in values)
+        supplemental=[account(p) for p,v in zip(paths,values)
+                      if not base.runtime.healthy_result(v) and not base.complete_content_failure(v)]
+        request_paths={e['request_path'] for v in values for e in v['trace']['response_evidence']}
+        request_paths.update(x['request_path'] for x in supplemental)
+        groups[arm]={'recorded':len(values),'planned':len(base.runtime.CONTROLS),'passed':passed,
+                     'failed':len(values)-passed,
+                     'all_passed':len(values)==passed==len(base.runtime.CONTROLS),
+                     'supplemental_failed_decode_usage':supplemental,
+                     'distinct_actual_requests':len(request_paths)}
+    return groups
 
 
 def score(output, plan=None):
@@ -141,21 +203,28 @@ def score(output, plan=None):
         report['usage'][arm]['distinct_actual_requests']+=len({x['request_path'] for x in extras[arm]})
     report['supplemental_failed_decode_usage']=extras
     report['shared_preparation_requests_counted_once_in_batch']+=len({x['request_path'] for v in extras.values() for x in v})
+    if (output/OUTPUT_AMENDMENT).exists():
+        report['output_failure_amendment_sha256']=vr.sha(output/OUTPUT_AMENDMENT)
+        report['engineering_controls']=control_summary(output)
+        report['all_engineering_controls_passed']=all(x['all_passed'] for x in report['engineering_controls'].values())
     vr.atomic(output/'metrics.json',report)
     return report
 
 
 def run(output):
     plan=verify(output)
+    output_amended=(output/OUTPUT_AMENDMENT).exists()
     original_condition, original_score=base.run_condition,base.score
     def condition(out,row,phase,arm,*args,**kwargs):
         try:return original_condition(out,row,phase,arm,*args,**kwargs)
         except ValueError:
             path=base.path_for(out,phase,arm,row)
-            if phase!='formal' or not path.exists():raise
-            account(path)
+            if phase not in ('formal','controls') or not path.exists():raise
+            if phase=='controls' and not output_amended:raise
+            value=retained_failure(path,output_amended=output_amended)
+            base.require(value['configuration_sha256']==plan['configuration_sha256'], 'Failure binding changed')
             base.old.emit(out,phase,arm=arm,sample_id=row['id'],result_status='failed_content_preserved')
-            return vr.read(path)
+            return value
     def scoring(out,plan=None):
         with patch.object(base,'score',original_score):return score(out,plan)
     with patch.object(base,'run_condition',condition),patch.object(base,'score',scoring), \
