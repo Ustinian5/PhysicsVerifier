@@ -2,7 +2,7 @@
 
 所有 Python 入口通过 conda `physicsverifier` 执行。完整参数以各脚本 `--help` 为准；方法和指标见 [效果测评](../docs/效果测评.md)。
 
-## 当前主线：99题经验组织对照（已准备，未运行）
+## 当前主线：99题经验组织对照（skills提炼中）
 
 入口为[run_organization_bench99.py](run_organization_bench99.py)，提示和隔离实现为[organization_bench99.py](../rule_framework/organization_bench99.py)。纯120B、原始经验RAG、平铺过程skills和规则树各99题，共396项。沿用120B medium、公共查询和连续全文检查，不独立拆checker；RAG检索原题/30B回答/既有120B具体核查说明，不检索规则叶。skills只含独立自然语言检查方法的标题/正文，不含目录或规则字段。
 
