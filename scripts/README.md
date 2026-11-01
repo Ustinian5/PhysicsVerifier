@@ -2,22 +2,27 @@
 
 所有 Python 入口通过 conda `physicsverifier` 执行。完整参数以各脚本 `--help` 为准；方法和指标见 [效果测评](../docs/效果测评.md)。
 
-## 当前主线：C4提示下新旧规则库对照
+## 当前主线：99题经验组织对照（已准备，未运行）
 
-入口为[run_catalog_comparison.py](run_catalog_comparison.py)。固定历史E39的C4原文、120B medium、完整50题、工具与预算，旧1,123叶和新2,065叶各重新运行50题。检索与诊断保持同一会话，无独立checker。E39仅提供选定提示，不复用其输出；近期规则/skills通用提示也不混入。
+入口为[run_organization_bench99.py](run_organization_bench99.py)，提示和隔离实现为[organization_bench99.py](../rule_framework/organization_bench99.py)。纯120B、原始经验RAG、平铺过程skills和规则树各99题，共396项。沿用120B medium、公共查询和连续全文检查，不独立拆checker；RAG检索原题/30B回答/既有120B具体核查说明，不检索规则叶。skills只含独立自然语言检查方法的标题/正文，不含目录或规则字段。
 
-服务器个人conda环境及只读运行库按既有配置设置，`PV_PY`是环境内Python绝对路径，`PV_CATALOG_RUN`是独立个人结果目录，`PV_NEW_TREE`指向已冻结tree_v2。只在确认无同批客户端和锁后启动：
+先从已完成的50题批次复用原始案例，再统一排除已知或疑似同源材料，准备完整99题。保守过滤保留1,621份来源、1,935条规则叶；它不证明全语义题族独立。skills另行提炼，旧批不覆盖。所有组共享每题最多3条查询；材料上限6条完整条目/8,192 token，超限整条跳过。RAG/skills平铺BM25，树由程序分层路由。每题预算和计分与旧批相同，完整条件见[项目进展](../docs/项目进展.md)。
+
+以下变量由操作者明确指定：`PV_PY`为个人conda内Python绝对路径；`PV_ORGANIZATION_RUN`为新的个人持久化目录；`PV_PRIOR_COMPARISON`为已完成的organization_comparison_20261030；`PV_NEW_TREE`为已冻结tree_v2。在服务器原仓库设置所需运行库环境，检查进程、锁和资源后：
 
 ```bash
-"$PV_PY" -m scripts.run_catalog_comparison prepare --output "$PV_CATALOG_RUN" --rule-tree "$PV_NEW_TREE"
-nohup "$PV_PY" -u -m scripts.run_catalog_comparison run --output "$PV_CATALOG_RUN" >> "$PV_CATALOG_RUN/runner.log" 2>&1 < /dev/null &
-# 退出启动SSH，在新SSH会话核对进程和waiting_disconnect_acceptance后：
-"$PV_PY" -m scripts.run_catalog_comparison confirm-detached --output "$PV_CATALOG_RUN"
+"$PV_PY" -m scripts.run_organization_bench99 prepare --output "$PV_ORGANIZATION_RUN" --parent-comparison "$PV_PRIOR_COMPARISON" --rule-tree "$PV_NEW_TREE"
+"$PV_PY" -m scripts.run_organization_bench99 verify --output "$PV_ORGANIZATION_RUN"
+nohup "$PV_PY" -u -m scripts.run_organization_bench99 run --output "$PV_ORGANIZATION_RUN" >> "$PV_ORGANIZATION_RUN/runner.log" 2>&1 < /dev/null &
+# 退出启动SSH；新SSH中核对PID存活、状态waiting_disconnect_acceptance后：
+"$PV_PY" -m scripts.run_organization_bench99 confirm-detached --output "$PV_ORGANIZATION_RUN"
 ```
 
-prepare/verify/score不调用模型。两库各一次原生工具验证与5个集外控制通过后，按题交替执行100项正式任务，自动输出metrics.json和固定选样的case_review.json；原始请求、响应、结果、进度与退出状态均落服务器盘。成功、真实空结果和已审计完整格式失败不重抽；传输、身份及未知协议异常停止。每题仍为12响应、16,384累计输出token、6张完整叶，不因新库更大加预算。
+首次run提炼固定12来源后停止为awaiting_skill_pilot_review。执行助手审读原经验和skills，检查是否提供具体的检查操作、是否只是孤立物理判据改写；只看构建材料，不看bench分数。审读文件skills/pilot_review.json需含configuration_sha256、actor（Codex assistant或human）、human_gold=false、decision=continue及samples。每份sample写id、outcome_sha256、notes和method_distinction：非空有效方法为acceptable，空输出valid_empty，内容失败unassessable_output_failure。全部固定来源均须审读且至少有一份可评方法；明显不合格时停止回主线，不改提示补抽。格式校验本身不等于语义验收，详见执行器check_pilot。
 
-新旧库同时存在来源、规模及隔离差异；旧材料与23/50题同题干，不能把分差单独归因于建库方法。分数使用新参考的位置代理，并报告全部发布作分母、计算量和实际读库情况。选C4属于开发集历史选优，不是独立论文验证。新库候选质量标记和默认库不改。
+通过后用同一run入口及新的断连验收续跑，不重做成功/空/失败项。补齐skills后按题轮换四组，20项集外工程控制单列，完成时自动计分并选双向案例。prepare/verify/score不调用模型；未满99题的组不填分数。原始请求、响应、进度、退出状态、已知输出失败均保留；传输/身份/未知协议故障停止，不改变判定标准。verify使用证据缓存，首次和显式--full才完整核验依赖，不反复解析全部旧日志。
+
+99题参考含402确认错误（397可定位）和7未决，仍是机器与助手修订的位置代理。指标同时报告全部发布分母敏感性、失败、参考实际供给量、配对区间和固定双向案例。旧50题批次保持冻结，扩样本、改skills和隔离后不能直接把跨批分差归因于一个改动。
 
 ## 历史入口导航
 
@@ -32,7 +37,9 @@ prepare/verify/score不调用模型。两库各一次原生工具验证与5个�
 | Jev | jev_checker_50_20261005中的冻结计划及执行版本 | 独立支线已结束，暂不接主线 |
 | 39组新bench重评 | rescore_frozen_bench.py | 离线完成，无需重新调用模型 |
 | 120B新库及分页建树 | run_qwen30b_expansion.py、reorganize_qwen30b_expansion.py | 累计5,000题已完成 |
-| 同源规则与skills | run_rule_skill_comparison.py | 两组50题已完成，skills形式暂缓 |
+| 同源规则与树状skills | run_rule_skill_comparison.py | 两组50题已完成，非本轮平铺skills |
+| C4固定提示换库 | run_catalog_comparison.py / resume_catalog_comparison.py | 旧/新库各50题已完成 |
+| 原四组50题 | run_organization_comparison.py / resume_organization_comparison.py | 200项已完成；新99题不使用这些入口重跑 |
 
 换标签离线重评使用 `rescore_frozen_bench.py`。原批以 `prepare --scope all39 --data-root <原材料目录> --plan <新清单路径>` 冻结E01–E39、原50题、修订参考及输出哈希，复现旧成绩并运行已知案例合成探针；不传scope时仍为近期连续上下文4组。执行工作区使用同一代码与清单依次 `verify --data-root <原材料目录> --plan <清单路径>`、`run --data-root <原材料目录> --plan <清单路径> --output <新结果目录>`。verify返回2表示原件缺失，返回1表示哈希/计分等异常，须回主线核查，不用指标摘要代替原件。
 
