@@ -2,9 +2,9 @@
 
 所有 Python 入口通过 conda `physicsverifier` 执行。完整参数以各脚本 `--help` 为准；方法和指标见 [效果测评](../docs/效果测评.md)。
 
-## 当前主线：99题经验组织对照（正式检查续跑中）
+## 当前主线：99题经验组织对照（396项已完成）
 
-入口为[run_organization_bench99.py](run_organization_bench99.py)，本轮格式故障恢复使用[resume_organization_bench99.py](resume_organization_bench99.py)（prepare/verify/run/score/confirm-detached）；恢复回执绑定原始证据，仅将已核验完整但格式不符的输出保留为失败，不修补、不重抽。提示和隔离实现为[organization_bench99.py](../rule_framework/organization_bench99.py)。纯120B、原始经验RAG、平铺过程skills和规则树各99题，共396项。沿用120B medium、公共查询和连续全文检查，不独立拆checker；RAG检索原题/30B回答/既有120B具体核查说明，不检索规则叶。skills只含独立自然语言检查方法的标题/正文，不含目录或规则字段。
+本批已完成，以下命令保留用于理解原执行过程，不要对已完成目录重新启动。入口为[run_organization_bench99.py](run_organization_bench99.py)，本轮格式故障恢复使用[resume_organization_bench99.py](resume_organization_bench99.py)（prepare/verify/run/score/confirm-detached）；恢复回执绑定原始证据，仅将已核验完整但格式不符的输出保留为失败，不修补、不重抽。提示和隔离实现为[organization_bench99.py](../rule_framework/organization_bench99.py)。纯120B、原始经验RAG、平铺过程skills和规则树各99题，共396项。沿用120B medium、公共查询和连续全文检查，不独立拆checker；RAG检索原题/30B回答/既有120B具体核查说明，不检索规则叶。skills只含独立自然语言检查方法的标题/正文，不含目录或规则字段。
 
 先从已完成的50题批次复用原始案例，再统一排除已知或疑似同源材料，准备完整99题。保守过滤保留1,621份来源、1,935条规则叶；它不证明全语义题族独立。skills另行提炼，旧批不覆盖。所有组共享每题最多3条查询；材料上限6条完整条目/8,192 token，超限整条跳过。RAG/skills平铺BM25，树由程序分层路由。每题预算和计分与旧批相同，完整条件见[项目进展](../docs/项目进展.md)。
 
@@ -21,6 +21,8 @@ nohup "$PV_PY" -u -m scripts.run_organization_bench99 run --output "$PV_ORGANIZA
 首次run提炼固定12来源后停止为awaiting_skill_pilot_review。执行助手审读原经验和skills，检查是否提供具体的检查操作、是否只是孤立物理判据改写；只看构建材料，不看bench分数。审读文件skills/pilot_review.json需含configuration_sha256、actor（Codex assistant或human）、human_gold=false、decision=continue及samples。每份sample写id、outcome_sha256、notes和method_distinction：非空有效方法为acceptable，空输出valid_empty，内容失败unassessable_output_failure。全部固定来源均须审读且至少有一份可评方法；明显不合格时停止回主线，不改提示补抽。格式校验本身不等于语义验收，详见执行器check_pilot。
 
 通过后用同一run入口及新的断连验收续跑，不重做成功/空/失败项。补齐skills后按题轮换四组，20项集外工程控制单列，完成时自动计分并选双向案例。prepare/verify/score不调用模型；未满99题的组不填分数。原始请求、响应、进度、退出状态、已知输出失败均保留；传输/身份/未知协议故障停止，不改变判定标准。verify使用证据缓存，首次和显式--full才完整核验依赖，不反复解析全部旧日志。
+
+已核验396项原始输出并复现全表。`python -m scripts.analyze_organization_comparison RESULT_DIRECTORY`支持已冻结50/99题，核验实际请求、材料送达、已记录的引用违规及评分依赖，保存`material_usage_audit.json`；不调用模型、不改原分数，案例复核在原`case_review.json`维护。
 
 99题参考含402确认错误（397可定位）和7未决，仍是机器与助手修订的位置代理。指标同时报告全部发布分母敏感性、失败、参考实际供给量、配对区间和固定双向案例。旧50题批次保持冻结，扩样本、改skills和隔离后不能直接把跨批分差归因于一个改动。
 
