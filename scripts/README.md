@@ -2,9 +2,9 @@
 
 所有 Python 入口通过 conda `physicsverifier` 执行。完整参数以各脚本 `--help` 为准；方法和指标见 [效果测评](../docs/效果测评.md)。
 
-## 当前主线：99题经验组织对照（skills提炼中）
+## 当前主线：99题经验组织对照（正式检查续跑中）
 
-入口为[run_organization_bench99.py](run_organization_bench99.py)，提示和隔离实现为[organization_bench99.py](../rule_framework/organization_bench99.py)。纯120B、原始经验RAG、平铺过程skills和规则树各99题，共396项。沿用120B medium、公共查询和连续全文检查，不独立拆checker；RAG检索原题/30B回答/既有120B具体核查说明，不检索规则叶。skills只含独立自然语言检查方法的标题/正文，不含目录或规则字段。
+入口为[run_organization_bench99.py](run_organization_bench99.py)，本轮格式故障恢复使用[resume_organization_bench99.py](resume_organization_bench99.py)（prepare/verify/run/score/confirm-detached）；恢复回执绑定原始证据，仅将已核验完整但格式不符的输出保留为失败，不修补、不重抽。提示和隔离实现为[organization_bench99.py](../rule_framework/organization_bench99.py)。纯120B、原始经验RAG、平铺过程skills和规则树各99题，共396项。沿用120B medium、公共查询和连续全文检查，不独立拆checker；RAG检索原题/30B回答/既有120B具体核查说明，不检索规则叶。skills只含独立自然语言检查方法的标题/正文，不含目录或规则字段。
 
 先从已完成的50题批次复用原始案例，再统一排除已知或疑似同源材料，准备完整99题。保守过滤保留1,621份来源、1,935条规则叶；它不证明全语义题族独立。skills另行提炼，旧批不覆盖。所有组共享每题最多3条查询；材料上限6条完整条目/8,192 token，超限整条跳过。RAG/skills平铺BM25，树由程序分层路由。每题预算和计分与旧批相同，完整条件见[项目进展](../docs/项目进展.md)。
 
