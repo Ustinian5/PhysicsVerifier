@@ -2,29 +2,38 @@
 
 所有 Python 入口通过 conda `physicsverifier` 执行。完整参数以各脚本 `--help` 为准；方法和指标见 [效果测评](../docs/效果测评.md)。
 
-## 当前主线：99题经验组织对照（396项已完成）
+## 当前主线：限量skills的99题四组对照＋案例重复（准备完成，未运行）
 
-本批已完成，以下命令保留用于理解原执行过程，不要对已完成目录重新启动。入口为[run_organization_bench99.py](run_organization_bench99.py)，本轮格式故障恢复使用[resume_organization_bench99.py](resume_organization_bench99.py)（prepare/verify/run/score/confirm-detached）；恢复回执绑定原始证据，仅将已核验完整但格式不符的输出保留为失败，不修补、不重抽。提示和隔离实现为[organization_bench99.py](../rule_framework/organization_bench99.py)。纯120B、原始经验RAG、平铺过程skills和规则树各99题，共396项。沿用120B medium、公共查询和连续全文检查，不独立拆checker；RAG检索原题/30B回答/既有120B具体核查说明，不检索规则叶。skills只含独立自然语言检查方法的标题/正文，不含目录或规则字段。
+入口：[run_organization_followup.py](run_organization_followup.py)；完整提示及目标复核标准：[organization_followup.py](../rule_framework/organization_followup.py)。两项独立，不改已完成的99题协议或默认verifier：
 
-先从已完成的50题批次复用原始案例，再统一排除已知或疑似同源材料，准备完整99题。保守过滤保留1,621份来源、1,935条规则叶；它不证明全语义题族独立。skills另行提炼，旧批不覆盖。所有组共享每题最多3条查询；材料上限6条完整条目/8,192 token，超限整条跳过。RAG/skills平铺BM25，树由程序分层路由。每题预算和计分与旧批相同，完整条件见[项目进展](../docs/项目进展.md)。
+| task | 新工作 | 复用材料 | 正式检查量 |
+|---|---|---|---:|
+| bounded99 | 同1,621来源提炼平铺skills，默认1条、最多2条完整方法；四组重新检查 | 原案例、1,935规则叶、已发布99题和104条原查询（含控制） | 99×4，另20工程控制 |
+| case-repeat | 原光纤alpha数值错误定向重复，按固定公式复核 | 四组原查询、实际材料包及首个CHECK请求，使用原skills | 1题×4组×5次 |
 
-以下变量由操作者明确指定：`PV_PY`为个人conda内Python绝对路径；`PV_ORGANIZATION_RUN`为新的个人持久化目录；`PV_PRIOR_COMPARISON`为已完成的organization_comparison_20261030；`PV_NEW_TREE`为已冻结tree_v2。在服务器原仓库设置所需运行库环境，检查进程、锁和资源后：
+共同保持120B medium、连续上下文、原提示及每题预算（最多12响应、累计16,384输出token、6完整材料/8,192参考token）；旧查询用量仍计入各条件预算，实际新请求不重复计费记账。RAG仍检索完整原始错题经验，树仍由程序分层BM25路由；skills无目录、无触发器模板，不能称只消融树结构。只限制方法粒度与条数，不按bench分数抽删旧skills。构建时超过两条保留为失败，不截取前两条；最终不足1,000条停在正式检查前，不填充。相近条数不等于相同信息量。
+
+服务器个人conda内执行，先核实进程/锁和GPU/磁盘。PV_PARENT是已完成的organization_comparison_99_20261102；PV_RUN是新的个人持久化结果目录；PV_PY为个人conda的Python绝对路径。两任务共用服务锁，优先小规模重复，串行启动。
 
 ```bash
-"$PV_PY" -m scripts.run_organization_bench99 prepare --output "$PV_ORGANIZATION_RUN" --parent-comparison "$PV_PRIOR_COMPARISON" --rule-tree "$PV_NEW_TREE"
-"$PV_PY" -m scripts.run_organization_bench99 verify --output "$PV_ORGANIZATION_RUN"
-nohup "$PV_PY" -u -m scripts.run_organization_bench99 run --output "$PV_ORGANIZATION_RUN" >> "$PV_ORGANIZATION_RUN/runner.log" 2>&1 < /dev/null &
-# 退出启动SSH；新SSH中核对PID存活、状态waiting_disconnect_acceptance后：
-"$PV_PY" -m scripts.run_organization_bench99 confirm-detached --output "$PV_ORGANIZATION_RUN"
+"$PV_PY" -m scripts.run_organization_followup prepare --task case-repeat --parent-comparison "$PV_PARENT" --output "$PV_RUN"
+"$PV_PY" -m scripts.run_organization_followup verify --output "$PV_RUN" --full
+nohup "$PV_PY" -u -m scripts.run_organization_followup run --output "$PV_RUN" >> "$PV_RUN/runner.log" 2>&1 < /dev/null &
+# 退出SSH后重新连接，核对PID存活与waiting_disconnect_acceptance状态：
+"$PV_PY" -m scripts.run_organization_followup confirm-detached --output "$PV_RUN"
 ```
 
-首次run提炼固定12来源后停止为awaiting_skill_pilot_review。执行助手审读原经验和skills，检查是否提供具体的检查操作、是否只是孤立物理判据改写；只看构建材料，不看bench分数。审读文件skills/pilot_review.json需含configuration_sha256、actor（Codex assistant或human）、human_gold=false、decision=continue及samples。每份sample写id、outcome_sha256、notes和method_distinction：非空有效方法为acceptable，空输出valid_empty，内容失败unassessable_output_failure。全部固定来源均须审读且至少有一份可评方法；明显不合格时停止回主线，不改提示补抽。格式校验本身不等于语义验收，详见执行器check_pilot。
+A更换新PV_RUN并使用`--task bounded99`准备，其余命令相同。首次提炼固定12来源后正常停止；执行助手读取实际原经验及生成方法，填写skills/pilot_review.json，不看bench分数。字段包含configuration_sha256、actor=Codex assistant、human_gold=false、decision=continue、samples；每样本需id、outcome_sha256、method_distinction、notes。非空方法还需substeps_bundled=true；两条时需second_method_independent=true。空/失败分别记valid_empty/unassessable_output_failure；明显不合格回主线，不改提示补抽。全部审读、至少一份可评后同入口断点继续，并重新断连验收。
 
-通过后用同一run入口及新的断连验收续跑，不重做成功/空/失败项。补齐skills后按题轮换四组，20项集外工程控制单列，完成时自动计分并选双向案例。prepare/verify/score不调用模型；未满99题的组不填分数。原始请求、响应、进度、退出状态、已知输出失败均保留；传输/身份/未知协议故障停止，不改变判定标准。verify使用证据缓存，首次和显式--full才完整核验依赖，不反复解析全部旧日志。
+`score`为离线模式。A未满99题的组不出主分数；保留完整P/R/F1、失败、全部诊断分母敏感性及配对区间。完成后用`python -m scripts.analyze_organization_comparison RESULT_DIRECTORY`（同conda）核验材料作用和所有原始证据；该审计支持绑定的历史查询前缀，不重复复制旧响应。
 
-已核验396项原始输出并复现全表。`python -m scripts.analyze_organization_comparison RESULT_DIRECTORY`支持已冻结50/99题，核验实际请求、材料送达、已记录的引用违规及评分依赖，保存`material_usage_audit.json`；不调用模型、不改原分数，案例复核在原`case_review.json`维护。
+B全部20项保存后才生成target_review.json（去组名、打乱、隐藏reference_ids）及operator_map.json。盲审只读取前者，Codex assistant对每份健康输出填写status=completed、target_verdict、diagnostic_indices和具体notes，human_gold=false。判断正确检出、漏检、涉及目标但纠正错误或无法判定；错误诊断不能因位置命中计为正确。重新score仅在复核齐全后报告各组正确检出/5，技术失败始终留在分母。单题经历史正向筛选，只报告重复性，不报告整体P/R/F1或规则因果增益；不更换新skills混入重复。
 
-99题参考含402确认错误（397可定位）和7未决，仍是机器与助手修订的位置代理。指标同时报告全部发布分母敏感性、失败、参考实际供给量、配对区间和固定双向案例。旧50题批次保持冻结，扩样本、改skills和隔离后不能直接把跨批分差归因于一个改动。
+原查询、材料、源码和输入通过哈希冻结；重复任务运行库须与父批runtime.json一致，首个CHECK完整请求在发送前逐项核对。成功、真实空项和已核验格式失败不补抽；身份/传输/未知协议问题停止。prepare/verify/score不推理；所有正式客户端在服务器后台直连回环服务，不能用本机SSH隧道替代。完成与语义复核状态分开，执行分支不自行更改核心协议。
+
+## 已完成99题批次（只读追溯）
+
+原入口[run_organization_bench99.py](run_organization_bench99.py)、[提示与隔离](../rule_framework/organization_bench99.py)，原格式恢复[resume_organization_bench99.py](resume_organization_bench99.py)。396项已完成；1,621份案例、14,329 skills、1,935规则叶。完整指标、适用范围与证据见[项目进展](../docs/项目进展.md)，不再重新启动或覆盖失败/空结果。原始prepare/verify/run/score接口保留用于复现，旧配置以各结果目录plan为准。
 
 ## 历史入口导航
 

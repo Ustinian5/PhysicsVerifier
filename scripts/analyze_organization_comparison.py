@@ -28,6 +28,25 @@ def require(condition, message):
 def evidence_path(root, recorded):
     """Map a receipt from the original server into this exact downloaded run."""
     parts = Path(recorded).parts
+    if root.name not in parts and (root/'plan.json').exists():
+        # New follow-ups may reuse a bound old PREPARE, never arbitrary external files.
+        plan = read(root/'plan.json'); c = plan['configuration']
+        require(digest(c) == plan['configuration_sha256'] and c.get('reused_queries') is True,
+                'Unbound external evidence')
+        prefix_path = root/'frozen_prefixes.json'
+        expected = [h for name, h in c['files'].items() if name.endswith('/'+root.name+'/frozen_prefixes.json')]
+        require(expected == [sha(prefix_path)], 'Frozen prefix manifest changed')
+        allowed = {name: h for prefix in read(prefix_path).values() for name, h in prefix['files'].items()}
+        require(recorded in allowed and c['files'].get(recorded) == allowed[recorded], 'Unbound external query')
+        parent = Path(c['parent'])
+        if not parent.exists(): parent = root.parent/parent.name
+        require(parts.count(parent.name) == 1, 'Ambiguous external query path')
+        suffix = parts[parts.index(parent.name)+1:]
+        path = parent.joinpath(*suffix).resolve()
+        require(suffix and suffix[0] == 'queries' and path.is_relative_to(parent.resolve()),
+                'External evidence escapes frozen query directory')
+        require(sha(path) == allowed[recorded], 'External query evidence changed')
+        return path
     require(parts.count(root.name) == 1, 'Ambiguous/out-of-run evidence path')
     path = root.joinpath(*parts[parts.index(root.name) + 1:]).resolve()
     require(path.is_relative_to(root.resolve()), 'Evidence escapes run directory')
@@ -48,7 +67,8 @@ def sample_record(path, root, binding, model, evidence):
         require(item['model_ids'] == [model], 'Recorded response identity changed')
         for key in ('request', 'response', 'raw_sse'):
             f = evidence_path(root, item[key + '_path'])
-            actual = evidence.setdefault(str(f.relative_to(root)), sha(f))
+            name = str(f.relative_to(root)) if f.is_relative_to(root) else str(f)
+            actual = evidence.setdefault(name, sha(f))
             require(actual == item[key + '_sha256'], 'Broken evidence hash: ' + str(f))
     # Some terminal native-format failures have supplemental usage receipts;
     # inspect actual turn files even if they were not appended to result.trace.
@@ -111,7 +131,8 @@ def sample_record(path, root, binding, model, evidence):
 def audit_inputs(root, config):
     """Resolve the exact released cohort, never silently use legacy 50 for 99."""
     from rule_framework import organization_bench99 as bench99
-    if config.get('protocol') == bench99.VERSION:
+    from rule_framework import organization_followup as followup
+    if config.get('protocol') in {bench99.VERSION, followup.VERSION}:
         for name in (bench99.INPUT, scoring.RELEASE, scoring.REFERENCE):
             hashes = [value for path, value in config['files'].items() if path.endswith('/'+name)]
             require(hashes == [sha(ROOT/name)], 'Frozen 99 reference/input dependency drift')

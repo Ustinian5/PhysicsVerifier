@@ -96,3 +96,19 @@ def test_corrupted_raw_response_is_rejected(tmp_path):
 def test_evidence_path_cannot_escape_run(tmp_path):
     with pytest.raises(ValueError, match='escapes run'):
         evidence_path(tmp_path / 'run', '/server/run/../other/response.json')
+
+
+def test_external_prefix_requires_both_manifest_and_exact_file_hash(tmp_path):
+    root, parent = tmp_path/'new', tmp_path/'old'
+    actual = parent/'queries/q/request.json'; atomic(actual, {'request': 'old prefix'})
+    recorded = '/server/old/queries/q/request.json'
+    prefixes = {'row': {'files': {recorded: sha(actual)}}}
+    atomic(root/'frozen_prefixes.json', prefixes)
+    c = dict(reused_queries=True, parent='/server/old', files={recorded: sha(actual),
+        '/server/new/frozen_prefixes.json': sha(root/'frozen_prefixes.json')})
+    atomic(root/'plan.json', dict(configuration=c, configuration_sha256=digest(c)))
+    assert evidence_path(root, recorded) == actual.resolve()
+    with pytest.raises(ValueError, match='Unbound external query'):
+        evidence_path(root, '/server/old/unregistered.json')
+    actual.write_text('changed')
+    with pytest.raises(ValueError, match='evidence changed'): evidence_path(root, recorded)
