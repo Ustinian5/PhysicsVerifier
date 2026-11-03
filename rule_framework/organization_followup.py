@@ -51,7 +51,7 @@ class FamilyScreen(previous.FamilyScreen):
                                               field=field, normalized_shared_span=span))
         return [found[sid] for sid in sorted(found)]
 
-INPUT_POLICY = 'original question/context/30B answer only; independent 120B review and extraction in one response; no historical reviewer notes'
+INPUT_POLICY = 'original question/context/30B answer only; independent 120B draft and fixed audit in continuous context; no historical reviewer notes'
 
 SKILL_PROMPT = '''任务：从一份历史题目和30B回答中，学到最多两条可迁移的解答检查方法。没有标准答案或可信旧判词。
 先独立判断一个证据明确的问题，不默认回答必错。返回简短source_review，使用原文片段编号定位，不抄长公式，不输出长篇思考过程。
