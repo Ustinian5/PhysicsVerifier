@@ -2,7 +2,7 @@
 
 所有 Python 入口通过 conda `physicsverifier` 执行。完整参数以各脚本 `--help` 为准；方法和指标见 [效果测评](../docs/效果测评.md)。
 
-## 当前主线：限量skills的99题四组对照（提炼方式试跑中）
+## 当前主线：限量skills的99题四组对照（提炼试跑未通过，暂未放量）
 
 入口：[run_organization_followup.py](run_organization_followup.py)；完整提示及目标复核标准：[organization_followup.py](../rule_framework/organization_followup.py)。两项独立，不改已完成的99题协议或默认verifier：
 
