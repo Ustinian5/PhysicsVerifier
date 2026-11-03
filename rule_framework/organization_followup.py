@@ -10,7 +10,7 @@ from collections import defaultdict
 
 from rule_framework import organization_bench99 as previous
 
-VERSION = 'experience_organization_99_bounded_skills_v10'
+VERSION = 'experience_organization_99_bounded_skills_v11'
 REPEAT_VERSION = 'organization_positive_case_repeat_v1'
 MAX_SKILLS = 2
 PILOT_SIZE = 24  # fixed 12 development sources + next 12 untouched construction sources
@@ -63,12 +63,13 @@ status取supported_method（已找到有价值的核验目标）、uncertain（�
 只输出JSON：{"source_review":{"status":"supported_method","evidence_ids":["prediction:0"],"finding":"具体核验目标及选材依据"},"skills":[]}。无目标则用uncertain/no_method和空编号。'''
 
 
-AUDIT_PROMPT = '''根据下面原题和选出的历史解答片段，写一条可迁移的检查技能。选材备注只是建议目标，历史解答不是标准答案。不要继续原回答的试算，不重新解整道题。
-技能是给未来检查者执行的操作，不是检查者要求原作者展示的解题模板：具体说明在什么情形下，提取/推导什么量，怎样独立核验，以及如何根据矛盾或信息缺口作判断。对象、定义、参考点和条件要明确。保持具体，不能只写“核对公式/单位”。
-默认一条紧凑完整方法，中文约150至300字或英文约100至180词。多个子步骤合成一条，不写长篇推导、例题或最终答案；只有确实不同目标才可两条，不跨条引用。必要的通用数学关系可以保留，但不得抄写原题特有数值/答案或把特殊条件写成通用定律。
-输出前检验：这条方法是否会误报一个正确但简洁、用另一种方法、从已知量推算新量或正常读图的答案？如果会，改成检查者自己去核验，而不是要求原答案展示特定步骤。不能以偏离常见数量级、缺少某一步展示或与旧题形式不同直接判错。
-不确定的公式不要作真理引用，改写为明确的独立建立和比较操作。若题设或图表信息不足，指出无法核验的部分，不补数字、几何或假设。若无法保留具体可靠的方法，空选。
-只输出JSON：顶层source_review、skills；source_review仅status、evidence_ids、finding；status取supported_method、uncertain、no_method，后两者skills=[]。非空技能须引用至少一个本次实际提供的片段编号（完整字符串），最多3个。finding简短记方法依据，不声称原回答必错。每条skills仅title、text。选材没有有效依据时空选。'''
+AUDIT_PROMPT = '''Extract a reusable VERIFICATION PROCEDURE from this historical problem and the selected answer excerpts. The answer and selection note are untrusted observations, not a correct solution.
+The deliverable is an action recipe for a future checker. It must explain which information to inspect, which independent comparison to perform, and what evidence would support or fail to support an error. Do not solve this problem and do not store its proposed solution as a skill.
+Write normally one skill, at most two only for independent checks. Merge preparation, calculation, comparison and qualification for one target into one self-contained procedure. Keep each about 100-160 words. Use plain natural language. No equations, symbolic derivations, worked examples, numerical answers, original variable names or quoted source-span identifiers in the skill text. The future checker must establish the applicable relations from its NEW problem, not copy a relation learned from this answer. Name the relevant physical or reasoning objects precisely enough to make the operations actionable. Do not reduce the method to 'check the formula/units/logic'.
+A procedure must remain useful when the original problem's numbers, geometry or answer change. Distinguish quantities and their definitions. Trace an assumption to supplied information or a legitimate derivation. Reconstruct missing intermediate work yourself: an answer need not show your preferred steps. A missing display, unusual magnitude or different solution path is not an error. Use a discrepancy only after matching assumptions, definitions and applicable approximations; if required data are unavailable, preserve uncertainty.
+Before returning, mentally apply the procedure to a correct concise answer: would it wrongly condemn the answer? Remove such criteria. If no specific defensible procedure remains, return an empty skills list.
+Return only JSON with keys source_review and skills. source_review has exactly status, evidence_ids, finding. status is supported_method, uncertain, or no_method; the latter two require skills=[]. A nonempty skills list requires 1-3 exact evidence IDs actually present in the input. finding briefly identifies the source of the method without asserting the old answer is wrong. Each skill has exactly title and text. Evidence IDs belong only in source_review, never in the reusable text.'''
+
 
 
 def source_spans(source):
