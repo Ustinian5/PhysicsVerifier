@@ -106,16 +106,39 @@ def prepare(output, parent, task):
         if task == 'bounded99':
             # One preparation-time screen, never repeated on every checkpoint.
             screen = protocol.FamilyScreen(heldout); byid = {x['source_ids'][0]: x for x in cases}
+            excluded = []
             for row in sources:
-                require(not screen.matches(row) and not screen.matches(dict(row, prediction=byid[row['id']]['text'])),
-                        'Source isolation changed; do not silently filter another cohort')
-            for name in MATERIALS:
+                matches = screen.matches(dict(row, prediction=byid[row['id']]['text']))
+                if matches: excluded.append(dict(source_id=row['id'], matches=matches))
+            excluded_ids = {x['source_id'] for x in excluded}
+            sources = [x for x in sources if x['id'] not in excluded_ids]
+            cases = [x for x in cases if x['source_ids'][0] not in excluded_ids]
+            require(sources and len(sources) == len(cases), 'No isolated build sources')
+            provenance_paths = [p for p in pc['files'] if p.endswith('/tree_v2/materials.json')]
+            require(len(provenance_paths) == 1, 'Need unique bound original tree provenance')
+            provenance_path = Path(provenance_paths[0])
+            if not provenance_path.exists():
+                provenance_path = ROOT/'results/qwen30b_expansion_5000/tree_v2/materials.json'
+            require(vr.sha(provenance_path) == pc['files'][provenance_paths[0]], 'Tree provenance drift')
+            files[str(provenance_path)] = vr.sha(provenance_path)
+            catalog, tree_changes = protocol.previous.prune_catalog(vr.read(parent/'catalog.json'),
+                vr.read(provenance_path)['provenance'], excluded_ids)
+            base.p.TreeMemory(catalog)
+            for name in ('inputs', 'bench_questions'):
                 (output/(name+'.json')).write_bytes((parent/(name+'.json')).read_bytes())
+            for name, value in [('sources', sources), ('cases', cases), ('catalog', catalog),
+                    ('isolation', dict(parent_isolation_sha256=vr.sha(parent/'isolation.json'),
+                        policy=protocol.ISOLATION_POLICY, original_sources=1621, kept_sources=len(sources),
+                        excluded=excluded, tree_changes=tree_changes, human_gold=False,
+                        semantic_family_independence_proven=False))]:
+                vr.atomic(output/(name+'.json'), value)
             c.update(skill_prompt=protocol.SKILL_PROMPT, skills='one complete procedure by default; at most two per source',
                      max_skills_per_source=2, target_skill_count_is_not_a_quota=True,
                      minimum_skill_count_before_comparison=1000,
+                     source_count=len(sources), isolation_policy=protocol.ISOLATION_POLICY,
+                     source_exclusions_from_parent=sorted(excluded_ids),
                      order='build bounded skills, then fresh 99x4 checks with original shared queries',
-                     planned_checks=396, planned_skill_sources=1621)
+                     planned_checks=396, planned_skill_sources=len(sources))
             query_rows = rows + base.runtime.CONTROLS
         else:
             rows = [x for x in rows if x['id'] == protocol.TARGET_ID]
@@ -170,7 +193,7 @@ def verify(output, full=False):
     require([r['id'] for r in rows] == c['sample_ids'] and len(rows) == c['sample_count'], 'Wrong cohort')
     if c['task'] == 'bounded99':
         require(len(rows) == 99 and c['skill_prompt'] == protocol.SKILL_PROMPT and c['max_skills_per_source'] == 2 and
-                c['minimum_skill_count_before_comparison'] == 1000,
+                c['minimum_skill_count_before_comparison'] == 1000 and c['isolation_policy'] == protocol.ISOLATION_POLICY,
                 'Bounded skill protocol changed')
     else:
         require(c['repeats'] == 5 and c['sample_ids'] == [protocol.TARGET_ID] and

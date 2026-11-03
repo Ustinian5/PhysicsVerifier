@@ -10,6 +10,31 @@ from scripts import run_organization_followup as run
 from tests.test_organization_comparison import ROW, QUERIES, Tokenizer
 
 
+def test_partial_shared_stem_excluded_despite_different_subquestions():
+    stem = ('An extremely thin current carrying solenoid extends from the origin along the negative axis '
+            'and carries a low frequency alternating current with known cross sectional area and turns per length. '
+            'Consider the solid angle enclosed by a triangular conductor surrounding the axis at a prescribed distance. ')
+    heldout = [dict(id='test', question='Unrelated introductory material. '*80+stem+' Derive the potential.')]
+    screen = p.FamilyScreen(heldout)
+    row = dict(id='build', question=stem+' Compute triangular loop thermal power. '+'Different detail. '*150)
+    found = screen.matches(row)
+    assert any(x['heldout_id'] == 'test' for x in found)
+    assert not screen.matches(dict(id='clean', question='A uniform rod leans against a smooth vertical wall.'))
+    # A shared stem hidden in the case memory must also be excluded.
+    found = screen.matches(dict(id='notes', question='A different question.', prediction=row['question']))
+    assert any(x['heldout_id'] == 'test' for x in found)
+
+
+@pytest.mark.skipif(not (run.ROOT/'results/organization_comparison_99_20261102/sources.json').exists(),
+                    reason='Private frozen experiment unavailable')
+def test_actual_dirac_subproblem_is_rejected_without_using_bench_labels():
+    root = run.ROOT/'results/organization_comparison_99_20261102'
+    screen = p.FamilyScreen(run.vr.read(root/'bench_questions.json'))
+    row = next(x for x in run.vr.read(root/'sources.json') if x['id'] == 'trainphysics_6997')
+    assert any(x['reason'] == 'shared_subproblem_prose' and 'diracstring' in x['normalized_shared_span']
+               for x in screen.matches(row))
+
+
 def test_skills_are_complete_methods_with_a_hard_cap_not_posthoc_truncation():
     skill = dict(title='核验代入', text='从题目独立换算单位再代入；将所得数量级与原回答比较。')
     values = [{'skills': []}, {'skills': [skill]}, {'skills': [skill, dict(skill, title='另一方法')]}]

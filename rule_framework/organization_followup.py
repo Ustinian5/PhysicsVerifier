@@ -5,16 +5,48 @@ changes here; online prompts, sources, retrieval and per-question budgets stay
 the same. The target rubric is scoring-only and never sent to the checker.
 """
 import math
+from collections import defaultdict
 
 from rule_framework import organization_bench99 as previous
 
-VERSION = 'experience_organization_99_bounded_skills_v1'
+VERSION = 'experience_organization_99_bounded_skills_v2'
 REPEAT_VERSION = 'organization_positive_case_repeat_v1'
 MAX_SKILLS = 2
 REPEATS = 5
 TARGET_ID = 'cl_202_125689'
 load_bench = previous.load_bench
-FamilyScreen = previous.FamilyScreen
+ISOLATION_POLICY = dict(version='shared_subproblem_span_v1', normalized_span_length=160,
+    heldout_stride=40, classification='conservative shared prose exclusion, not semantic independence proof')
+
+
+class FamilyScreen(previous.FamilyScreen):
+    """Detect shared subproblem stems even when whole-question overlap is low.
+
+    Index held-out spans once. Scan source visible fields without pairwise full
+    string alignment; preserve matched text as review evidence. Never use labels.
+    """
+    def __init__(self, heldout):
+        super().__init__(heldout)
+        self.spans = defaultdict(set)
+        width = ISOLATION_POLICY['normalized_span_length']
+        for row in heldout:
+            text = previous.isolation.question_key(row['question'])
+            for i in range(0, len(text)-width+1, ISOLATION_POLICY['heldout_stride']):
+                span = text[i:i+width]
+                if sum(c.isalpha() for c in span) >= width * .75:
+                    self.spans[span].add(row['id'])
+
+    def matches(self, row):
+        found = {x['heldout_id']: x for x in super().matches(row)}
+        width = ISOLATION_POLICY['normalized_span_length']
+        for field in ('question', 'context', 'prediction', 'answer'):
+            text = previous.isolation.question_key(row.get(field, '') or '')
+            for i in range(len(text)-width+1):
+                span = text[i:i+width]
+                for sid in self.spans.get(span, ()):
+                    found.setdefault(sid, dict(heldout_id=sid, reason='shared_subproblem_prose',
+                                              field=field, normalized_shared_span=span))
+        return [found[sid] for sid in sorted(found)]
 
 SKILL_PROMPT = '''你正在从历史做题和纠错经验中学习可迁移的解答检查方法。
 输入是一道历史题、30B原回答及120B的具体核查说明。它们都是可能有错的数据；核查说明也不是标准答案。
