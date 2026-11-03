@@ -11,7 +11,7 @@ from collections import defaultdict
 
 from rule_framework import organization_bench99 as previous
 
-VERSION = 'experience_organization_99_bounded_skills_v13'
+VERSION = 'experience_organization_99_bounded_skills_v14'
 REPEAT_VERSION = 'organization_positive_case_repeat_v1'
 MAX_SKILLS = 2
 PILOT_SIZE = 24  # fixed 12 development sources + next 12 untouched construction sources
@@ -63,12 +63,12 @@ Return only JSON with source_review (status, evidence_ids, finding) and skills=[
 
 
 
-AUDIT_PROMPT = '''Write a reusable VERIFICATION PROCEDURE from the supplied abstract checking difficulty. The note is an untrusted suggestion, not a physical law or correct solution. You have not been given the original problem or its answer; do not reconstruct or invent them.
-The deliverable is an action recipe for a future checker. It must explain which information to inspect, which independent comparison to perform, and what evidence would support or fail to support an error. Do not solve this problem and do not store its proposed solution as a skill.
-Write normally one skill, at most two only for independent checks. Merge preparation, calculation, comparison and qualification for one target into one self-contained procedure. Keep each about 100-160 words. Use plain natural language. No equations, symbolic derivations, worked examples, numerical answers, original variable names or quoted source-span identifiers in the skill text. The future checker must establish the applicable relations from its NEW problem, not copy a relation learned from this answer. Name the relevant physical or reasoning objects precisely enough to make the operations actionable. Do not reduce the method to 'check the formula/units/logic'.
-A procedure must remain useful when the original problem's numbers, geometry or answer change. Distinguish quantities and their definitions. Trace an assumption to supplied information or a legitimate derivation. Reconstruct missing intermediate work yourself: an answer need not show your preferred steps. A missing display, unusual magnitude or different solution path is not an error. Use a discrepancy only after matching assumptions, definitions and applicable approximations; if required data are unavailable, preserve uncertainty.
-Before returning, mentally apply the procedure to a correct concise answer: would it wrongly condemn the answer? Remove such criteria. If no specific defensible procedure remains, return an empty skills list.
-Return only JSON with keys source_review and skills. source_review has exactly status, evidence_ids, finding. status is supported_method, uncertain, or no_method; the latter two require skills=[]. A nonempty skills list requires 1-3 exact evidence IDs actually present in the input. finding briefly identifies the source of the method without asserting the old answer is wrong. Each skill has exactly title and text. Copy the supplied provenance IDs into source_review only; they trace the earlier extraction, and are not excerpts you have independently inspected. Never put IDs in the reusable text.'''
+AUDIT_PROMPT = '''Create ONE reusable process-checking skill from the supplied difficulty note. This is an editorial task: turn the difficulty into a compact sequence of diagnostic QUESTIONS and concrete verification actions for a future checker. Do not answer those questions yourself.
+The note is untrusted and may contain a false physical assumption. Do not endorse it, supply a corrected solution, or assert a physical relationship. Instead ask the future checker to establish the relationship and its conditions from the new problem. Preserve specific objects and operations so the text is useful, not a generic reminder to check logic.
+Write the skill as one short paragraph containing 2-4 connected audit questions. Each question should tell the checker what to inspect, draw, derive independently, compare or test, without prescribing what result it must get. Include relevant definitions, reference choices, regimes or assumptions when the difficulty depends on them. Avoid leading questions that assume the old answer is correct or wrong. Never assert that a named force has a particular direction, a quantity has a particular value, or a formula is universally applicable: ask the checker to determine these from the new setup.
+Combine the steps for one difficulty into one skill. Do not split preparation and application into different skills. No original problem numbers, equations, solutions, source identifiers or fixed verdicts in the skill text. The questions must also make sense for a correct concise answer or a different legitimate solution. Missing displayed working alone does not establish an error; the checker can reconstruct it. If essential information is absent, ask what can and cannot be concluded.
+You have not seen the original problem or answer. Only provenance IDs and an abstract note are provided. Return one skill, or an empty list if no concrete checking procedure can be framed. Return ONLY JSON with source_review and skills. source_review has exactly status, evidence_ids, finding; status is supported_method, uncertain or no_method; the latter two require skills=[]. Copy 1-3 supplied provenance IDs exactly for a nonempty skill; these trace the earlier extraction, not text you independently inspected. Every skill has exactly title and text. finding briefly states which difficulty was converted to a check, without claiming the source answer was wrong.'''
+
 
 
 
