@@ -72,9 +72,10 @@ def test_independent_journal_uses_bound_original_fields_not_case_notes(monkeypat
     assert calls[1][3]['draft'] == extracted([])
     audit = journal.messages('extract_skill', calls[1][3])
     assert len(audit) == 2 and audit[0] == {'role':'developer', 'content':p.AUDIT_PROMPT}
-    assert ROW['prediction'] in audit[1]['content']
+    assert ROW['prediction'] not in audit[1]['content']
+    assert ROW['question'] not in audit[1]['content']
     good['source_review']['evidence_ids'] = ['prediction:999999']
-    with pytest.raises(run.base.old.tree.ContentFailure, match='not visible'):
+    with pytest.raises(run.base.old.tree.ContentFailure, match='not supplied'):
         journal('extract_skill', ROW['id'], payload)
     with pytest.raises(ValueError, match='Unknown skill source'):
         journal.messages('extract_skill', {'case': {'source_ids': ['unknown']}})
@@ -282,11 +283,13 @@ def test_two_pass_initialization_preserves_binding_and_total_output_cap(tmp_path
     assert config['model']['max_tokens'] == 16384
 
 
-def test_distillation_receives_only_selected_verbatim_answer_spans():
+def test_distillation_receives_abstract_note_and_provenance_without_source_answer():
     source = dict(ROW, prediction='a'*800+'HIDDEN_UNSELECTED_ANSWER')
-    messages, visible = p.selected_evidence_messages(source, extracted([]))
+    messages, visible = p.abstraction_messages(source, extracted([]))
     assert 'prediction:0' in visible and 'prediction:1' not in visible
     assert 'HIDDEN_UNSELECTED_ANSWER' not in json.dumps(messages)
-    assert source['question'] in messages[1]['content']
+    assert source['question'] not in messages[1]['content']
+    assert 'a'*100 not in messages[1]['content']
+    assert 'checking_difficulty' in messages[1]['content']
     wrong = extracted([{'title':'x','text':'unaudited method'}])
-    with pytest.raises(ValueError, match='Selection must not'): p.selected_evidence_messages(source, wrong)
+    with pytest.raises(ValueError, match='Selection must not'): p.abstraction_messages(source, wrong)

@@ -252,19 +252,19 @@ class IndependentSkillJournal(bench.ProcedureJournal):
     def messages(self, stage, payload):
         require(stage == 'extract_skill', 'Independent extraction only')
         if 'draft' in payload:
-            return protocol.selected_evidence_messages(self.source(payload), payload['draft'])[0]
+            return protocol.abstraction_messages(self.source(payload), payload['draft'])[0]
         return protocol.skill_messages(self.source(payload))
 
     def __call__(self, stage, key, payload):
         require(key == self.source(payload)['id'], 'Skill source/key mismatch')
         draft = super().__call__(stage, key + ':select', payload)
         try:
-            _, visible = protocol.selected_evidence_messages(self.source(payload), draft)
+            _, visible = protocol.abstraction_messages(self.source(payload), draft)
         except (ValueError, TypeError, KeyError) as exc:
             raise base.old.tree.ContentFailure(str(exc)) from exc
         value = super().__call__(stage, key, dict(payload, draft=draft))
         try:
-            require(set(value['source_review']['evidence_ids']) <= visible, 'Final evidence was not visible during distillation')
+            require(set(value['source_review']['evidence_ids']) <= visible, 'Final provenance was not supplied during distillation')
             return protocol.validate_source_evidence(value, self.source(payload))
         except (ValueError, TypeError, KeyError) as exc:
             raise base.old.tree.ContentFailure(str(exc)) from exc
