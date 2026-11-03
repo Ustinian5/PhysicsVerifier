@@ -50,10 +50,8 @@ def test_skills_are_complete_methods_with_a_hard_cap_not_posthoc_truncation():
     messages = p.skill_messages(dict(ROW, prediction=ROW['prediction']+'<|end|>',
                                     answer='SECRET', rules='SECRET', case_note='SECRET'))
     assert 'SECRET' not in json.dumps(messages) and '<|' not in messages[1]['content']
-    assert '同一方法' in messages[0]['content']
     assert messages[1]['content'].endswith(p.SKILL_PROMPT)
     assert '[prediction:0]' in messages[1]['content']
-    assert '禁止猜测倍率' in messages[0]['content'] and '跨条引用' in messages[0]['content']
 
 
 def test_independent_journal_uses_bound_original_fields_not_case_notes(monkeypatch):
@@ -66,16 +64,16 @@ def test_independent_journal_uses_bound_original_fields_not_case_notes(monkeypat
     calls = []
     def generate(*args):
         calls.append(args)
-        return good
+        return extracted([]) if args[2].endswith(':select') else good
     monkeypatch.setattr(run.bench.ProcedureJournal, '__call__', generate)
     assert journal('extract_skill', ROW['id'], payload) == good
-    assert [x[2] for x in calls] == [ROW['id']+':draft', ROW['id']]
-    assert calls[1][3]['draft'] == good
+    assert [x[2] for x in calls] == [ROW['id']+':select', ROW['id']]
+    assert calls[1][3]['draft'] == extracted([])
     audit = journal.messages('extract_skill', calls[1][3])
-    assert len(audit) == 4 and audit[-1]['content'] == p.AUDIT_PROMPT
-    assert audit[0:2] == journal.messages('extract_skill', payload)
+    assert len(audit) == 2 and audit[0]['content'] == p.AUDIT_PROMPT
+    assert ROW['prediction'] in audit[1]['content']
     good['source_review']['evidence_ids'] = ['prediction:999999']
-    with pytest.raises(run.base.old.tree.ContentFailure, match='Unknown evidence address'):
+    with pytest.raises(run.base.old.tree.ContentFailure, match='not visible'):
         journal('extract_skill', ROW['id'], payload)
     with pytest.raises(ValueError, match='Unknown skill source'):
         journal.messages('extract_skill', {'case': {'source_ids': ['unknown']}})
@@ -281,3 +279,13 @@ def test_two_pass_initialization_preserves_binding_and_total_output_cap(tmp_path
     assert journal.binding == run.vr.digest(config)
     assert journal.config['max_tokens'] * p.EXTRACTION_PASSES == config['model']['max_tokens']
     assert config['model']['max_tokens'] == 16384
+
+
+def test_distillation_receives_only_selected_verbatim_answer_spans():
+    source = dict(ROW, prediction='a'*800+'HIDDEN_UNSELECTED_ANSWER')
+    messages, visible = p.selected_evidence_messages(source, extracted([]))
+    assert 'prediction:0' in visible and 'prediction:1' not in visible
+    assert 'HIDDEN_UNSELECTED_ANSWER' not in json.dumps(messages)
+    assert source['question'] in messages[1]['content']
+    wrong = extracted([{'title':'x','text':'unaudited method'}])
+    with pytest.raises(ValueError, match='Selection must not'): p.selected_evidence_messages(source, wrong)

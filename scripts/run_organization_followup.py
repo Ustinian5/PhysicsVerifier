@@ -251,17 +251,20 @@ class IndependentSkillJournal(bench.ProcedureJournal):
 
     def messages(self, stage, payload):
         require(stage == 'extract_skill', 'Independent extraction only')
-        messages = protocol.skill_messages(self.source(payload))
         if 'draft' in payload:
-            messages += [{'role': 'assistant', 'content': json.dumps(payload['draft'], ensure_ascii=False).replace('<|', '\\u003c|')},
-                         {'role': 'user', 'content': protocol.AUDIT_PROMPT}]
-        return messages
+            return protocol.selected_evidence_messages(self.source(payload), payload['draft'])[0]
+        return protocol.skill_messages(self.source(payload))
 
     def __call__(self, stage, key, payload):
         require(key == self.source(payload)['id'], 'Skill source/key mismatch')
-        draft = super().__call__(stage, key + ':draft', payload)
+        draft = super().__call__(stage, key + ':select', payload)
+        try:
+            _, visible = protocol.selected_evidence_messages(self.source(payload), draft)
+        except (ValueError, TypeError, KeyError) as exc:
+            raise base.old.tree.ContentFailure(str(exc)) from exc
         value = super().__call__(stage, key, dict(payload, draft=draft))
         try:
+            require(set(value['source_review']['evidence_ids']) <= visible, 'Final evidence was not visible during distillation')
             return protocol.validate_source_evidence(value, self.source(payload))
         except (ValueError, TypeError, KeyError) as exc:
             raise base.old.tree.ContentFailure(str(exc)) from exc
