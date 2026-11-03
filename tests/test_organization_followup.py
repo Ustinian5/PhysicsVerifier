@@ -11,7 +11,7 @@ from tests.test_organization_comparison import ROW, QUERIES, Tokenizer
 
 
 def extracted(skills, status='supported_issue'):
-    return dict(source_review=dict(status=status, field='prediction', quote=ROW['prediction'],
+    return dict(source_review=dict(status=status, evidence_ids=['prediction:0'],
                                   finding='Fixture only: independently reviewed source.'), skills=skills)
 
 
@@ -52,7 +52,7 @@ def test_skills_are_complete_methods_with_a_hard_cap_not_posthoc_truncation():
     assert 'SECRET' not in json.dumps(messages) and '<|' not in messages[1]['content']
     assert '同一方法' in messages[0]['content']
     assert messages[1]['content'].endswith(p.SKILL_PROMPT)
-    assert 'BEGIN_PREDICTION' in messages[1]['content']
+    assert '[prediction:0]' in messages[1]['content']
     assert '禁止猜测倍率' in messages[0]['content'] and '跨条引用' in messages[0]['content']
 
 
@@ -65,8 +65,8 @@ def test_independent_journal_uses_bound_original_fields_not_case_notes(monkeypat
     good = extracted([dict(title='check', text='Check forces and dimensions.')])
     monkeypatch.setattr(run.bench.ProcedureJournal, '__call__', lambda *args: good)
     assert journal('extract_skill', ROW['id'], payload) == good
-    good['source_review']['quote'] = 'invented evidence'
-    with pytest.raises(run.base.old.tree.ContentFailure, match='not verbatim'):
+    good['source_review']['evidence_ids'] = ['prediction:999999']
+    with pytest.raises(run.base.old.tree.ContentFailure, match='Unknown evidence address'):
         journal('extract_skill', ROW['id'], payload)
     with pytest.raises(ValueError, match='Unknown skill source'):
         journal.messages('extract_skill', {'case': {'source_ids': ['unknown']}})
@@ -253,3 +253,12 @@ def test_real_case_four_arm_requests_replay_exactly_without_live_model(tmp_path,
     assert len(posts) == 4 and posts == [expected[a] for a in run.base.p.ARMS]
     assert all('correct_value_per_m' not in json.dumps(body) for body in posts)
     assert not (tmp_path/'queries').exists()  # Old prefix referenced in place, never regenerated.
+
+
+def test_evidence_spans_preserve_all_source_text_without_json_reescaping():
+    source = dict(ROW, prediction='a'*799+'\\\\frac{a}{b}\\n'+'b'*900)
+    spans = p.source_spans(source)
+    assert ''.join(v for k, v in spans.items() if k.startswith('prediction:')) == source['prediction']
+    assert p.validate_source_evidence(extracted([]), source)
+    value = extracted([]); value['source_review']['evidence_ids'] = ['prediction:0']*2
+    with pytest.raises(ValueError, match='Invalid evidence addresses'): p.validate_skills(value)
