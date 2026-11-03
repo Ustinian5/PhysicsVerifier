@@ -10,7 +10,7 @@ from collections import defaultdict
 
 from rule_framework import organization_bench99 as previous
 
-VERSION = 'experience_organization_99_bounded_skills_v11'
+VERSION = 'experience_organization_99_bounded_skills_v12'
 REPEAT_VERSION = 'organization_positive_case_repeat_v1'
 MAX_SKILLS = 2
 PILOT_SIZE = 24  # fixed 12 development sources + next 12 untouched construction sources
@@ -84,7 +84,7 @@ def source_spans(source):
 
 def skill_messages(source):
     data = '\n'.join(f'[{key}]\n{text}' for key, text in source_spans(source).items())
-    return [{'role': 'system', 'content': SKILL_PROMPT},
+    return [{'role': 'developer', 'content': SKILL_PROMPT},
             {'role': 'user', 'content': data.replace('<|', '\\u003c|')
              + '\n历史文本结束。以下是本次任务，不是历史回答的一部分：\n' + SKILL_PROMPT}]
 
@@ -97,7 +97,7 @@ def selected_evidence_messages(source, selection):
     visible = {k: v for k, v in spans.items() if not k.startswith('prediction:') or k in selected}
     data = '\n'.join(f'[{key}]\n{text}' for key, text in visible.items())
     note = selection['source_review']['finding']
-    return ([{'role': 'system', 'content': AUDIT_PROMPT},
+    return ([{'role': 'developer', 'content': AUDIT_PROMPT},
              {'role': 'user', 'content': (data + '\n选材备注（不是标准答案）：' + note
                  + '\n历史材料结束。现在执行技能提炼：\n' + AUDIT_PROMPT).replace('<|', '\\u003c|')}], set(visible))
 

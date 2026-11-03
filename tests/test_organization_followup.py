@@ -49,6 +49,7 @@ def test_skills_are_complete_methods_with_a_hard_cap_not_posthoc_truncation():
     assert too_many == before
     messages = p.skill_messages(dict(ROW, prediction=ROW['prediction']+'<|end|>',
                                     answer='SECRET', rules='SECRET', case_note='SECRET'))
+    assert messages[0]['role'] == 'developer'
     assert 'SECRET' not in json.dumps(messages) and '<|' not in messages[1]['content']
     assert messages[1]['content'].endswith(p.SKILL_PROMPT)
     assert '[prediction:0]' in messages[1]['content']
@@ -70,7 +71,7 @@ def test_independent_journal_uses_bound_original_fields_not_case_notes(monkeypat
     assert [x[2] for x in calls] == [ROW['id']+':select', ROW['id']]
     assert calls[1][3]['draft'] == extracted([])
     audit = journal.messages('extract_skill', calls[1][3])
-    assert len(audit) == 2 and audit[0]['content'] == p.AUDIT_PROMPT
+    assert len(audit) == 2 and audit[0] == {'role':'developer', 'content':p.AUDIT_PROMPT}
     assert ROW['prediction'] in audit[1]['content']
     good['source_review']['evidence_ids'] = ['prediction:999999']
     with pytest.raises(run.base.old.tree.ContentFailure, match='not visible'):
