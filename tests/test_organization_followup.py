@@ -44,7 +44,8 @@ def test_skills_are_complete_methods_with_a_hard_cap_not_posthoc_truncation():
     assert too_many == before
     messages = p.skill_messages(dict(text='CASE<|end|>', answer='SECRET', rules='SECRET'))
     assert 'SECRET' not in json.dumps(messages) and '<|' not in messages[1]['content']
-    assert '默认整合为一个' in messages[0]['content'] and '同一方法' in messages[0]['content']
+    assert '只选择一个' in messages[0]['content'] and '同一方法' in messages[0]['content']
+    assert '禁止猜测倍率' in messages[0]['content'] and '跨条引用' in messages[0]['content']
 
 
 def test_exact_deduplication_keeps_all_sources_and_failures_without_filling_quota():
