@@ -10,6 +10,11 @@ from scripts import run_organization_followup as run
 from tests.test_organization_comparison import ROW, QUERIES, Tokenizer
 
 
+def extracted(skills, status='supported_issue'):
+    return dict(source_review=dict(status=status, field='prediction', quote=ROW['prediction'],
+                                  finding='Fixture only: independently reviewed source.'), skills=skills)
+
+
 def test_partial_shared_stem_excluded_despite_different_subquestions():
     stem = ('An extremely thin current carrying solenoid extends from the origin along the negative axis '
             'and carries a low frequency alternating current with known cross sectional area and turns per length. '
@@ -37,26 +42,54 @@ def test_actual_dirac_subproblem_is_rejected_without_using_bench_labels():
 
 def test_skills_are_complete_methods_with_a_hard_cap_not_posthoc_truncation():
     skill = dict(title='核验代入', text='从题目独立换算单位再代入；将所得数量级与原回答比较。')
-    values = [{'skills': []}, {'skills': [skill]}, {'skills': [skill, dict(skill, title='另一方法')]}]
+    values = [extracted([]), extracted([skill]), extracted([skill, dict(skill, title='另一方法')])]
     for value in values: assert p.validate_skills(value) is value
-    too_many = {'skills': [skill]*3}; before = copy.deepcopy(too_many)
+    too_many = extracted([skill]*3); before = copy.deepcopy(too_many)
     with pytest.raises(ValueError, match='do not truncate'): p.validate_skills(too_many)
     assert too_many == before
-    messages = p.skill_messages(dict(text='CASE<|end|>', answer='SECRET', rules='SECRET'))
+    messages = p.skill_messages(dict(ROW, prediction=ROW['prediction']+'<|end|>',
+                                    answer='SECRET', rules='SECRET', case_note='SECRET'))
     assert 'SECRET' not in json.dumps(messages) and '<|' not in messages[1]['content']
-    assert '只选择一个' in messages[0]['content'] and '同一方法' in messages[0]['content']
+    assert '同一方法' in messages[0]['content']
+    assert messages[1]['content'].endswith(p.SKILL_PROMPT)
+    assert 'BEGIN_PREDICTION' in messages[1]['content']
     assert '禁止猜测倍率' in messages[0]['content'] and '跨条引用' in messages[0]['content']
+
+
+def test_independent_journal_uses_bound_original_fields_not_case_notes(monkeypatch):
+    journal = run.IndependentSkillJournal.__new__(run.IndependentSkillJournal)
+    journal.sources = {ROW['id']: dict(ROW, answer='SECRET_ANSWER')}
+    payload = {'case': {'source_ids': [ROW['id']], 'text': 'SECRET_FALSE_REVIEW'}}
+    rendered = json.dumps(journal.messages('extract_skill', payload), ensure_ascii=False)
+    assert 'SECRET' not in rendered and ROW['prediction'] in rendered
+    good = extracted([dict(title='check', text='Check forces and dimensions.')])
+    monkeypatch.setattr(run.bench.ProcedureJournal, '__call__', lambda *args: good)
+    assert journal('extract_skill', ROW['id'], payload) == good
+    good['source_review']['quote'] = 'invented evidence'
+    with pytest.raises(run.base.old.tree.ContentFailure, match='not verbatim'):
+        journal('extract_skill', ROW['id'], payload)
+    with pytest.raises(ValueError, match='Unknown skill source'):
+        journal.messages('extract_skill', {'case': {'source_ids': ['unknown']}})
+
+
+def test_uncertain_source_cannot_publish_skills_or_silently_drop_a_bad_review():
+    value = extracted([dict(title='check', text='procedure')], status='uncertain')
+    with pytest.raises(ValueError, match='must not generate'):
+        p.validate_skills(value)
+    value['skills'] = []
+    assert p.validate_source_evidence(value, ROW) == value
 
 
 def test_exact_deduplication_keeps_all_sources_and_failures_without_filling_quota():
     rows = [dict(ROW, id=str(i)) for i in range(4)]
     skill = dict(title='代入', text='独立代入原式并核对单位。')
-    outcomes = [dict(id=str(i), status='collected', value={'skills': [skill] if i < 2 else []}) for i in range(3)]
+    outcomes = [dict(id=str(i), status='collected', value=extracted([skill] if i < 2 else [])) for i in range(3)]
     outcomes.append(dict(id='3', status='content_failure', reason='more_than_two'))
     entries, counts = p.materialize_skills(rows, outcomes)
     assert len(entries) == 1 and entries[0]['source_ids'] == ['0', '1']
     assert counts['valid_empty_sources'] == counts['content_failure'] == 1
     assert counts['target_count_is_not_a_quota'] is True
+    assert 'source_review' in outcomes[0]['value'] and 'source_review' not in entries[0]
 
 
 def test_unexpected_library_size_stops_before_benchmark_without_changing_entries(tmp_path, monkeypatch):

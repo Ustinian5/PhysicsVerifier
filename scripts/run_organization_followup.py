@@ -132,7 +132,8 @@ def prepare(output, parent, task):
                         excluded=excluded, tree_changes=tree_changes, human_gold=False,
                         semantic_family_independence_proven=False))]:
                 vr.atomic(output/(name+'.json'), value)
-            c.update(skill_prompt=protocol.SKILL_PROMPT, skills='one complete procedure by default; at most two per source',
+            c.update(skill_prompt=protocol.SKILL_PROMPT, skill_input_policy=protocol.INPUT_POLICY,
+                     skills='one complete procedure by default; at most two per source',
                      max_skills_per_source=2, target_skill_count_is_not_a_quota=True,
                      minimum_skill_count_before_comparison=1000,
                      source_count=len(sources), isolation_policy=protocol.ISOLATION_POLICY,
@@ -193,7 +194,8 @@ def verify(output, full=False):
     require([r['id'] for r in rows] == c['sample_ids'] and len(rows) == c['sample_count'], 'Wrong cohort')
     if c['task'] == 'bounded99':
         require(len(rows) == 99 and c['skill_prompt'] == protocol.SKILL_PROMPT and c['max_skills_per_source'] == 2 and
-                c['minimum_skill_count_before_comparison'] == 1000 and c['isolation_policy'] == protocol.ISOLATION_POLICY,
+                c['minimum_skill_count_before_comparison'] == 1000 and c['isolation_policy'] == protocol.ISOLATION_POLICY and
+                c['skill_input_policy'] == protocol.INPUT_POLICY,
                 'Bounded skill protocol changed')
     else:
         require(c['repeats'] == 5 and c['sample_ids'] == [protocol.TARGET_ID] and
@@ -224,6 +226,29 @@ def build(output, plan, tokenizer):
     return memory
 
 
+class IndependentSkillJournal(bench.ProcedureJournal):
+    def __init__(self, folder, config, tokenizer):
+        super().__init__(folder, config, tokenizer)
+        self.sources = {x['id']: x for x in vr.read(folder.parent/'sources.json')}
+
+    def source(self, payload):
+        ids = payload['case']['source_ids']
+        require(len(ids) == 1 and ids[0] in self.sources, 'Unknown skill source')
+        return self.sources[ids[0]]
+
+    def messages(self, stage, payload):
+        require(stage == 'extract_skill', 'Independent extraction only')
+        return protocol.skill_messages(self.source(payload))
+
+    def __call__(self, stage, key, payload):
+        require(key == self.source(payload)['id'], 'Skill source/key mismatch')
+        value = super().__call__(stage, key, payload)
+        try:
+            return protocol.validate_source_evidence(value, self.source(payload))
+        except (ValueError, TypeError, KeyError) as exc:
+            raise base.old.tree.ContentFailure(str(exc)) from exc
+
+
 @contextmanager
 def adapted(output, plan):
     prefixes = vr.read(output/'frozen_prefixes.json')
@@ -233,6 +258,7 @@ def adapted(output, plan):
         prefix['configuration_sha256'] = plan['configuration_sha256']
         return prefix
     with patch.object(bench, 'protocol', protocol), patch.object(bench, 'verify', verify), \
+         patch.object(bench, 'ProcedureJournal', IndependentSkillJournal), \
          patch.object(bench, 'check_pilot', check_pilot), patch.object(bench, 'build', build), \
          patch.object(base, 'query', reuse_query), \
          patch.object(bench.recovery, 'inspect_failure', native.inspect_failure):
