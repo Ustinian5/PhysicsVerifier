@@ -135,6 +135,9 @@ def prepare(output, parent, task):
             c.update(skill_prompt=protocol.SKILL_PROMPT, skill_input_policy=protocol.INPUT_POLICY,
                      skill_audit_prompt=protocol.AUDIT_PROMPT, extraction_passes=protocol.EXTRACTION_PASSES,
                      extraction_pass_output_tokens=protocol.PASS_OUTPUT_TOKENS,
+                     skill_pilot_size=protocol.PILOT_SIZE, skill_development_size=12,
+                     skill_pilot="fixed first 12 development plus next 12 construction validation sources; review all before scale-up",
+                     skill_pilot_ids=[x['id'] for x in sources[:protocol.PILOT_SIZE]],
                      skills='one complete procedure by default; at most two per source',
                      max_skills_per_source=2, target_skill_count_is_not_a_quota=True,
                      minimum_skill_count_before_comparison=1000,
@@ -200,7 +203,9 @@ def verify(output, full=False):
                 c['skill_input_policy'] == protocol.INPUT_POLICY and
                 c['skill_audit_prompt'] == protocol.AUDIT_PROMPT and
                 c['extraction_passes'] == protocol.EXTRACTION_PASSES and
-                c['extraction_pass_output_tokens'] == protocol.PASS_OUTPUT_TOKENS,
+                c['extraction_pass_output_tokens'] == protocol.PASS_OUTPUT_TOKENS and
+                c['skill_pilot_size'] == protocol.PILOT_SIZE and c['skill_development_size'] == 12 and
+                c['skill_pilot_ids'] == [x['id'] for x in vr.read(output/'sources.json')[:protocol.PILOT_SIZE]],
                 'Bounded skill protocol changed')
     else:
         require(c['repeats'] == 5 and c['sample_ids'] == [protocol.TARGET_ID] and
@@ -270,7 +275,8 @@ def adapted(output, plan):
         require(prefix['input_sha256'] == vr.digest(row), 'Replayed query input changed')
         prefix['configuration_sha256'] = plan['configuration_sha256']
         return prefix
-    with patch.object(bench, 'protocol', protocol), patch.object(bench, 'verify', verify), \
+    with patch.object(base.p, 'PILOT_SIZE', protocol.PILOT_SIZE), \
+         patch.object(bench, 'protocol', protocol), patch.object(bench, 'verify', verify), \
          patch.object(bench, 'ProcedureJournal', IndependentSkillJournal), \
          patch.object(bench, 'check_pilot', check_pilot), patch.object(bench, 'build', build), \
          patch.object(base, 'query', reuse_query), \

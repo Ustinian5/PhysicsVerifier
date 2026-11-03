@@ -10,7 +10,7 @@ from scripts import run_organization_followup as run
 from tests.test_organization_comparison import ROW, QUERIES, Tokenizer
 
 
-def extracted(skills, status='supported_issue'):
+def extracted(skills, status='supported_method'):
     return dict(source_review=dict(status=status, evidence_ids=['prediction:0'],
                                   finding='Fixture only: independently reviewed source.'), skills=skills)
 
@@ -136,6 +136,7 @@ def test_reused_query_is_not_regenerated_and_completed_results_are_not_repeated(
     monkeypatch.setattr(run.base.runtime.transport, 'chat_response', transport)
     original_protocol = run.bench.protocol
     with run.adapted(tmp_path, plan):
+        assert run.base.p.PILOT_SIZE == p.PILOT_SIZE == 24
         first = run.bench.run_condition(tmp_path, ROW, 'formal', 'pure', None, plan, Tokenizer(), None)
         second = run.bench.run_condition(tmp_path, ROW, 'formal', 'pure', None, plan, Tokenizer(), None)
         assert first == second and first['trace']['response_evidence'][0] == evidence

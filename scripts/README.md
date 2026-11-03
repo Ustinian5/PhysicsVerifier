@@ -2,7 +2,7 @@
 
 所有 Python 入口通过 conda `physicsverifier` 执行。完整参数以各脚本 `--help` 为准；方法和指标见 [效果测评](../docs/效果测评.md)。
 
-## 当前主线：限量skills的99题四组对照（提炼试跑未通过，暂未放量）
+## 当前主线：限量skills的99题四组对照（核验方法提炼试跑）
 
 入口：[run_organization_followup.py](run_organization_followup.py)；完整提示及目标复核标准：[organization_followup.py](../rule_framework/organization_followup.py)。两项独立，不改已完成的99题协议或默认verifier：
 
@@ -11,7 +11,7 @@
 | bounded99 | 隔离后1,595来源，由120B仅看原题/30B回答，固定草案＋审查两步提炼，默认1条最多2条；四组重新检查 | 1,595原案例、1,913规则叶、已发布99题和104条原查询（含控制） | 99×4，另20工程控制 |
 | case-repeat（未执行） | 原光纤alpha数值错误定向重复，按固定公式复核 | 四组原查询、实际材料包及首个CHECK请求，使用原skills | 1题×4组×5次 |
 
-共同保持120B medium、连续上下文、原提示及每题预算（最多12响应、累计16,384输出token、6完整材料/8,192参考token）；旧查询用量仍计入各条件预算，实际新请求不重复计费记账。RAG仍检索完整原始错题经验，树仍由程序分层BM25路由；skills无目录、无触发器模板，不能称只消融树结构。本轮同时修正材料隔离与skills提炼输入，不是只改条数的消融。skills不再读取旧120B核查说明；正常来源固定两步，各8,192输出token，总上限16,384不变。首步有效JSON（含空选）保留完整输入和草案进入第二步，唯一采用审查后的最终输出；首步格式失败/截断保留并终止该来源，不补抽。source_review只保存为构建依据，不进入检索库，依据使用程序生成的原文片段编号，未知编号记为内容失败；片段可逐字还原原文，地址有效不等于判断正确；未确证问题时空选。不按bench分数删选条目。构建时超过两条保留为失败，不截取前两条；最终不足1,000条停在正式检查前，不填充。相近条数不等于相同信息量。
+共同保持120B medium、连续上下文、原提示及每题预算（最多12响应、累计16,384输出token、6完整材料/8,192参考token）；旧查询用量仍计入各条件预算，实际新请求不重复计费记账。RAG仍检索完整原始错题经验，树仍由程序分层BM25路由；skills无目录、无触发器模板，不能称只消融树结构。本轮同时修正材料隔离与skills提炼输入，不是只改条数的消融。skills不再读取旧120B核查说明；正常来源固定两步，各8,192输出token，总上限16,384不变。首步有效JSON（含空选）保留完整输入和草案进入第二步，唯一采用审查后的最终输出；首步格式失败/截断保留并终止该来源，不补抽。source_review只保存为构建依据，不进入检索库，依据使用程序生成的原文片段编号，未知编号记为内容失败；片段可逐字还原原文，地址有效不等于判断正确；无法提炼可靠方法时空选；不要求先判原答有错。不按bench分数删选条目。构建时超过两条保留为失败，不截取前两条；最终不足1,000条停在正式检查前，不填充。相近条数不等于相同信息量。
 
 服务器个人conda内执行，先核实进程/锁和GPU/磁盘。PV_PARENT是已完成的organization_comparison_99_20261102；PV_RUN是新的个人持久化结果目录；PV_PY为个人conda的Python绝对路径。两任务共用服务锁；本次仅启动bounded99，case-repeat暂不执行。
 
@@ -23,7 +23,7 @@ nohup "$PV_PY" -u -m scripts.run_organization_followup run --output "$PV_RUN" >>
 "$PV_PY" -m scripts.run_organization_followup confirm-detached --output "$PV_RUN"
 ```
 
-每次提示/输入协议变更使用新的结果目录，旧试跑保留，不能把新提示称作旧失败恢复。首次提炼固定12来源后正常停止；执行助手读取实际原经验及生成方法，填写skills/pilot_review.json，不看bench分数。字段包含configuration_sha256、actor=Codex assistant、human_gold=false、decision=continue、samples；每样本需id、outcome_sha256、method_distinction、notes。非空方法还需substeps_bundled=true；两条时需second_method_independent=true。空/失败分别记valid_empty/unassessable_output_failure；明显不合格回主线，不改提示补抽。全部审读、至少一份可评后同入口断点继续，并重新断连验收。
+每次提示/输入协议变更使用新的结果目录，旧试跑保留，不能把新提示称作旧失败恢复。首次提炼固定24来源（旧12开发＋后12构建侧验证）后正常停止；执行助手读取实际原经验及生成方法，填写skills/pilot_review.json，不看bench分数。字段包含configuration_sha256、actor=Codex assistant、human_gold=false、decision=continue、samples；每样本需id、outcome_sha256、method_distinction、notes。非空方法还需substeps_bundled=true；两条时需second_method_independent=true。空/失败分别记valid_empty/unassessable_output_failure；明显不合格回主线，不改提示补抽。全部审读、至少一份可评后同入口断点继续，并重新断连验收。
 
 `score`为离线模式。A未满99题的组不出主分数；保留完整P/R/F1、失败、全部诊断分母敏感性及配对区间。完成后用`python -m scripts.analyze_organization_comparison RESULT_DIRECTORY`（同conda）核验材料作用和所有原始证据；该审计支持绑定的历史查询前缀，不重复复制旧响应。
 
