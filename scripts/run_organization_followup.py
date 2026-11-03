@@ -133,6 +133,8 @@ def prepare(output, parent, task):
                         semantic_family_independence_proven=False))]:
                 vr.atomic(output/(name+'.json'), value)
             c.update(skill_prompt=protocol.SKILL_PROMPT, skill_input_policy=protocol.INPUT_POLICY,
+                     skill_audit_prompt=protocol.AUDIT_PROMPT, extraction_passes=protocol.EXTRACTION_PASSES,
+                     extraction_pass_output_tokens=protocol.PASS_OUTPUT_TOKENS,
                      skills='one complete procedure by default; at most two per source',
                      max_skills_per_source=2, target_skill_count_is_not_a_quota=True,
                      minimum_skill_count_before_comparison=1000,
@@ -195,7 +197,10 @@ def verify(output, full=False):
     if c['task'] == 'bounded99':
         require(len(rows) == 99 and c['skill_prompt'] == protocol.SKILL_PROMPT and c['max_skills_per_source'] == 2 and
                 c['minimum_skill_count_before_comparison'] == 1000 and c['isolation_policy'] == protocol.ISOLATION_POLICY and
-                c['skill_input_policy'] == protocol.INPUT_POLICY,
+                c['skill_input_policy'] == protocol.INPUT_POLICY and
+                c['skill_audit_prompt'] == protocol.AUDIT_PROMPT and
+                c['extraction_passes'] == protocol.EXTRACTION_PASSES and
+                c['extraction_pass_output_tokens'] == protocol.PASS_OUTPUT_TOKENS,
                 'Bounded skill protocol changed')
     else:
         require(c['repeats'] == 5 and c['sample_ids'] == [protocol.TARGET_ID] and
@@ -230,6 +235,9 @@ class IndependentSkillJournal(bench.ProcedureJournal):
     def __init__(self, folder, config, tokenizer):
         super().__init__(folder, config, tokenizer)
         self.sources = {x['id']: x for x in vr.read(folder.parent/'sources.json')}
+        require(protocol.EXTRACTION_PASSES * protocol.PASS_OUTPUT_TOKENS <= config['model']['max_tokens'],
+                'Two-pass extraction exceeds original per-source output cap')
+        self.config = dict(self.config, max_tokens=protocol.PASS_OUTPUT_TOKENS)
 
     def source(self, payload):
         ids = payload['case']['source_ids']
@@ -238,11 +246,16 @@ class IndependentSkillJournal(bench.ProcedureJournal):
 
     def messages(self, stage, payload):
         require(stage == 'extract_skill', 'Independent extraction only')
-        return protocol.skill_messages(self.source(payload))
+        messages = protocol.skill_messages(self.source(payload))
+        if 'draft' in payload:
+            messages += [{'role': 'assistant', 'content': json.dumps(payload['draft'], ensure_ascii=False).replace('<|', '\\u003c|')},
+                         {'role': 'user', 'content': protocol.AUDIT_PROMPT}]
+        return messages
 
     def __call__(self, stage, key, payload):
         require(key == self.source(payload)['id'], 'Skill source/key mismatch')
-        value = super().__call__(stage, key, payload)
+        draft = super().__call__(stage, key + ':draft', payload)
+        value = super().__call__(stage, key, dict(payload, draft=draft))
         try:
             return protocol.validate_source_evidence(value, self.source(payload))
         except (ValueError, TypeError, KeyError) as exc:

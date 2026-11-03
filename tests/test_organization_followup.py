@@ -63,8 +63,17 @@ def test_independent_journal_uses_bound_original_fields_not_case_notes(monkeypat
     rendered = json.dumps(journal.messages('extract_skill', payload), ensure_ascii=False)
     assert 'SECRET' not in rendered and ROW['prediction'] in rendered
     good = extracted([dict(title='check', text='Check forces and dimensions.')])
-    monkeypatch.setattr(run.bench.ProcedureJournal, '__call__', lambda *args: good)
+    calls = []
+    def generate(*args):
+        calls.append(args)
+        return good
+    monkeypatch.setattr(run.bench.ProcedureJournal, '__call__', generate)
     assert journal('extract_skill', ROW['id'], payload) == good
+    assert [x[2] for x in calls] == [ROW['id']+':draft', ROW['id']]
+    assert calls[1][3]['draft'] == good
+    audit = journal.messages('extract_skill', calls[1][3])
+    assert len(audit) == 4 and audit[-1]['content'] == p.AUDIT_PROMPT
+    assert audit[0:2] == journal.messages('extract_skill', payload)
     good['source_review']['evidence_ids'] = ['prediction:999999']
     with pytest.raises(run.base.old.tree.ContentFailure, match='Unknown evidence address'):
         journal('extract_skill', ROW['id'], payload)
@@ -262,3 +271,12 @@ def test_evidence_spans_preserve_all_source_text_without_json_reescaping():
     assert p.validate_source_evidence(extracted([]), source)
     value = extracted([]); value['source_review']['evidence_ids'] = ['prediction:0']*2
     with pytest.raises(ValueError, match='Invalid evidence addresses'): p.validate_skills(value)
+
+
+def test_two_pass_initialization_preserves_binding_and_total_output_cap(tmp_path):
+    config = {'model': {'max_tokens': 16384}, 'budget_limits': {'requests': 6000, 'input_tokens': 1800000000, 'output_tokens': 98304000}, 'prior_usage': run.base.old.ZERO_USAGE}
+    run.vr.atomic(tmp_path/'sources.json', [ROW])
+    journal = run.IndependentSkillJournal(tmp_path/'skills', config, Tokenizer())
+    assert journal.binding == run.vr.digest(config)
+    assert journal.config['max_tokens'] * p.EXTRACTION_PASSES == config['model']['max_tokens']
+    assert config['model']['max_tokens'] == 16384
