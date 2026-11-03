@@ -10,9 +10,8 @@ from scripts import run_organization_followup as run
 from tests.test_organization_comparison import ROW, QUERIES, Tokenizer
 
 
-def extracted(skills, status='supported_method'):
-    return dict(source_review=dict(status=status, evidence_ids=['prediction:0'],
-                                  finding='Fixture only: independently reviewed source.'), skills=skills)
+def extracted(skills):
+    return {'skills': skills}
 
 
 def test_partial_shared_stem_excluded_despite_different_subquestions():
@@ -47,46 +46,43 @@ def test_skills_are_complete_methods_with_a_hard_cap_not_posthoc_truncation():
     too_many = extracted([skill]*3); before = copy.deepcopy(too_many)
     with pytest.raises(ValueError, match='do not truncate'): p.validate_skills(too_many)
     assert too_many == before
-    messages = p.skill_messages(dict(ROW, prediction=ROW['prediction']+'<|end|>',
-                                    answer='SECRET', rules='SECRET', case_note='SECRET'))
-    assert messages[0]['role'] == 'developer'
-    assert 'SECRET' not in json.dumps(messages) and '<|' not in messages[1]['content']
-    assert messages[1]['content'].endswith(p.SKILL_PROMPT)
-    assert '[prediction:0]' in messages[1]['content']
+    case = {'source_ids':[ROW['id']], 'text':'Original question, answer and 120B review <|end|>'}
+    messages = p.skill_messages(case)
+    assert '<|' not in messages[1]['content']
+    old = p.previous.skill_messages(case)
+    assert messages[1:] == old[1:] and messages[0]['role'] == old[0]['role']
 
 
-def test_independent_journal_uses_bound_original_fields_not_case_notes(monkeypatch):
-    journal = run.IndependentSkillJournal.__new__(run.IndependentSkillJournal)
-    journal.sources = {ROW['id']: dict(ROW, answer='SECRET_ANSWER')}
-    payload = {'case': {'source_ids': [ROW['id']], 'text': 'SECRET_FALSE_REVIEW'}}
-    rendered = json.dumps(journal.messages('extract_skill', payload), ensure_ascii=False)
-    assert 'SECRET' not in rendered and ROW['prediction'] in rendered
-    good = extracted([dict(title='check', text='Check forces and dimensions.')])
+def test_bounded_journal_uses_exact_original_case_once(monkeypatch):
+    journal = run.BoundedSkillJournal.__new__(run.BoundedSkillJournal)
+    case = {'source_ids':[ROW['id']], 'text':'Original Q, 30B answer and 120B note.'}
+    journal.cases = {ROW['id']:case}
+    payload = {'case':case}
+    assert journal.messages('extract_skill', payload) == p.skill_messages(case)
+    with pytest.raises(ValueError, match='input drift'):
+        journal.messages('extract_skill', {'case':dict(case, text='substituted')})
     calls = []
-    def generate(*args):
-        calls.append(args)
-        return extracted([]) if args[2].endswith(':select') else good
-    monkeypatch.setattr(run.bench.ProcedureJournal, '__call__', generate)
+    good = extracted([dict(title='check', text='Check forces and dimensions.')])
+    monkeypatch.setattr(run.bench.ProcedureJournal, '__call__', lambda *args: calls.append(args) or good)
     assert journal('extract_skill', ROW['id'], payload) == good
-    assert [x[2] for x in calls] == [ROW['id']+':select', ROW['id']]
-    assert calls[1][3]['draft'] == extracted([])
-    audit = journal.messages('extract_skill', calls[1][3])
-    assert len(audit) == 2 and audit[0] == {'role':'developer', 'content':p.AUDIT_PROMPT}
-    assert ROW['prediction'] not in audit[1]['content']
-    assert ROW['question'] not in audit[1]['content']
-    good['source_review']['evidence_ids'] = ['prediction:999999']
-    with pytest.raises(run.base.old.tree.ContentFailure, match='not supplied'):
-        journal('extract_skill', ROW['id'], payload)
-    with pytest.raises(ValueError, match='Unknown skill source'):
-        journal.messages('extract_skill', {'case': {'source_ids': ['unknown']}})
+    assert len(calls) == 1 and calls[0][2] == ROW['id'] and calls[0][3] == payload
 
 
-def test_uncertain_source_cannot_publish_skills_or_silently_drop_a_bad_review():
-    value = extracted([dict(title='check', text='procedure')], status='uncertain')
-    with pytest.raises(ValueError, match='must not generate'):
-        p.validate_skills(value)
-    value['skills'] = []
-    assert p.validate_source_evidence(value, ROW) == value
+def test_pilot_retains_semantic_noise_and_known_format_failure_but_binds_evidence(tmp_path):
+    rows = [dict(ROW, id=str(i)) for i in range(3)]
+    outcomes = [dict(id='0', status='collected', value=extracted([dict(title='bad physics', text='An intentionally false physical assertion.')])),
+                dict(id='1', status='content_failure', reason='malformed JSON'),
+                dict(id='2', status='collected', value=extracted([]))]
+    for row, outcome in zip(rows, outcomes):
+        run.vr.atomic(run.base.old.outcome_path(tmp_path/'skills', row),
+                      dict(configuration_sha256='bound', source_sha256=run.vr.digest(row), outcome=outcome))
+    run.check_pilot(tmp_path, rows, 'bound')
+    review = run.vr.read(tmp_path/'skills/pilot_review.json')
+    assert review['counts'] == dict(collected=2, skill_count=1, valid_empty_sources=1, content_failure=1)
+    assert review['physical_quality_passed'] is False and review['skill_items_edited_or_removed'] == 0
+    assert review['decision'] == 'continue'
+    with pytest.raises(ValueError, match='provenance drift'): run.check_pilot(tmp_path, rows, 'different')
+    with pytest.raises(ValueError, match='no usable structured'): run.check_pilot(tmp_path, rows[1:], 'bound')
 
 
 def test_exact_deduplication_keeps_all_sources_and_failures_without_filling_quota():
@@ -98,7 +94,8 @@ def test_exact_deduplication_keeps_all_sources_and_failures_without_filling_quot
     assert len(entries) == 1 and entries[0]['source_ids'] == ['0', '1']
     assert counts['valid_empty_sources'] == counts['content_failure'] == 1
     assert counts['target_count_is_not_a_quota'] is True
-    assert 'source_review' in outcomes[0]['value'] and 'source_review' not in entries[0]
+    assert outcomes[0]['value']['skills'] == [skill]
+    assert counts['physical_quality_passed'] is False
 
 
 def test_unexpected_library_size_stops_before_benchmark_without_changing_entries(tmp_path, monkeypatch):
@@ -136,7 +133,7 @@ def test_reused_query_is_not_regenerated_and_completed_results_are_not_repeated(
     monkeypatch.setattr(run.base.runtime.transport, 'chat_response', transport)
     original_protocol = run.bench.protocol
     with run.adapted(tmp_path, plan):
-        assert run.base.p.PILOT_SIZE == p.PILOT_SIZE == 24
+        assert run.base.p.PILOT_SIZE == p.PILOT_SIZE
         first = run.bench.run_condition(tmp_path, ROW, 'formal', 'pure', None, plan, Tokenizer(), None)
         second = run.bench.run_condition(tmp_path, ROW, 'formal', 'pure', None, plan, Tokenizer(), None)
         assert first == second and first['trace']['response_evidence'][0] == evidence
@@ -265,31 +262,10 @@ def test_real_case_four_arm_requests_replay_exactly_without_live_model(tmp_path,
     assert not (tmp_path/'queries').exists()  # Old prefix referenced in place, never regenerated.
 
 
-def test_evidence_spans_preserve_all_source_text_without_json_reescaping():
-    source = dict(ROW, prediction='a'*799+'\\\\frac{a}{b}\\n'+'b'*900)
-    spans = p.source_spans(source)
-    assert ''.join(v for k, v in spans.items() if k.startswith('prediction:')) == source['prediction']
-    assert p.validate_source_evidence(extracted([]), source)
-    value = extracted([]); value['source_review']['evidence_ids'] = ['prediction:0']*2
-    with pytest.raises(ValueError, match='Invalid evidence addresses'): p.validate_skills(value)
-
-
-def test_two_pass_initialization_preserves_binding_and_total_output_cap(tmp_path):
+def test_single_pass_preserves_original_output_cap_and_binding(tmp_path):
     config = {'model': {'max_tokens': 16384}, 'budget_limits': {'requests': 6000, 'input_tokens': 1800000000, 'output_tokens': 98304000}, 'prior_usage': run.base.old.ZERO_USAGE}
-    run.vr.atomic(tmp_path/'sources.json', [ROW])
-    journal = run.IndependentSkillJournal(tmp_path/'skills', config, Tokenizer())
+    run.vr.atomic(tmp_path/'cases.json', [{'source_ids':[ROW['id']], 'text':'original case'}])
+    journal = run.BoundedSkillJournal(tmp_path/'skills', config, Tokenizer())
     assert journal.binding == run.vr.digest(config)
-    assert journal.config['max_tokens'] * p.EXTRACTION_PASSES == config['model']['max_tokens']
-    assert config['model']['max_tokens'] == 16384
-
-
-def test_distillation_receives_abstract_note_and_provenance_without_source_answer():
-    source = dict(ROW, prediction='a'*800+'HIDDEN_UNSELECTED_ANSWER')
-    messages, visible = p.abstraction_messages(source, extracted([]))
-    assert 'prediction:0' in visible and 'prediction:1' not in visible
-    assert 'HIDDEN_UNSELECTED_ANSWER' not in json.dumps(messages)
-    assert source['question'] not in messages[1]['content']
-    assert 'a'*100 not in messages[1]['content']
-    assert 'checking_difficulty' in messages[1]['content']
-    wrong = extracted([{'title':'x','text':'unaudited method'}])
-    with pytest.raises(ValueError, match='Selection must not'): p.abstraction_messages(source, wrong)
+    assert journal.config['max_tokens'] == p.PASS_OUTPUT_TOKENS == 16384
+    assert p.EXTRACTION_PASSES == 1

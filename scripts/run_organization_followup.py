@@ -24,7 +24,6 @@ SOURCE_FILES = sorted(set(bench.SOURCE_FILES) | {
     'rule_framework/organization_followup.py', 'scripts/run_organization_followup.py',
     'scripts/resume_organization_bench99.py', 'scripts/analyze_organization_comparison.py'})
 MATERIALS = ('sources', 'inputs', 'cases', 'catalog', 'isolation', 'bench_questions')
-ORIGINAL_PILOT = bench.check_pilot
 ORIGINAL_BUILD = bench.build
 
 
@@ -133,10 +132,10 @@ def prepare(output, parent, task):
                         semantic_family_independence_proven=False))]:
                 vr.atomic(output/(name+'.json'), value)
             c.update(skill_prompt=protocol.SKILL_PROMPT, skill_input_policy=protocol.INPUT_POLICY,
-                     skill_audit_prompt=protocol.AUDIT_PROMPT, extraction_passes=protocol.EXTRACTION_PASSES,
+                     extraction_passes=protocol.EXTRACTION_PASSES,
                      extraction_pass_output_tokens=protocol.PASS_OUTPUT_TOKENS,
-                     skill_pilot_size=protocol.PILOT_SIZE, skill_development_size=12,
-                     skill_pilot="fixed first 12 development plus next 12 construction validation sources; review all before scale-up",
+                     skill_pilot_size=protocol.PILOT_SIZE,
+                     skill_pilot=protocol.PILOT_POLICY,
                      skill_pilot_ids=[x['id'] for x in sources[:protocol.PILOT_SIZE]],
                      skills='one complete procedure by default; at most two per source',
                      max_skills_per_source=2, target_skill_count_is_not_a_quota=True,
@@ -201,10 +200,9 @@ def verify(output, full=False):
         require(len(rows) == 99 and c['skill_prompt'] == protocol.SKILL_PROMPT and c['max_skills_per_source'] == 2 and
                 c['minimum_skill_count_before_comparison'] == 1000 and c['isolation_policy'] == protocol.ISOLATION_POLICY and
                 c['skill_input_policy'] == protocol.INPUT_POLICY and
-                c['skill_audit_prompt'] == protocol.AUDIT_PROMPT and
                 c['extraction_passes'] == protocol.EXTRACTION_PASSES and
                 c['extraction_pass_output_tokens'] == protocol.PASS_OUTPUT_TOKENS and
-                c['skill_pilot_size'] == protocol.PILOT_SIZE and c['skill_development_size'] == 12 and
+                c['skill_pilot_size'] == protocol.PILOT_SIZE and c['skill_pilot'] == protocol.PILOT_POLICY and
                 c['skill_pilot_ids'] == [x['id'] for x in vr.read(output/'sources.json')[:protocol.PILOT_SIZE]],
                 'Bounded skill protocol changed')
     else:
@@ -214,18 +212,30 @@ def verify(output, full=False):
 
 
 def check_pilot(output, rows, binding):
-    ORIGINAL_PILOT(output, rows, binding)
-    review = vr.read(output/'skills/pilot_review.json')
-    byid = {x['id']: x for x in review['samples']}
-    for row in rows[:base.p.PILOT_SIZE]:
-        outcome = vr.read(base.old.outcome_path(output/'skills', row))['outcome']
-        if outcome['status'] != 'collected': continue
-        skills = protocol.validate_skills(outcome['value'])['skills']
-        if skills:
-            require(byid[row['id']].get('substeps_bundled') is True, 'Pilot must check complete-method granularity')
-            if len(skills) == 2:
-                require(byid[row['id']].get('second_method_independent') is True,
-                        'Second method is not independent; revise protocol, never reroll this source')
+    """Record automatic-library noise; do not certify or select physical content."""
+    samples, counts = [], Counter()
+    for row in rows[:protocol.PILOT_SIZE]:
+        path = base.old.outcome_path(output/'skills', row)
+        record = vr.read(path)
+        require(record['configuration_sha256'] == binding and record['source_sha256'] == vr.digest(row),
+                'Pilot provenance drift')
+        outcome = record['outcome']
+        require(outcome['id'] == row['id'], 'Pilot source mismatch')
+        require(outcome['status'] in {'collected', 'content_failure'}, 'Unknown pilot status')
+        counts[outcome['status']] += 1
+        if outcome['status'] == 'collected':
+            skills = protocol.validate_skills(outcome['value'])['skills']
+            counts['skill_count'] += len(skills)
+            counts['valid_empty_sources'] += not skills
+        else:
+            require(bool(outcome.get('reason')), 'Unexplained content failure')
+        samples.append(dict(id=row['id'], outcome_sha256=vr.sha(path), status=outcome['status']))
+    require(counts['skill_count'] > 0, 'Pilot produced no usable structured skills; preserve all failures')
+    vr.atomic(output/'skills/pilot_review.json', dict(configuration_sha256=binding,
+        actor='automated protocol', human_gold=False, decision='continue',
+        scope=protocol.PILOT_POLICY, physical_quality_passed=False,
+        benchmark_scores_used=False, skill_items_edited_or_removed=0,
+        counts=dict(counts), samples=samples))
 
 
 def build(output, plan, tokenizer):
@@ -236,38 +246,23 @@ def build(output, plan, tokenizer):
     return memory
 
 
-class IndependentSkillJournal(bench.ProcedureJournal):
+class BoundedSkillJournal(bench.ProcedureJournal):
+    """Reuse original single-pass extraction and bind the exact case memory."""
     def __init__(self, folder, config, tokenizer):
         super().__init__(folder, config, tokenizer)
-        self.sources = {x['id']: x for x in vr.read(folder.parent/'sources.json')}
-        require(protocol.EXTRACTION_PASSES * protocol.PASS_OUTPUT_TOKENS <= config['model']['max_tokens'],
-                'Two-pass extraction exceeds original per-source output cap')
-        self.config = dict(self.config, max_tokens=protocol.PASS_OUTPUT_TOKENS)
-
-    def source(self, payload):
-        ids = payload['case']['source_ids']
-        require(len(ids) == 1 and ids[0] in self.sources, 'Unknown skill source')
-        return self.sources[ids[0]]
+        self.cases = {x['source_ids'][0]: x for x in vr.read(folder.parent/'cases.json')}
+        require(self.config['max_tokens'] == protocol.PASS_OUTPUT_TOKENS,
+                'Original extraction output cap changed')
 
     def messages(self, stage, payload):
-        require(stage == 'extract_skill', 'Independent extraction only')
-        if 'draft' in payload:
-            return protocol.abstraction_messages(self.source(payload), payload['draft'])[0]
-        return protocol.skill_messages(self.source(payload))
+        require(stage == 'extract_skill', 'Bounded extraction only')
+        case = payload['case']; ids = case['source_ids']
+        require(len(ids) == 1 and self.cases.get(ids[0]) == case, 'Frozen case input drift')
+        return protocol.skill_messages(case)
 
     def __call__(self, stage, key, payload):
-        require(key == self.source(payload)['id'], 'Skill source/key mismatch')
-        draft = super().__call__(stage, key + ':select', payload)
-        try:
-            _, visible = protocol.abstraction_messages(self.source(payload), draft)
-        except (ValueError, TypeError, KeyError) as exc:
-            raise base.old.tree.ContentFailure(str(exc)) from exc
-        value = super().__call__(stage, key, dict(payload, draft=draft))
-        try:
-            require(set(value['source_review']['evidence_ids']) <= visible, 'Final provenance was not supplied during distillation')
-            return protocol.validate_source_evidence(value, self.source(payload))
-        except (ValueError, TypeError, KeyError) as exc:
-            raise base.old.tree.ContentFailure(str(exc)) from exc
+        require(payload['case']['source_ids'] == [key], 'Skill source/key mismatch')
+        return super().__call__(stage, key, payload)
 
 
 @contextmanager
@@ -280,7 +275,7 @@ def adapted(output, plan):
         return prefix
     with patch.object(base.p, 'PILOT_SIZE', protocol.PILOT_SIZE), \
          patch.object(bench, 'protocol', protocol), patch.object(bench, 'verify', verify), \
-         patch.object(bench, 'ProcedureJournal', IndependentSkillJournal), \
+         patch.object(bench, 'ProcedureJournal', BoundedSkillJournal), \
          patch.object(bench, 'check_pilot', check_pilot), patch.object(bench, 'build', build), \
          patch.object(base, 'query', reuse_query), \
          patch.object(bench.recovery, 'inspect_failure', native.inspect_failure):

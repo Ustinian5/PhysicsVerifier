@@ -1,6 +1,6 @@
 # 脚本入口
 
-当前状态（2026-11-03）：bounded99 v14构建试跑未通过语义审读，已保留STOP并退出，正式检查0/396。以下为实验接口说明，不表示当前配置已获质量验收；不要伪填pilot_review或直接删STOP放量。
+当前状态（2026-11-03）：bounded99 v15按用户最新口径恢复原始经验单次提炼，保留生成错误/失败，取消语义零错误门槛；旧v14 STOP与失败原件不改。新批正在准备/启动，实际状态以execution_status.json为准。
 
 所有 Python 入口通过 conda `physicsverifier` 执行。完整参数以各脚本 `--help` 为准；方法和指标见 [效果测评](../docs/效果测评.md)。
 
@@ -10,10 +10,12 @@
 
 | task | 新工作 | 复用材料 | 正式检查量 |
 |---|---|---|---:|
-| bounded99 | 隔离后1,595来源，由120B仅看原题/30B回答，固定难点抽象＋方法提炼两步，默认1条最多2条；四组重新检查 | 1,595原案例、1,913规则叶、已发布99题和104条原查询（含控制） | 99×4，另20工程控制 |
+| bounded99 | 隔离后1,595来源，由120B看原题/30B回答/原120B核查说明，单次提炼，默认1条最多2条；四组重新检查 | 1,595原案例、1,913规则叶、已发布99题和104条原查询（含控制） | 99×4，另20工程控制 |
 | case-repeat（未执行） | 原光纤alpha数值错误定向重复，按固定公式复核 | 四组原查询、实际材料包及首个CHECK请求，使用原skills | 1题×4组×5次 |
 
-共同保持120B medium、连续上下文、原提示及每题预算（最多12响应、累计16,384输出token、6完整材料/8,192参考token）；旧查询用量仍计入各条件预算，实际新请求不重复计费记账。RAG仍检索完整原始错题经验，树仍由程序分层BM25路由；skills无目录、无触发器模板，不能称只消融树结构。本轮同时修正材料隔离与skills提炼输入，不是只改条数的消融。skills不再读取旧120B核查说明；正常来源固定两步，各8,192输出token，总上限16,384不变。第一步读取完整原题/原答，抽象一个检查难点并附1–3原文地址；第二步只接收难点说明及来源地址，不接收原题或原答，不传旧判词或解题草案，唯一采用第二步最终输出。来源地址追溯第一步，不冒称第二步独立核查了原文；两步使用显式Harmony developer指令；首步格式失败/截断保留并终止该来源，不补抽。方法正文为2–4个相连的核查问题，每问带具体操作，要求使用者依据新题建立关系；不预设物理结论，不保存原题公式、变量、数值答案或解题模板；这属于过程skills的表示约束，不代表所有数学内容都无效。source_review只保存为构建依据，不进入检索库，依据使用程序生成的原文片段编号，未知编号记为内容失败；片段可逐字还原原文，地址有效不等于判断正确；无法提炼可靠方法时空选；不要求先判原答有错。不按bench分数删选条目。构建时超过两条保留为失败，不截取前两条；最终不足1,000条停在正式检查前，不填充。相近条数不等于相同信息量。
+共同保持120B medium、连续上下文、原在线提示及每题预算（最多12响应、累计16,384输出token、6完整材料/8,192参考token）。复用原查询，不重复生成；三组材料同步隔离，不是纯数量消融。skills恢复原99题完整case输入与单次16,384输出token上限，允许必要公式，仅增加默认1条/最多2条及完整方法粒度。来源由程序绑定，不需模型生成新证据地址。
+
+固定12来源先作工程核验并自动记录pilot_review.json：内容不作物理正确性认证；可解析内容原样保留，已知格式失败单列且不补抽，不按bench分数删选/改写。至少有一条结构可用方法才续跑。来源隔离、模型身份、预算和证据漂移仍停止。超过两条整份记内容失败，不截前两条；最终少于1,000条仍报告数量目标未满足，不填充。通过工程核验不等于全库物理质量合格。旧v2–v14不能用新标准改成通过，也不能从中挑好条目混入新批。
 
 服务器个人conda内执行，先核实进程/锁和GPU/磁盘。PV_PARENT是已完成的organization_comparison_99_20261102；PV_RUN是新的个人持久化结果目录；PV_PY为个人conda的Python绝对路径。两任务共用服务锁；本次仅启动bounded99，case-repeat暂不执行。
 
@@ -25,7 +27,7 @@ nohup "$PV_PY" -u -m scripts.run_organization_followup run --output "$PV_RUN" >>
 "$PV_PY" -m scripts.run_organization_followup confirm-detached --output "$PV_RUN"
 ```
 
-每次提示/输入协议变更使用新的结果目录，旧试跑保留，不能把新提示称作旧失败恢复。首次提炼固定24来源（旧12开发＋后12构建侧验证）后正常停止；执行助手读取实际原经验及生成方法，填写skills/pilot_review.json，不看bench分数。字段包含configuration_sha256、actor=Codex assistant、human_gold=false、decision=continue、samples；每样本需id、outcome_sha256、method_distinction、notes。非空方法还需substeps_bundled=true；两条时需second_method_independent=true。空/失败分别记valid_empty/unassessable_output_failure；明显不合格回主线，不改提示补抽。全部审读、至少一份可评后同入口断点继续，并重新断连验收。
+每次提示/输入协议变更使用新的结果目录，旧试跑保留，不能把新提示称作旧失败恢复。首次提炼固定12来源（旧12开发＋后12构建侧验证）后正常停止；执行助手读取实际原经验及生成方法，填写skills/pilot_review.json，不看bench分数。字段包含configuration_sha256、actor=Codex assistant、human_gold=false、decision=continue、samples；每样本需id、outcome_sha256、method_distinction、notes。非空方法还需substeps_bundled=true；两条时需second_method_independent=true。空/失败分别记valid_empty/unassessable_output_failure；明显不合格回主线，不改提示补抽。全部工程核验、至少一份可评后同入口断点继续，并重新断连验收。
 
 `score`为离线模式。A未满99题的组不出主分数；保留完整P/R/F1、失败、全部诊断分母敏感性及配对区间。完成后用`python -m scripts.analyze_organization_comparison RESULT_DIRECTORY`（同conda）核验材料作用和所有原始证据；该审计支持绑定的历史查询前缀，不重复复制旧响应。
 
@@ -164,7 +166,7 @@ nohup "$PYTHON_BIN" -u -m scripts.run_continuous_context_v2 run --output "$RUN_D
 
 当前v5只收集未验收机器候选：沿用v3逐题初稿提示，不采用试验中未解决物理误判的固定复查。结构异常最多一次完整上下文修复；仍不合规者进入invalid_outputs，不能算正确、空选或入库规则，也不阻塞其余题。技术故障、模型身份、隔离、树成员守恒仍严格停止。输出发布清单固定usable_for_runtime=false、physical_quality_passed=false，不能绕过物理验收接入默认库。试跑收集许可记录engineering_passed、collection_only与已发现的质量问题，不冒充物理验收通过。`prepare --parent-preparation DIR`复用相同生成/隔离证据；父v3已完成目录/初稿仅在请求体完全一致时重放，调用计数保留。
 
-正式入口为`python -m scripts.run_experience_first_120b`，必须在服务器个人conda环境中执行。依次使用`prepare --output DIR --corpus-release RELEASE`、后台`run --output DIR --phase pilot`、断开SSH重新连接后`confirm-detached --output DIR`。固定12题试跑输出保存在DIR/pilot，由主线审读并以`acceptance.json`绑定counts及semantic_experience的SHA；然后后台`run --output DIR --phase full`并再次断连确认。不能跳过验收，不能让执行助手自行改提示或内容门槛。
+正式入口为`python -m scripts.run_experience_first_120b`，必须在服务器个人conda环境中执行。依次使用`prepare --output DIR --corpus-release RELEASE`、后台`run --output DIR --phase pilot`、断开SSH重新连接后`confirm-detached --output DIR`。固定12题试跑输出保存在DIR/pilot，由主线工程核验并以`acceptance.json`绑定counts及semantic_experience的SHA；然后后台`run --output DIR --phase full`并再次断连确认。不能跳过验收，不能让执行助手自行改提示或内容门槛。
 
 prepare核对已发布的全部完整30B回答及实际生成证据，不导入旧筛错标签，重新检查所有已登记bench。Domain/Topic按领域分批补摘要，保持原名称/层级；逐题审查＋提炼和场景归组都用本地120B medium。成功调用精确重放，只有明确技术故障在同一请求最多3次尝试内恢复；模型身份、语义/结构异常停止，保存原件由主线修复。正式输出不覆盖旧83条或默认库。`execution_status.json`、`budget.json`、`runner.log`与原始arm目录分别记录状态、用量、过程和证据；release_manifest仅表示候选库构建完成，仍不是物理效果验收。
 
@@ -207,7 +209,7 @@ python -m scripts.resume_qwen30b_corpus confirm-detached --output <采集目录>
 
 已冻结旧升级清单的批次若需修复最终发布路径，先等客户端退出、两把锁释放，使用`patch-publication --output <原目录> --previous-source-git-blob 7451a9eaeebab9d1ac58bcf9d00a5000f8b6545a`。它保留原`continuation_upgrade.json`，以`continuation_publication_patch.json`关联旧源码与全部既有证据；不重写原请求、提示或采样。此补丁只防止校验运行证据时覆盖最终清单的目标路径，最终发布同时绑定两份技术恢复清单。已完成该步骤的批次直接用run续跑，不重复升级或打补丁。
 
-两项服务分别由`start_qwen30b_corpus_service.sh`、`start_oss120b_corpus_service.sh`在服务器后台启动。显式设置`CORPUS_GRAPH_MODE=1`可使用已验证的level=0、FULL_DECODE_ONLY模式，不做Torch编译；缓存位于个人`/dev/shm/huhengyuan/`，原始记录仍持久化。默认未设置时保留eager模式。切换须先排空客户端，核验并停止自己的原服务；不能覆盖运行中的启动脚本或抢占GPU。实际服务的切换前后验证用`probe_qwen30b_runtime --validate-existing before|after`，后台启动、退出SSH，再重连以同参数加`--confirm`放行。每阶段只复用三项既有合成控制，收到的响应不重跑；须审读生成控制并保存验收，最终发布绑定`service/runtime_transition.json`关联的证据。
+两项服务分别由`start_qwen30b_corpus_service.sh`、`start_oss120b_corpus_service.sh`在服务器后台启动。显式设置`CORPUS_GRAPH_MODE=1`可使用已验证的level=0、FULL_DECODE_ONLY模式，不做Torch编译；缓存位于个人`/dev/shm/huhengyuan/`，原始记录仍持久化。默认未设置时保留eager模式。切换须先排空客户端，核验并停止自己的原服务；不能覆盖运行中的启动脚本或抢占GPU。实际服务的切换前后验证用`probe_qwen30b_runtime --validate-existing before|after`，后台启动、退出SSH，再重连以同参数加`--confirm`放行。每阶段只复用三项既有合成控制，收到的响应不重跑；须工程核验生成控制并保存验收，最终发布绑定`service/runtime_transition.json`关联的证据。
 
 重启恢复时，可显式设置`CORPUS_RUNTIME_SITE`复用已核验的个人持久化运行库；30B可同时设置`CORPUS_GPU_INDEX`与`CORPUS_GPU_UUID`，启动器仍要求该GPU空闲、型号容量合格且UUID一致，不直接沿用重启前编号。120B仍检查原GPU1及其UUID。重启后的合成控制使用`--validate-existing reboot`，与before/after记录分开；模型、提示、种子、预算及既有结果均保持不变。环境包解压不得修改他人的运行库，正式客户端仍显式使用个人conda。
 
@@ -228,7 +230,7 @@ python -m scripts.build_120b_rules verify --output <新的构建结果目录>
 
 新30B来源必须加`--corpus-release`：核验完整发布清单、逐题生成和审查原始请求/响应，复用已接纳错误，不重做筛错、不修复已拒绝引文。120B依次建立通用目录、分配错误Topic、按机制归组、结合完整题目/回答核实并提炼规则、组织ScenarioCluster；拒绝项逐条保留，每条叶仍需两个不同题干模板支持。plan绑定源码、提示、模型角色、来源及隔离证据和预算；历史无发布清单模式仅保留来源声明，不能混称同一协议。必查bench由`BENCHMARK_FILES`登记，包括新增的服务器历史评测题干表；同步至执行环境时该表不可遗漏，`--exclude`只能追加。检查同题、数字变体、近重复和各可见字段嵌入的题干；verify/run及在线接入均重放筛查与抽样。文件缺失/改变、实际在线题目重叠即停止。文本筛查不证明全部语义题族独立。
 
-服务器客户端只连本机18083的既有个人120B服务；不要求OPENAI_API_KEY或外部额度，不自动部署或抢占GPU。先核对进程/锁、服务身份、模型配置/索引哈希及磁盘，再用个人conda后台运行`python -u -m scripts.build_120b_rules run --output <构建目录>`。新来源首次先给`run`加`--control-only`，仅跑两个合成错误的完整提炼/建树控制。退出启动SSH后重新连接，执行`python -m scripts.build_120b_rules confirm-detached --output <构建目录>`，放行后才发请求。主线审读控制规则后写入`controls/acceptance.json`（actor为Codex assistant、passed为true、summary_sha256绑定controls/summary.json），再以不带`--control-only`的`run`启动正式批并重新断连确认；控制成功响应直接复用。新输出优先放在个人slow_share2目录，服务和客户端均须在服务器。
+服务器客户端只连本机18083的既有个人120B服务；不要求OPENAI_API_KEY或外部额度，不自动部署或抢占GPU。先核对进程/锁、服务身份、模型配置/索引哈希及磁盘，再用个人conda后台运行`python -u -m scripts.build_120b_rules run --output <构建目录>`。新来源首次先给`run`加`--control-only`，仅跑两个合成错误的完整提炼/建树控制。退出启动SSH后重新连接，执行`python -m scripts.build_120b_rules confirm-detached --output <构建目录>`，放行后才发请求。主线工程核验控制规则后写入`controls/acceptance.json`（actor为Codex assistant、passed为true、summary_sha256绑定controls/summary.json），再以不带`--control-only`的`run`启动正式批并重新断连确认；控制成功响应直接复用。新输出优先放在个人slow_share2目录，服务和客户端均须在服务器。
 
 成功请求及完整落盘响应直接复用。每任务最多3次尝试，只有明确技术故障且冷却至少300秒/满足Retry-After后才可用`--retry-transient`；身份、内容、未知限流错误不重抽。STOP阻止新请求，在途响应先落盘；查看`execution_status.json`、`budget.json`和`arm_*`。总预算包含失败的保守预留，提炼次数上限也含失败，不等于美元额度。历史回答中的Harmony标记仅作JSON无损转义，不删原文。引用/类别/schema异常继续保留证据回主线处理。
 
