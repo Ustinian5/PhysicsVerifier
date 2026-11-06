@@ -25,6 +25,30 @@ def require(condition, message):
         raise ValueError(message)
 
 
+def generation_fingerprints(raw_path):
+    """Hash server-recorded tokens, not just the client's messages.
+
+    Harmony serving may inject a date before tokenization. Equal request bodies
+    therefore do not establish equal model inputs. Missing receipts stay unknown.
+    """
+    try:
+        raw = read(raw_path)
+    except json.JSONDecodeError:
+        raw = {}
+    require(isinstance(raw, dict), 'Invalid raw response object')
+    choices = raw.get('choices') or []
+    prompt = raw.get('prompt_token_ids')
+    generated = choices[0].get('token_ids') if len(choices) == 1 else None
+    for tokens in (prompt, generated):
+        require(tokens is None or (isinstance(tokens, list) and tokens and
+                all(type(token) is int and token >= 0 for token in tokens)),
+                'Invalid recorded token IDs')
+    return {
+        'effective_prompt_tokens_sha256': digest(prompt) if prompt is not None else None,
+        'first_generated_tokens_sha256': digest(generated) if generated is not None else None,
+    }
+
+
 def evidence_path(root, recorded):
     """Map a receipt from the original server into this exact downloaded run."""
     parts = Path(recorded).parts
@@ -118,6 +142,7 @@ def sample_record(path, root, binding, model, evidence):
         'query_evidence_sha256': packet['query_evidence_sha256'],
         'shared_prefix_sha256': digest(p['messages'][:-1]),
         'check_request_body_sha256': first_request['request_sha256'],
+        **generation_fingerprints(turns[0].with_name('response.sse')),
         'diagnostics_sha256': digest(diagnostics),
         'provided_ids': reference_ids, 'provided_count': len(reference_ids),
         'reference_tokens': p['retrieval']['reference_tokens'],
@@ -152,17 +177,23 @@ def paired_summary(ids, assisted, pure, assisted_scores, pure_scores):
     rows = []
     for sid in ids:
         a, b = assisted_scores[sid], pure_scores[sid]
+        prompt_a = assisted[sid].get('effective_prompt_tokens_sha256')
+        prompt_b = pure[sid].get('effective_prompt_tokens_sha256')
         gains = sorted(set(a['matched_claim_ids']) - set(b['matched_claim_ids']))
         losses = sorted(set(b['matched_claim_ids']) - set(a['matched_claim_ids']))
         rows.append({'id': sid, 'gained_claim_ids': gains, 'lost_claim_ids': losses,
                      'same_check_request': assisted[sid]['check_request_body_sha256'] ==
                                            pure[sid]['check_request_body_sha256'],
+                     'same_effective_prompt': prompt_a == prompt_b
+                                             if prompt_a is not None and prompt_b is not None else None,
                      'same_diagnostics': assisted[sid]['diagnostics_sha256'] ==
                                          pure[sid]['diagnostics_sha256']})
     gains, losses = (sum(len(r[k]) for r in rows) for k in ('gained_claim_ids', 'lost_claim_ids'))
     return {'questions': len(ids), 'gained_location_matches': gains,
             'lost_location_matches': losses, 'net_location_matches': gains - losses,
             'identical_check_requests': sum(r['same_check_request'] for r in rows),
+            'identical_effective_prompts': sum(r['same_effective_prompt'] is True for r in rows),
+            'effective_prompt_comparison_unavailable': sum(r['same_effective_prompt'] is None for r in rows),
             'identical_diagnostics': sum(r['same_diagnostics'] for r in rows), 'details': rows,
             'assisted': scoring.summarize([assisted_scores[i] for i in ids]),
             'pure': scoring.summarize([pure_scores[i] for i in ids])}
@@ -258,7 +289,7 @@ def analyze(root):
             'Citation is observable self-attribution, not proof of causality; no citation does not prove non-use.',
             'Matched claims are frozen location proxies, not semantic correctness judgments.',
             'Partitions are post-hoc descriptive analyses; original full-cohort scores remain primary.',
-            'Identical empty-reference requests show repeated-output variation; they do not estimate the causal effect on other questions.',
+            'Identical client requests do not guarantee identical model inputs; compare server-recorded prompt-token hashes, including injected headers.',
             'Content/extraction/routing all differ, so this is not an isolated test of tree structure.',
         ]}
 

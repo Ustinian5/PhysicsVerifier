@@ -50,6 +50,31 @@ def test_packet_claim_alone_cannot_prove_delivery(tmp_path):
         sample_record(folder / 'result.json', root, 'binding', 'pinned-model', {})
 
 
+def test_same_request_different_server_prompt_is_not_identical_input(tmp_path):
+    root, folder = sample(tmp_path)
+    raw = folder/'turn_02/response.sse'
+    receipt = folder/'turn_02/response.json'
+
+    def inspect(date_token):
+        atomic(raw, {'prompt_token_ids': [200006, 123, date_token, 200007],
+                     'choices': [{'token_ids': [42, 200002]}]})
+        response = json.loads(receipt.read_text())
+        response['raw_sse_sha256'] = sha(raw)
+        atomic(receipt, response)
+        return sample_record(folder/'result.json', root, 'binding', 'pinned-model', {})
+
+    old, new = inspect(3286), inspect(3170)
+    assert old['check_request_body_sha256'] == new['check_request_body_sha256']
+    assert old['effective_prompt_tokens_sha256'] != new['effective_prompt_tokens_sha256']
+
+
+def test_missing_server_prompt_tokens_remain_unknown(tmp_path):
+    root, folder = sample(tmp_path)
+    item = sample_record(folder/'result.json', root, 'binding', 'pinned-model', {})
+    assert item['effective_prompt_tokens_sha256'] is None
+    assert item['first_generated_tokens_sha256'] is None
+
+
 def test_unsupplied_citation_is_rejected(tmp_path):
     root, folder = sample(tmp_path, status='completed', citations=['invented-reference'])
     with pytest.raises(ValueError, match='unsupplied reference'):
