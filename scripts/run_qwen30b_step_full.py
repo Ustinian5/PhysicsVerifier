@@ -165,6 +165,8 @@ def prepare(out, pilot):
 
 
 def verify(out, acceptance=False):
+    if acceptance:
+        require(not (out/'STOP').exists(), 'Formal execution is held; construction/workflow correction required')
     plan = vr.read(out/'plan.json'); c = plan['configuration']
     require(c['protocol'] == VERSION and vr.digest(c) == plan['configuration_sha256'], 'Full plan drift')
     require(c['source_hashes'] == code_hashes(), 'Full code drift')
@@ -173,11 +175,32 @@ def verify(out, acceptance=False):
     pilot = (out/c['pilot_relative']).resolve()
     require(vr.sha(pilot/'plan.json') == c['pilot_plan_sha256'], 'Pilot plan drift')
     if acceptance:
+        construction_acceptance(out, plan)
         a = vr.read(pilot/'pilot_acceptance.json')
         require(a.get('passed') is True and a['configuration_sha256'] == vr.read(pilot/'plan.json')['configuration_sha256']
                 and a.get('semantic_review_passed') is True, 'Six-question semantic acceptance required')
         for n, h in a['evidence'].items(): require(vr.sha(pilot/n) == h, 'Acceptance evidence drift')
     return plan
+
+
+def construction_acceptance(out, plan):
+    """A completed benchmark pilot cannot approve a different library's source."""
+    path = out/'construction_acceptance.json'
+    require(path.exists(), 'Corrected original-source construction acceptance is required')
+    a = vr.read(path)
+    require(a.get('passed') is True and a.get('configuration_sha256') == plan['configuration_sha256'] and
+            a.get('original_source_only') is True and a.get('answer_model') == corpus.MODEL and
+            a.get('construction_model') == base.r.EXPECTED_MODEL and a.get('embedding_calls') == 0 and
+            a.get('heldout_questions_sha256') == vr.sha(out/'questions.json') and
+            a.get('catalog_sha256') == vr.sha(out/'catalog.json') and
+            a.get('source_count') == plan['configuration']['source_count'] and
+            a.get('scope') == 'generation_and_library_provenance_and_heldout_isolation' and
+            a.get('human_gold') is False and bool(a.get('evidence')),
+            'Construction acceptance missing or belongs to different inputs/library')
+    for n, h in a['evidence'].items():
+        evidence = Path(n)
+        require(evidence.is_absolute() and vr.sha(evidence) == h, 'Construction evidence drift')
+    return a
 
 
 def pilot_root(out, plan):

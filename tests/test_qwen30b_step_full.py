@@ -8,6 +8,17 @@ from scripts import run_qwen30b_step_full as f
 
 
 class FullStepTests(unittest.TestCase):
+    def test_formal_hold_precedes_any_generation_or_source_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp); (out/'STOP').write_text('source correction')
+            with self.assertRaisesRegex(ValueError, 'Formal execution is held'):
+                f.verify(out, acceptance=True)
+
+    def test_semantic_pilot_cannot_substitute_for_construction_acceptance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, 'construction acceptance'):
+                f.construction_acceptance(Path(tmp), {'configuration_sha256':'benchmark-only'})
+
     def test_selection_is_deterministic_and_excludes_build_and_old_faces(self):
         old = [{'id':'old', 'question':'Unique harmonic oscillator with variable spring', 'context':''}]
         pool = [{'id':'build-copy','question':'Falling mass with drag coefficient'},
