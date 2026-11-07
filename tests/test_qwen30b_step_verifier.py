@@ -34,7 +34,7 @@ class StepVerifierTests(unittest.TestCase):
     def test_actual_server_date_is_checked_from_tokens(self):
         class Tokenizer:
             def decode(self, tokens, **kwargs):
-                return '[im_start]system[im_sep]Current date: 2026-11-07\nReasoning: medium[im_end]'
+                return '<|start|>system<|message|>Identity\nCurrent date: 2026-11-07\nReasoning: medium\n<|end|>'
         raw={'prompt_token_ids':[1,2,3]}
         self.assertEqual(checks.validate_effective_input(raw,Tokenizer(),'2026-11-07')['token_count'],3)
         with self.assertRaises(ValueError):checks.validate_effective_input(raw,Tokenizer(),'2026-11-08')

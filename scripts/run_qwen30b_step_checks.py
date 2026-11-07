@@ -87,8 +87,9 @@ def validate_effective_input(raw, tokenizer, date):
     tokens=raw.get('prompt_token_ids')
     require(isinstance(tokens,list) and tokens and all(type(x) is int for x in tokens),
             'Server must return actual input tokens')
-    header=tokenizer.decode(tokens[:256],skip_special_tokens=False).split('[im_end]',1)[0]
-    require('Current date: '+date in header and 'Reasoning: medium' in header,
+    header=tokenizer.decode(tokens[:256],skip_special_tokens=False).split('<|end|>',1)[0]
+    require(header.startswith('<|start|>system<|message|>') and
+            '\nCurrent date: '+date+'\n' in header and '\nReasoning: medium\n' in header,
             'Actual Harmony date/reasoning differs from frozen protocol')
     return {'sha256':vr.digest(tokens),'token_count':len(tokens),'system_header':header}
 
