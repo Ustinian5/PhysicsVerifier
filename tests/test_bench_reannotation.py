@@ -61,7 +61,7 @@ class AnnotationValidation(unittest.TestCase):
     def test_valid_empty_pilot_and_tamper_detection(self):
         with tempfile.TemporaryDirectory() as d:
             out = Path(d)
-            (out / "manifest.json").write_text(json.dumps({"pilot_ids": ["p"+str(i) for i in range(5)]}))
+            (out / "manifest.json").write_text(json.dumps({"pilot_ids": ["p"+str(i) for i in range(5)], "formal_tasks":396}))
             for stage in ("initial", "blind", "review", "final"):
                 for i in range(5):
                     folder = out / ("arm_"+stage) / ("p"+str(i))

@@ -157,24 +157,28 @@ def extract(response):
     return json.loads(text)
 
 
-def prepare(source, out, endpoint, recover_technical=False, record_recovery=True):
+def prepare(source, out, endpoint, recover_technical=False, record_recovery=True,
+            expected_count=99, pilot_size=5):
     rows = json.loads(source.read_text())
-    if len(rows) != 99 or len({r["id"] for r in rows}) != 99:
-        raise ValueError("expected 99 unique rows")
+    if (expected_count < 1 or not 1 <= pilot_size <= expected_count or
+            len(rows) != expected_count or len({r["id"] for r in rows}) != expected_count):
+        raise ValueError(f"expected {expected_count} unique rows and a valid pilot size")
     # Strict allowlist: labels and model raw annotation outputs never enter prompts.
     inputs = [{k: str(r.get(k) or "") for k in ("id", "question", "context", "prediction", "answer")} for r in rows]
     if any(not r["question"] or not r["prediction"] for r in inputs):
         raise ValueError("missing required input")
-    pilot = sorted(random.Random(20261011).sample([r["id"] for r in inputs], 5))
+    pilot = sorted(random.Random(20261011).sample([r["id"] for r in inputs], pilot_size))
     config = {"model": MODEL, "reasoning_effort": "high", "response_tokens": 32768,
               "endpoint_sha256": digest(endpoint), "source_sha256": sha256_file(source),
               "input_sha256": digest(inputs), "prompts_sha256": digest([SYSTEM, INSTRUCTIONS]),
               "runner_sha256": sha256_file(Path(__file__)), "pilot_ids": pilot,
               "reference_authority": "unverified historical reference; independent verification required",
-              "max_requests": 1200, "max_input_tokens": 80000000, "max_output_tokens": 40000000,
+              "max_requests": 1200 if expected_count == 99 else expected_count * 12,
+              "max_input_tokens": 80000000 if expected_count == 99 else expected_count * 808081,
+              "max_output_tokens": 40000000 if expected_count == 99 else expected_count * 404041,
               "platform_quota_floor": 1000000, "stages": list(STAGES),
               "model_alias_policy": "exact returned model ID; no automatic model substitution",
-              "human_gold": False, "formal_tasks": 396, "concurrency": 1}
+              "human_gold": False, "formal_tasks": len(rows) * len(STAGES), "concurrency": 1}
     out.mkdir(parents=True, exist_ok=True)
     if (out / "manifest.json").exists():
         frozen = json.loads((out / "manifest.json").read_text())
@@ -472,7 +476,7 @@ def audit(out, inputs, config):
               "statistics": request_statistics(records, sum(completed.values()), {**config, "max_requests": execution_limits(out, config, records)["requests"]}),
               "human_review_queue": findings, "fixed_human_spotcheck_ids": human_spotcheck,
               "human_gold": False, "label_freeze_ready": False,
-              "scientific_status": "Unfrozen machine annotations. All 99 final tasks plus documented human adjudication/spot checks are required before release. No old GT or verifier output is provided to annotators."}
+              "scientific_status": "Unfrozen machine annotations. All configured final tasks plus documented review are required before release. Machine/assistant review is not human gold. No old GT or verifier output is provided to annotators."}
     write_json(out / "quality_audit.json", report)
     return report
 
@@ -485,7 +489,9 @@ def run(args):
     with (out / "runner.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
-            inputs, config = prepare(args.source, out, base, args.recover_technical, record_recovery=args.mode != "audit")
+            inputs, config = prepare(args.source, out, base, args.recover_technical,
+                record_recovery=args.mode != "audit", expected_count=getattr(args, 'expected_count', 99),
+                pilot_size=getattr(args, 'pilot_size', 5))
             initial_audit = audit(out, inputs, config)
         except Exception as exc:
             if args.mode != "audit":
@@ -713,5 +719,8 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--env", type=Path, required=True)
     parser.add_argument("--mode", choices=("pilot", "formal", "audit"), required=True)
+    parser.add_argument("--expected-count", type=int, default=99,
+                        help="Explicit new cohort size; default preserves historical 99-question protocol")
+    parser.add_argument("--pilot-size", type=int, default=5)
     parser.add_argument("--recover-technical", action="store_true", help="Resume classified transport failures within unchanged attempt/budget caps; completed content is never rerolled")
     raise SystemExit(run(parser.parse_args()))

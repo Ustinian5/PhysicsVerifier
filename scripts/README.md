@@ -1,6 +1,15 @@
 # 脚本入口
 
-当前路线与状态见[项目进展](../docs/项目进展.md)。主实验转为原题源内30B回答的题级四组检查；新bench与正式运行配置尚未冻结，下面的历史入口不能直接启动新实验。Python统一使用conda环境。
+当前路线与状态见[项目进展](../docs/项目进展.md)。当前先运行原题源内新30B回答的步骤级小样本验收，题级扩展暂缓；下面的历史入口不能直接启动新实验。Python统一使用conda环境。
+
+## 当前步骤级验收入口
+
+- `run_qwen30b_step_verifier.py prepare/verify/generate/confirm-detached/export --output <根目录>`：隔离并冻结问题，新生成30B回答；默认仅6题，`--full`须已有小样本验收记录。
+- `run_qwen30b_step_checks.py prepare/verify/run/confirm-detached --output <根目录/checks_pilot>`：纯120B与原题源规则树连续检查；prepare需指定`--source <生成根目录> --catalog <已绑定原题源catalog.json>`。
+- `run_bench_reannotation.py --source <新30B annotation_inputs.json> --output <annotation_pilot> --env <私密配置> --mode pilot --expected-count 6 --pilot-size 6`：独立Sol high四轮标注，不启动全量。
+- `start_qwen30b_step_service.sh`与`start_oss120b_step_service.sh`为个人服务器启动器，环境/模型/端口需按已核验资源使用；120B通过`serve_fixed_date_vllm.py`固定服务实际日期。
+
+生成、检查均须后台运行后从新SSH执行`confirm-detached`；成功项不可重复生成。原始请求、响应及计划保存在指定结果目录。当前6题是工程验收，不是独立测试或完整四组结果。
 
 ## 可复用基础
 
@@ -8,7 +17,7 @@
 |---|---|---|
 | 30B作答及核查采集 | [rebuild_qwen30b_corpus.py](rebuild_qwen30b_corpus.py) | 沿用已验证组件，先绑定新划分和目标模型 |
 | 规则组织 | [reorganize_qwen30b_expansion.py](reorganize_qwen30b_expansion.py) | 不自动沿用混合题源输入 |
-| 四组连续检查 | [run_organization_followup.py](run_organization_followup.py)及[协议](../rule_framework/organization_followup.py) | 历史99题实现；新输入、无定位提示及输出需适配 |
+| 四组连续检查 | [run_organization_followup.py](run_organization_followup.py)及[协议](../rule_framework/organization_followup.py) | 历史99题实现；本轮通过新步骤级入口绑定30B回答 |
 | 题目级计分 | [evaluate_question_level_sets.py](evaluate_question_level_sets.py) | 严格标签与技术失败处理需核验后适配 |
 | 原始记录审计 | [analyze_organization_comparison.py](analyze_organization_comparison.py) | 复用哈希与材料送达核验 |
 

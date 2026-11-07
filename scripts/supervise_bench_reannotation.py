@@ -34,11 +34,12 @@ def accept(out):
                 if stage == "final" and e["status"] == "confirmed" and e["quote"] and not e["evidence_validation"]["exact_match"]:
                     raise ValueError("confirmed pilot error has no exact original quote; operator review needed")
             records.append({"path": str(path.relative_to(out)), "sha256": sha256_file(path)})
-    return {"state": "engineering_accepted", "pilot_tasks": 20, "records": records,
+    pilot_tasks = len(manifest["pilot_ids"]) * len(STAGES)
+    return {"state": "engineering_accepted", "pilot_tasks": pilot_tasks, "records": records,
             "manifest_sha256": sha256_file(out / "manifest.json"), "accepted_unix": time.time(),
             "physical_gold_validation": "pending human review; engineering acceptance is not label correctness",
             "omission_policy": "Empty-quote omission claims allowed by frozen schema remain unlocated; excluded from location-based gold until reviewed; never fabricated or dropped",
-            "reuse_policy": "same frozen inputs/prompts; 20 pilot results reused in formal 396 tasks"}
+            "reuse_policy": f"same frozen inputs/prompts; {pilot_tasks} pilot results reused in formal {manifest['formal_tasks']} tasks"}
 
 
 def main(args):
@@ -67,7 +68,9 @@ def main(args):
                 write_json(out / "pilot_acceptance.json", acceptance)
             command = [sys.executable, str(ROOT / "scripts/run_bench_reannotation.py"),
                        "--source", str(args.source.resolve()), "--output", str(out),
-                       "--env", str(args.env.resolve()), "--mode", "formal"]
+                       "--env", str(args.env.resolve()), "--mode", "formal",
+                       "--expected-count", str(len(json.loads((out / 'inputs.json').read_text()))),
+                       "--pilot-size", str(len(json.loads((out / 'manifest.json').read_text())['pilot_ids']))]
             if args.recover_technical:
                 command.append("--recover-technical")
             write_json(out / "supervisor_status.json", {"state": "starting_formal", "time": time.time()})

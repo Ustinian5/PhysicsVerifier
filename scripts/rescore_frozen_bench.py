@@ -395,7 +395,7 @@ def ratios(tp, pred, gt):
                 precision_defined=bool(pred), recall_defined=bool(gt))
 
 
-def score(dataset, predictions, unresolved=None):
+def score(dataset, predictions, unresolved=None, *, preserve_zero_offsets=False):
     """Unmodified matching helpers; all 50 remain in the operational denominator."""
     indexed = index_rows(predictions, "predictions")
     details = []
@@ -405,12 +405,14 @@ def score(dataset, predictions, unresolved=None):
         gt = legacy._extract_gt_entries(row, sid)
         findings = legacy._fill_missing_pred_locations(legacy._collect_pred_findings(pred, {}), row["prediction"])
         loc_gt = [g for g in gt if g["locatable_valid"]]
-        matched, matches, used = legacy._match_by_location(loc_gt, findings, 0.5, 0.6)
+        matched, matches, used = legacy._match_by_location(loc_gt, findings, 0.5, 0.6,
+                                                          preserve_zero_offsets=preserve_zero_offsets)
         unknown_overlap = []
         if unresolved:
             unknown_gt = legacy._extract_gt_entries(dict(physics_error_gt=unresolved[sid]), sid)
             for i, finding in enumerate(findings):
-                if i not in used and legacy._match_by_location(unknown_gt, [finding], 0.5, 0.6)[0]:
+                if i not in used and legacy._match_by_location(unknown_gt, [finding], 0.5, 0.6,
+                                                               preserve_zero_offsets=preserve_zero_offsets)[0]:
                     unknown_overlap.append(i)
         details.append(dict(id=sid, gt_error_count=len(gt), gt_locatable_error_count=len(loc_gt),
             matched_error_count=len(matched), matched_pred_locatable=len(used),

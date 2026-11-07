@@ -608,14 +608,20 @@ def _match_by_location(
     pred_findings: List[Dict[str, Any]],
     iou_threshold: float,
     coverage_threshold: float,
+    *,
+    preserve_zero_offsets: bool = False,
 ) -> Tuple[Set[str], List[Dict[str, Any]], Set[int]]:
+    # Opt in for new protocols; retain frozen historical rescoring behavior.
+    def offset(row, key):
+        value = row.get(key)
+        return int(value) if preserve_zero_offsets and value is not None else int(value or -1)
     matched_gt_ids: Set[str] = set()
     matched_details: List[Dict[str, Any]] = []
     used_pred_idx: Set[int] = set()
 
     for gt in gt_entries:
-        g_start = int(gt.get("start_char") or -1)
-        g_end = int(gt.get("end_char") or -1)
+        g_start = offset(gt, "start_char")
+        g_end = offset(gt, "end_char")
         g_span_valid = bool(gt.get("span_valid")) and g_start >= 0 and g_end > g_start
         g_para_idx = int(gt.get("paragraph_index") or -1)
         g_para_valid = bool(gt.get("paragraph_valid")) and g_para_idx >= 1
@@ -632,8 +638,8 @@ def _match_by_location(
                     continue
                 if not bool(pred.get("span_valid")):
                     continue
-                p_start = int(pred.get("start_char") or -1)
-                p_end = int(pred.get("end_char") or -1)
+                p_start = offset(pred, "start_char")
+                p_end = offset(pred, "end_char")
                 if p_start < 0 or p_end <= p_start:
                     continue
 
@@ -653,8 +659,8 @@ def _match_by_location(
                     }
 
         if best_idx < 0 and g_para_valid:
-            g_ps = int(gt.get("paragraph_start_char") or -1)
-            g_pe = int(gt.get("paragraph_end_char") or -1)
+            g_ps = offset(gt, "paragraph_start_char")
+            g_pe = offset(gt, "paragraph_end_char")
             gt_text = str(gt.get("error_text") or "")
             gt_tokens = set(_tokenize(gt_text))
             for idx, pred in enumerate(pred_findings):
@@ -663,8 +669,8 @@ def _match_by_location(
                 p_para_idx = int(pred.get("paragraph_index") or -1)
                 if not bool(pred.get("paragraph_valid")):
                     continue
-                p_ps = int(pred.get("paragraph_start_char") or -1)
-                p_pe = int(pred.get("paragraph_end_char") or -1)
+                p_ps = offset(pred, "paragraph_start_char")
+                p_pe = offset(pred, "paragraph_end_char")
 
                 region_overlap_ok = False
                 region_score = 0.0
@@ -708,7 +714,7 @@ def _match_by_location(
                 {
                     "gt_error_id": gt_id,
                     "gt_span": [g_start, g_end],
-                    "pred_span": [int(pred.get("start_char") or -1), int(pred.get("end_char") or -1)],
+                    "pred_span": [offset(pred, "start_char"), offset(pred, "end_char")],
                     "iou": iou,
                     "gt_coverage": gt_cov,
                     "pred_coverage": pred_cov,
