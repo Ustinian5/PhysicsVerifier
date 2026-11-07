@@ -95,6 +95,20 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(t.responses(input="json", stream=True), response)
             self.assertEqual(t.output_tokens, 30)
 
+    def test_explicit_startup_timeout_recovers_without_relaxing_other_failures(self):
+        p,record=self.record(http_status=200,stream_error={
+            'code':'responses_startup_timeout','type':'timeout_error'})
+        self.assertEqual(failure_kind(record,self.out),'upstream_startup_timeout')
+        self.assertGreaterEqual(task_ready_at(p,record),record['started_unix']+601)
+        for changed in (
+            {'http_status':401}, {'http_status':429},
+            {'response':{'status':'completed'}}, {'response':{'status':'incomplete'}},
+            {'error':'response model identity mismatch'},
+            {'stream_error':{'code':'responses_startup_timeout','type':'rate_limit_error'}},
+        ):
+            with self.subTest(changed=changed):
+                self.assertIsNone(failure_kind({**record,**changed},self.out))
+
     def test_gateway_buffered_json_response_is_not_lost_or_retried(self):
         response=terminal()
         with self.client(lambda r:httpx.Response(200,json=response)):

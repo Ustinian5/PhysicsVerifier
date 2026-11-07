@@ -107,6 +107,8 @@ def failure_kind(record, folder):
         return "upstream_overload"
     if code == "ticket_wait_timeout" and error_type == "server_error" and error.get("status_code") == 503:
         return "upstream_queue_timeout"
+    if code == "responses_startup_timeout" and error_type == "timeout_error":
+        return "upstream_startup_timeout"
     if code in {"request_timeout", "server_error"}:
         return "upstream_timeout" if code == "request_timeout" else "upstream_error"
     if "Missing usage" in str(record.get("error", "")):
