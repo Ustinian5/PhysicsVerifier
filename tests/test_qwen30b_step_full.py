@@ -8,6 +8,33 @@ from scripts import run_qwen30b_step_full as f
 
 
 class FullStepTests(unittest.TestCase):
+    def test_full_skills_build_uses_same_cases_and_resumes_without_calls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            rows = [dict(id=str(i), question='Use the previous gas-cycle question.', prediction='30B answer', context='') for i in range(13)]
+            cases = [dict(id='case_'+r['id'], source_ids=[r['id']], text='Original Q, 30B answer, 120B audit '+r['id']) for r in rows]
+            for name, value in [('sources',rows),('cases',cases),('bench_questions',[{'id':'held','question':'An independent charged insulating sphere oscillates in an externally specified electromagnetic field.'}]),('plan',{})]:
+                f.vr.atomic(out/(name+'.json'),value)
+            config = {'model': {'model':f.base.r.EXPECTED_MODEL,'api_base':'http://unused',
+                'max_tokens':f.knowledge.PASS_OUTPUT_TOKENS,'reasoning_effort':'medium',
+                'max_requests':39,'attempts_per_job':3},
+                'budget_limits':{'requests':39,'input_tokens':100000,'output_tokens':100000},
+                'prior_usage':f.base.old.ZERO_USAGE,'source_count':13,
+                'source_plan_sha256':f.vr.sha(out/'plan.json'),'skill_prompt':f.knowledge.SKILL_PROMPT}
+            f.vr.atomic(out/'skills_plan.json',{'configuration':config,'configuration_sha256':f.vr.digest(config)})
+            seen=[]
+            def mock_call(journal, stage, key, payload):
+                self.assertEqual(payload['case'], cases[int(key)])
+                seen.append(key)
+                return {'skills':[{'title':'Check '+key,'text':'Independently derive the gas-cycle work and compare its sign. '+key}]}
+            with patch.object(f.followup.BoundedSkillJournal,'__call__',mock_call):
+                a=f.skills(out,{},None)
+                b=f.skills(out,{},None)
+            self.assertEqual(len(seen),13)
+            self.assertEqual(len(a.docs),len(b.docs))
+            self.assertGreater(len(a.docs),0)
+            self.assertFalse(f.vr.read(out/'skills/pilot_review.json')['physical_quality_passed'])
+
     def test_cohort_screen_retains_real_leakage_but_not_unrelated_parent_sentinel(self):
         held=[{'id':'test','question':'The finite charged sphere inside a concentric insulating enclosure is surrounded by a second grounded conductor with radius twice that of the first sphere.'}]
         screen=f.CohortScreen(held)
