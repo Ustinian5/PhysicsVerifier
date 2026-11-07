@@ -6,7 +6,7 @@
 
 - `run_qwen30b_step_verifier.py prepare/verify/generate/confirm-detached/export --output <根目录>`：隔离并冻结问题，新生成30B回答；默认仅6题，`--full`须已有小样本验收记录。
 - `run_qwen30b_step_checks.py prepare/verify/run/confirm-detached --output <根目录/checks_pilot>`：纯120B与原题源规则树连续检查；prepare需指定`--source <生成根目录> --catalog <已绑定原题源catalog.json>`。
-- `run_bench_reannotation.py --source <新30B annotation_inputs.json> --output <annotation_pilot> --env <私密配置> --mode pilot --expected-count 6 --pilot-size 6`：独立Sol high四轮标注，不启动全量。
+- `run_bench_reannotation.py --source <新30B annotation_inputs.json> --output <annotation_pilot> --env <私密配置> --mode pilot --expected-count 6 --pilot-size 6 --recover-technical`：独立Sol high四轮标注，不启动全量。
 - `start_qwen30b_step_service.sh`与`start_oss120b_step_service.sh`为个人服务器启动器，环境/模型/端口需按已核验资源使用；120B通过`serve_fixed_date_vllm.py`固定服务实际日期。
 
 生成、检查均须后台运行后从新SSH执行`confirm-detached`；成功项不可重复生成。原始请求、响应及计划保存在指定结果目录。当前6题是工程验收，不是独立测试或完整四组结果。
