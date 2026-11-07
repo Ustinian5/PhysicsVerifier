@@ -8,6 +8,44 @@ from scripts import run_qwen30b_step_full as f
 
 
 class FullStepTests(unittest.TestCase):
+    def reviewed_fixture(self):
+        old=[dict(id='pilot',question='A ball falls freely in vacuum.',context=''),
+             dict(id='bad',question='Calculate the missing value from the diagram.',context='')]
+        pool=[dict(id='new1',question='What is the latent heat released by condensation of steam?'),
+              dict(id='new2',question='An ideal gas expands adiabatically and reversibly.')]
+        review={'status':'review_complete','human_gold':False,'selection_uses_diagnostic_scores':False,
+                'formal_answers_generated_at_review':0,'target_count':2,'pilot_only_ids':['pilot'],
+                'replacement_order':['new1','new2'],
+                'entries':[dict(id=r['id'],question_sha256=f.vr.digest(r['question']),
+                    decision='keep' if i==0 else 'exclude',reason='input review') for i,r in enumerate(old)],
+                'replacement_reviews':[dict(order=i,id=r['id'],question_sha256=f.vr.digest(r['question']),
+                    decision='keep',reason='complete physical inputs') for i,r in enumerate(pool)]}
+        return old,pool,{'candidate_ids':['new1','new2'],'rejected':{}},review
+
+    def test_review_replenishes_in_order_and_keeps_even_complete_pilot_separate(self):
+        old,pool,iso,review=self.reviewed_fixture()
+        rows,_=f.reviewed_questions(old,pool,iso,review,['pilot'],2)
+        self.assertEqual([r['id'] for r in rows],['new1','new2'])
+        for mutate in ('order','text','scores'):
+            changed=copy.deepcopy(review)
+            if mutate=='order': changed['replacement_reviews'].reverse()
+            elif mutate=='text': changed['replacement_reviews'][0]['question_sha256']='different'
+            else: changed['selection_uses_diagnostic_scores']=True
+            with self.assertRaises(ValueError):f.reviewed_questions(old,pool,iso,changed,['pilot'],2)
+
+    def test_review_does_not_fill_with_same_family_or_incomplete_inputs(self):
+        old,pool,iso,review=self.reviewed_fixture()
+        pool[1]['question']=pool[0]['question']
+        review['replacement_reviews'][1]['question_sha256']=f.vr.digest(pool[1]['question'])
+        with self.assertRaisesRegex(ValueError,'Insufficient'):
+            f.reviewed_questions(old,pool,iso,review,['pilot'],2)
+
+    def test_cohort_cannot_be_changed_after_formal_calls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out=Path(tmp);(out/'STOP').touch();(out/'raw').mkdir()
+            with self.assertRaisesRegex(ValueError,'executed batch'):
+                f.revise_cohort(out)
+
     def test_full_skills_build_uses_same_cases_and_resumes_without_calls(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)

@@ -102,6 +102,129 @@ def select_questions(existing, original_pool, materials, old_questions, count=10
                     'semantic_family_independence_proven': False}
 
 
+def reviewed_questions(old_rows, original_pool, old_isolation, review, pilot_ids, count=100):
+    """Select from input-only reviews in the already frozen order, never by outputs."""
+    require(review['status'] == 'review_complete' and review['human_gold'] is False and
+            review['selection_uses_diagnostic_scores'] is False and
+            review['formal_answers_generated_at_review'] == 0 and
+            review['target_count'] == count and set(review['pilot_only_ids']) == set(pilot_ids),
+            'Input review is incomplete or used outcome-based selection')
+    entries = review['entries']; pool = {r['id']: r for r in original_pool}
+    require([e['id'] for e in entries] == [r['id'] for r in old_rows] and
+            len(pool) == len(original_pool), 'Review/source ID mismatch')
+    old_ids = {r['id'] for r in old_rows}
+    order = [i for i in old_isolation['candidate_ids']
+             if i not in old_ids and i not in old_isolation['rejected']]
+    extra = review['replacement_reviews']
+    require(review['replacement_order'] == order and
+            [e['id'] for e in extra] == order[:len(extra)] and
+            [e['order'] for e in extra] == list(range(len(extra))), 'Replacement order changed')
+    candidates = list(old_rows)+[dict(id=e['id'], question=pool[e['id']]['question'], context='') for e in extra]
+    chosen, rejected = [], {}
+    for row, entry in zip(candidates, entries+extra):
+        require(entry['question_sha256'] == vr.digest(row['question']) and
+                entry['decision'] in {'keep','exclude'} and entry.get('reason'), 'Unreviewed/changed question')
+        if row['id'] in pilot_ids or entry['decision'] != 'keep':
+            continue
+        hits = CohortScreen(chosen).matches(row) if chosen else []
+        reverse = CohortScreen([row])
+        hits += [h for other in chosen for h in reverse.matches(other)]
+        if hits:
+            rejected[row['id']] = hits
+        elif len(chosen) < count:
+            chosen.append(row)
+    require(len(chosen) == count, 'Insufficient complete isolated questions; continue input review in fixed order')
+    return chosen, rejected
+
+
+def revise_cohort(out):
+    """User-authorized pre-call correction; original six-case evidence stays untouched."""
+    with base.r.run_lock(out/'active.lock'):
+        require((out/'STOP').exists(), 'Hold execution before cohort correction')
+        require(not any((out/n).exists() for n in ('generated','raw','checks','annotations','skills')),
+                'An executed batch cannot replace questions')
+        require(not (out/'cohort_revision.json').exists(), 'Cohort already revised; do not overwrite its receipt')
+        previous = vr.read(out/'plan.json'); c = previous['configuration']
+        require(vr.digest(c) == previous['configuration_sha256'], 'Previous plan drift')
+        for n,h in c['frozen_files'].items(): require(vr.sha(out/n)==h, 'Previous input drift: '+n)
+        for n,h in c['source_files'].items(): require(vr.sha(ROOT/n)==h, 'Source drift: '+n)
+        review = vr.read(out/'question_review.json')
+        require(review['original_questions_sha256'] == vr.sha(out/'questions.json'), 'Review belongs to other cohort')
+        rows, pair_rejections = reviewed_questions(vr.read(out/'questions.json'),
+            vr.read(ROOT/POOL/'question_pool.json'), vr.read(out/'isolation.json'), review, c['pilot_ids'])
+        materials = list(visible_materials(ROOT/cohort.BUILD)); screen = CohortScreen(rows)
+        overlaps = []
+        for i, row in enumerate(materials):
+            hits = screen.matches(row)
+            if hits: overlaps.append(dict(source_id=row['id'], matches=hits))
+            if i % 300 == 0: print('revised cohort isolation', i, len(materials), flush=True)
+        require(not overlaps, 'New cohort overlaps construction material; do not relax isolation')
+        refs = {r['id']: r for r in vr.read(ROOT/POOL/'reference_pool.json')}
+        refs.update({r['id']:r for r in vr.read(out/'reference_answers.json')})
+        isolation = {'heldout_questions':len(rows), 'overlaps':overlaps,
+            'heldout_isolation_passed':True, 'visible_material_count':len(materials),
+            'library_source_hashes':c['source_files'], 'pair_rejections':pair_rejections,
+            'retained_old':sum(r['id'] in set(c['sample_ids']) for r in rows),
+            'added':sum(r['id'] not in set(c['sample_ids']) for r in rows),
+            'pilot_reused':0, 'selection_uses_new_answers_or_labels':False,
+            'semantic_family_independence_proven':False,
+            'question_review_sha256':vr.sha(out/'question_review.json')}
+        # Preserve the previous uncalled freeze in one provenance receipt, not parallel runs.
+        receipt = {'reason':'User approved input-completeness screening and deterministic original-pool replacement; six cases remain pilot only.',
+            'model_calls_before_revision':0, 'previous_plan':previous,
+            'previous_files':{n:(out/n).read_text() for n in
+                ('questions.json','reference_answers.json','isolation.json','bench_questions.json',
+                 'skills_plan.json','construction_acceptance.json')},
+            'question_review_sha256':vr.sha(out/'question_review.json'), 'created_unix':time.time()}
+        vr.atomic(out/'cohort_revision.json',receipt)
+        for n,v in [('questions',rows),('bench_questions',rows),
+                    ('reference_answers',[refs[r['id']] for r in rows]),('isolation',isolation)]:
+            vr.atomic(out/(n+'.json'),v)
+        updated = copy.deepcopy(c)
+        updated.update(source_hashes=code_hashes(), sample_ids=[r['id'] for r in rows], pilot_ids=[],
+            selection='Input-completeness-reviewed original pool; six pilot cases excluded; frozen hash order replenishment')
+        updated['frozen_files'] = {n:vr.sha(out/n) for n in c['frozen_files']}
+        updated['frozen_files']['question_review.json'] = vr.sha(out/'question_review.json')
+        updated['frozen_files']['cohort_revision.json'] = vr.sha(out/'cohort_revision.json')
+        vr.atomic(out/'plan.json',{'configuration':updated,'configuration_sha256':vr.digest(updated)})
+        sp = vr.read(out/'skills_plan.json'); sp['configuration']['source_plan_sha256']=vr.sha(out/'plan.json')
+        sp['configuration_sha256']=vr.digest(sp['configuration']);vr.atomic(out/'skills_plan.json',sp)
+        # The former acceptance was bound to different held-out questions, and cannot authorize calls.
+        (out/'construction_acceptance.json').unlink()
+        return verify(out)
+
+
+def accept_revised_construction(out, audit_path):
+    """Retain the completed construction audit and bind a fresh held-out scan."""
+    require(Path('/proc').exists(), 'Construction acceptance is server-only')
+    with base.r.run_lock(out/'active.lock'):
+        require((out/'STOP').exists(), 'Hold execution before acceptance')
+        plan = verify(out); c = plan['configuration']
+        receipt = vr.read(out/'cohort_revision.json'); audit = vr.read(audit_path)
+        prior = json.loads(receipt['previous_files']['construction_acceptance.json'])
+        require(prior['passed'] and prior['configuration_sha256']==receipt['previous_plan']['configuration_sha256']
+                and prior['evidence'].get(str(audit_path.resolve()))==vr.sha(audit_path)
+                and audit['provenance_passed'] and audit['original_source_only'], 'Prior source audit is not accepted')
+        evidence = {str(audit_path.resolve()):vr.sha(audit_path)}
+        for n,h in prior['evidence'].items():
+            # The old question bytes are retained in the revision, not at the newly frozen path.
+            if Path(n).resolve() == (out/'questions.json').resolve(): continue
+            require(vr.sha(Path(n))==h, 'Prior construction source changed: '+n)
+            evidence[n]=h
+        isolation = vr.read(out/'isolation.json')
+        require(isolation['heldout_isolation_passed'] and not isolation['overlaps'] and
+                isolation['library_source_hashes']==c['source_files'] and
+                isolation['question_review_sha256']==vr.sha(out/'question_review.json'), 'New heldout scan differs')
+        for n in ('questions.json','isolation.json','question_review.json','cohort_revision.json','catalog.json'):
+            evidence[str((out/n).resolve())]=vr.sha(out/n)
+        accepted = copy.deepcopy(prior)
+        accepted.update(configuration_sha256=plan['configuration_sha256'],
+            heldout_questions_sha256=vr.sha(out/'questions.json'), evidence=evidence,
+            scope_note='Original-only v5 construction audit retained; revised 100 complete question faces re-screened against all visible construction inputs/audits/catalog. Six cases pilot only.')
+        vr.atomic(out/'construction_acceptance.json',accepted)
+        return construction_acceptance(out, plan)
+
+
 def prepare(out, pilot):
     out.mkdir(parents=True, exist_ok=True)
     with base.r.run_lock(out/'active.lock'):
@@ -190,6 +313,12 @@ def verify(out, acceptance=False):
         require(a.get('passed') is True and a['configuration_sha256'] == vr.read(pilot/'plan.json')['configuration_sha256']
                 and a.get('semantic_review_passed') is True, 'Six-question semantic acceptance required')
         for n, h in a['evidence'].items(): require(vr.sha(pilot/n) == h, 'Acceptance evidence drift')
+        if a.get('pilot_primary_metrics_ready') is False:
+            require(a.get('scope') == 'engineering_and_semantic_workflow_only' and not c['pilot_ids'] and
+                    not (set(c['sample_ids']) & set(a['pilot_only_ids'])) and
+                    a.get('approved_full_configuration_sha256') == plan['configuration_sha256'] and
+                    'question_review.json' in c['frozen_files'],
+                    'Uncertain pilot cannot release metrics or be reused as formal cases')
     return plan
 
 
@@ -496,14 +625,16 @@ def prepare_annotations(out, env):
             else: folder.symlink_to(os.path.relpath(source, folder.parent), target_is_directory=True)
     audit = teacher.audit(target, rows, manifest)
     vr.atomic(target/'reuse_receipt.json', {'pilot_manifest_sha256': vr.sha(prior/'manifest.json'),
-        'pilot_ids': sorted(oldrows), 'reused_complete_tasks': sum(audit['completed'].values()),
+        'pilot_ids': sorted({r['id'] for r in rows} & set(oldrows)),
+        'reused_complete_tasks': sum(audit['completed'].values()),
         'new_model_calls': 0, 'prior_failed_attempts_and_unknown_usage_retained': True,
-        'mode_note': 'legacy runner pilot_size=100 executes all 100 questions; six-question gate accepted separately'})
+        'mode_note': 'legacy runner pilot_size=100 executes all 100 questions; separate six-question pilot evidence is retained'})
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('command', choices=['prepare','verify','generate','export','confirm-detached','checks','annotations','accept-construction'])
+    p.add_argument('command', choices=['prepare','verify','generate','export','confirm-detached','checks','annotations',
+                                     'accept-construction','revise-cohort','accept-revised-construction'])
     p.add_argument('--output', type=Path, required=True); p.add_argument('--pilot', type=Path)
     p.add_argument('--env', type=Path, default=ROOT/'.env')
     p.add_argument('--audit', type=Path)
@@ -515,6 +646,8 @@ def main():
     elif a.command == 'checks': run_checks(out)
     elif a.command == 'annotations': prepare_annotations(out, a.env)
     elif a.command == 'accept-construction': accept_construction(out, a.audit.resolve())
+    elif a.command == 'revise-cohort': revise_cohort(out)
+    elif a.command == 'accept-revised-construction': accept_revised_construction(out, a.audit.resolve())
     else: confirm(out)
 
 

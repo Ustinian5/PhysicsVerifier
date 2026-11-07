@@ -1,11 +1,13 @@
 # 脚本入口
 
-当前路线与状态见[项目进展](../docs/项目进展.md)。当前先运行原题源内新30B回答的步骤级小样本验收，题级扩展暂缓；下面的历史入口不能直接启动新实验。Python统一使用conda环境。
+当前路线与状态见[项目进展](../docs/项目进展.md)。6题试跑已完成并保留缺题设未决；正式100题已重新审题、隔离和冻结，全部新生成30B回答，题级扩展暂缓。下面的历史入口不能直接启动新实验。Python统一使用conda环境。
 
 ## 当前步骤级验收入口
 
 - `run_qwen30b_step_verifier.py prepare/verify/generate/confirm-detached/export --output <根目录>`：隔离并冻结问题，新生成30B回答；默认仅6题，`--full`须已有小样本验收记录。
 - `run_qwen30b_step_checks.py prepare/verify/run/confirm-detached --output <根目录/checks_pilot>`：纯120B与原题源规则树连续检查；prepare需指定`--source <生成根目录> --catalog <已绑定原题源catalog.json>`。
+- `run_qwen30b_step_full.py verify/generate/export/checks/annotations/confirm-detached --output <根目录/full>`：正式100题生成、四组连续检查、独立标注准备。需绑定建库来源验收和试跑流程验收；本次6题不纳入正式集。`revise-cohort`仅用于用户批准且0正式调用时的输入完整性更正，保留旧冻结关联；`accept-revised-construction --audit <来源核验>`在服务器绑定新题面隔离。生成后Sol标注使用`--expected-count 100 --pilot-size 100 --mode pilot`执行全部100题的四轮任务，此处pilot是旧执行器模式名，不表示再抽6题。
+- `run_step_full_pipeline.py prepare/run/confirm-detached/verify --output <根目录/full>`：串接已冻结的100题生成、独立标注、skills与四组检查、语义评测。prepare绑定`--generator-pid`、`--service-pid`及源码哈希，平台配置仅从进程环境读取；协调器独立后台启动并从新SSH确认，后续检查在同一已验证进程中执行。各阶段失败保留断点，不轮换模型/密钥、不替换题；GPU忙时停止相应步骤，不抢占。进度读`full/pipeline/execution_status.json`，各子任务原件分别保存。
 - `score_step_semantic.py prepare --checks <checks_pilot> --annotations <annotation_pilot> --output <semantic_pilot> --env <env>`：四轮独立标签完成后冻结盲化语义评审输入；`run --output ... --env ...`以Sol high匹配并复核，成功项不重跑；可加`--wait-annotations --checks ... --annotations ...`串行等待现有标注任务，标注停止但不完整时不发起评审；`score --output ...`离线计算一对一语义指标。服务器镜像可用`--relocate-source-root <原结果根> <服务器结果根>`核验相同哈希，争议未解决不发布正式主指标。
 - `run_bench_reannotation.py --source <新30B annotation_inputs.json> --output <annotation_pilot> --env <私密配置> --mode pilot --expected-count 6 --pilot-size 6 --recover-technical`：独立Sol high四轮标注，不启动全量。
 - `start_qwen30b_step_service.sh`与`start_oss120b_step_service.sh`为个人服务器启动器，环境/模型/端口需按已核验资源使用；120B通过`serve_fixed_date_vllm.py`固定服务实际日期。
