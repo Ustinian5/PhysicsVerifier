@@ -1,8 +1,14 @@
 # 脚本入口
 
-当前状态见[项目进展](../docs/项目进展.md)。2026-11-07用户要求暂停：本轮沿用的层级BM25与共享PREPARE未经流程变更确认。以下命令仅供审查，禁止启动或自动恢复；先核实服务器停机，再由用户确认恢复方案。
+当前状态见[项目进展](../docs/项目进展.md)。2026-11-07用户批准更正方案并授权执行；旧full/STOP保留，旧协调器不得恢复。
 
-## 当前步骤级验收入口
+## 已批准的独立生成入口
+
+`run_corrected_step_generation.py prepare --output <corrected/bench_generation> --prior <full> --inventory <source_question_inventory.json>`：绑定原源映射的同一100题，逐项核验旧回答的完整请求、模型、采样及响应哈希，只复用一致的32份。`run --output ...`在服务器独立后台执行；退出SSH后用`confirm-detached --output ...`放行，缺项从原协议断点补齐。`verify --output ...`离线核验，不调用模型。
+
+该入口仅生成bench回答，不引用旧知识库、不启动标签/检查/语义评分。2500题建库和新四组工具会话仍须完成冻结及试跑。30B启动器允许用STEP_RUN_ROOT指定本轮服务证据目录、STEP_CACHE_ROOT指定个人快速缓存，GPU仍须显式指定空闲卡及UUID。
+
+## 原批次入口（仅追溯，不恢复旧批量）
 
 - `run_qwen30b_step_verifier.py prepare/verify/generate/confirm-detached/export --output <根目录>`：隔离并冻结问题，新生成30B回答；默认仅6题，`--full`须已有小样本验收记录。
 - `run_qwen30b_step_checks.py prepare/verify/run/confirm-detached --output <根目录/checks_pilot>`：纯120B与原题源规则树连续检查；prepare需指定`--source <生成根目录> --catalog <已绑定原题源catalog.json>`。

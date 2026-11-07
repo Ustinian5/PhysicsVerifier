@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Separate logs/lock; reuse verified personal weights without copying old runs.
 set -euo pipefail
-RUN=/slow_share2/huhengyuan/physicsverifier_results/qwen30b_step_verifier
+RUN=${STEP_RUN_ROOT:-/slow_share2/huhengyuan/physicsverifier_results/qwen30b_step_verifier}
+export STEP_RUN_ROOT="$RUN"
 ENV=/home/visitor/huhengyuan/envs/physicsverifier
 export CONDA_PREFIX="$ENV" PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH=/home/visitor/huhengyuan/envs/vllm_gptoss120b/lib/python3.10/site-packages
 export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="${STEP_GPU_INDEX:?set free GPU index}"
 export STEP_GPU_UUID="${STEP_GPU_UUID:?set expected GPU UUID}"
-export XDG_CACHE_HOME=/slow_share2/huhengyuan/cache/qwen30b_steps
+export XDG_CACHE_HOME="${STEP_CACHE_ROOT:-/slow_share2/huhengyuan/cache/qwen30b_steps}"
 export TMPDIR="$XDG_CACHE_HOME/tmp" HF_HOME="$XDG_CACHE_HOME/huggingface"
 export VLLM_CACHE_ROOT="$XDG_CACHE_HOME/vllm" TRITON_CACHE_DIR="$XDG_CACHE_HOME/triton"
 export NO_PROXY=127.0.0.1,localhost
@@ -18,7 +19,7 @@ echo "$$" > "$RUN/service/launcher.pid"
 trap 'echo "$?" > "$RUN/service/exit_code"; rm -f "$RUN/service/launcher.pid"' EXIT
 "$ENV/bin/python" - <<'PY'
 import hashlib,json,os,pathlib,socket,subprocess,time
-root=pathlib.Path('/slow_share2/huhengyuan/physicsverifier_results/qwen30b_step_verifier/service')
+root=pathlib.Path(os.environ['STEP_RUN_ROOT'])/'service'
 manifest=pathlib.Path('/slow_share2/huhengyuan/physicsverifier_results/qwen30b_corpus/service/checkpoint_manifest.json')
 prior=json.loads(manifest.read_text())
 assert prior['complete']
