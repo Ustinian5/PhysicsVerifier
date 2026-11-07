@@ -24,6 +24,7 @@ from scripts.experiment_manifest import sha256_file
 VERSION = 'step_semantic_root_matching_v1'
 INPUT_SUFFIX = '\nReturn only a JSON object matching the required schema.'
 LEGACY_CODE_SHA256 = 'adbbc77c18d268e743932dc1013f1dd090fea7baf56ef8fbcec44546b5abc395'
+SCHEMA_LEGACY_CODE_SHA256 = '2f8ded82b4059e607eb651114ddd7b09cdf8a07f7e508bfc9e4e9db38bffb761'
 ROOT = Path(__file__).resolve().parents[1]
 STAGES = ('match', 'audit')
 SYSTEM = """You evaluate physics error diagnoses, not the method that produced them.
@@ -200,7 +201,15 @@ def prepare(out, checks, annotations, endpoint):
 def verify(out, endpoint=None, relocate=None):
     m = read(out / 'manifest.json')
     require(m['configuration_sha256'] == digest({k: v for k, v in m.items() if k != 'configuration_sha256'}), 'Manifest changed')
-    require(m['protocol'] == VERSION and m['source_code'] == code_hashes()
+    current_code = code_hashes()
+    if m['source_code'] != current_code:
+        receipt = read(out/'runtime_recovery.json')
+        require(receipt['previous_source_code'] == m['source_code'] and receipt['source_code'] == current_code
+                and receipt['manifest_sha256'] == sha256_file(out/'manifest.json')
+                and receipt['policy'] == 'allow_absent_quote_only_for_non_error_or_unresolved', 'Runtime repair drift')
+        for name, sha in receipt['preserved_files'].items():
+            require(sha256_file(out/name) == sha, 'Preserved prefix changed')
+    require(m['protocol'] == VERSION
             and m['prompt_sha256'] == digest([SYSTEM, TASKS]) and m['runtime_policy'] == POLICY, 'Scoring protocol/code drift')
     require(m.get('input_suffix') == INPUT_SUFFIX, 'JSON input format correction required')
     if endpoint is not None:
@@ -229,7 +238,8 @@ def validate_judgment(value, case):
         if item['verdict'] == 'accepted':
             accepted.add(item['root_id'])
     for item in js:
-        verdict, links, quote = item['verdict'], item.get('compatible_root_ids'), item.get('evidence_quote')
+        verdict, links = item['verdict'], item.get('compatible_root_ids')
+        quote = item.get('evidence_quote', '' if verdict in {'non_error', 'unresolved'} else None)
         require(verdict in {'matched', 'non_error', 'unresolved', 'reference_gap'}, 'Invalid candidate verdict')
         require(isinstance(links, list) and all(isinstance(x, str) for x in links)
                 and len(links) == len(set(links)) and set(links) <= accepted, 'Invalid compatible roots')
@@ -308,6 +318,41 @@ def recovered_format_request(out, path, rec, body):
             'Format-recovery evidence changed')
     validate_request(rec, body, legacy=True)
     return True
+
+
+def recover_quote_schema(out):
+    """Use a complete returned judgment; never reroll it for an optional quote."""
+    with (out/'runner.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        m = read(out/'manifest.json'); expected = dict(code_hashes())
+        expected['scripts/score_step_semantic.py'] = SCHEMA_LEGACY_CODE_SHA256
+        require(m['source_code'] == expected and not (out/'runtime_recovery.json').exists(),
+                'Only the known optional-quote validator may be repaired')
+        cases = read(out/'blind_inputs.json'); files = {}; repaired = []
+        for case in cases:
+            prior = None
+            for stage in STAGES:
+                folder = out/('arm_'+stage)/case['id']
+                if (folder/'result.json').exists():
+                    prior = saved_judgment(out, case, stage, prior)
+                    files[str((folder/'result.json').relative_to(out))] = sha256_file(folder/'result.json')
+                    continue
+                body = body_for(case, stage, prior)
+                for path in sorted(folder.glob('request_*.json')):
+                    rec = read(path)
+                    if (rec.get('response') or {}).get('status') != 'completed': continue
+                    value = judgment_from_raw(path, body, case)
+                    require(any('evidence_quote' not in j and j['verdict'] in {'non_error','unresolved'}
+                                for j in value['judgments']), 'Unrelated content failure; no repair')
+                    repaired.append(str(path.relative_to(out)))
+                break
+        require(bool(repaired), 'No complete judgment with optional quote omitted')
+        for path in out.glob('arm*/*/request_*.json'): files[str(path.relative_to(out))] = sha256_file(path)
+        write_json(out/'runtime_recovery.json', {'policy':'allow_absent_quote_only_for_non_error_or_unresolved',
+            'manifest_sha256':sha256_file(out/'manifest.json'), 'previous_source_code':m['source_code'],
+            'source_code':code_hashes(), 'preserved_files':files, 'completed_raw_to_replay':repaired,
+            'model_calls':0,'response_or_reference_edits':0,'updated_unix':time.time()})
+        return verify(out)
 
 
 def judgment_from_raw(path, body, case):
@@ -521,7 +566,7 @@ def await_annotations(out, annotations):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('command', choices=['prepare', 'verify', 'run', 'score', 'recover-json-format'])
+    p.add_argument('command', choices=['prepare', 'verify', 'run', 'score', 'recover-json-format', 'recover-quote-schema'])
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--checks', type=Path); p.add_argument('--annotations', type=Path)
     p.add_argument('--env', type=Path)
@@ -556,6 +601,7 @@ def main():
             run(out, os.environ['OPENAI_BASE_URL'], os.environ['OPENAI_API_KEY'])
     elif a.command == 'verify': verify(out, relocate=a.relocate_source_root)
     elif a.command == 'recover-json-format': recover_json_format(out)
+    elif a.command == 'recover-quote-schema': recover_quote_schema(out)
     else: score(out, relocate=a.relocate_source_root)
 
 

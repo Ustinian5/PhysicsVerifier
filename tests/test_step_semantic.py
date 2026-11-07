@@ -33,6 +33,18 @@ def mapping():
 
 
 class SemanticScoringTests(unittest.TestCase):
+    def test_only_nonmatched_judgments_allow_omitted_quotes_without_rewriting(self):
+        value = judgment()
+        for item in value['judgments']:
+            item.update(verdict='non_error', compatible_root_ids=[])
+            item.pop('evidence_quote')
+        before=copy.deepcopy(value)
+        self.assertEqual(s.validate_judgment(value,case()),before)
+        for verdict in ['matched','reference_gap']:
+            bad=copy.deepcopy(value);bad['judgments'][0]['verdict']=verdict
+            bad['judgments'][0]['compatible_root_ids']=['E1'] if verdict=='matched' else []
+            with self.assertRaises(ValueError):s.validate_judgment(bad,case())
+
     def test_server_evidence_relocation_requires_same_hash_and_containment(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); (root / 'raw.json').write_text('{}')
