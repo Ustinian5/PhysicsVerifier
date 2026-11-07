@@ -124,7 +124,7 @@ class SemanticScoringTests(unittest.TestCase):
     def test_wrong_model_effort_or_request_cannot_be_replayed(self):
         body = s.body_for(case(), 'match', None)
         request = {'model': s.teacher.MODEL, 'reasoning': {'effort': 'high'}, 'max_output_tokens': 16384,
-                   'store': False, 'instructions': s.SYSTEM, 'input': s.canonical(body),
+                   'store': False, 'instructions': s.SYSTEM, 'input': s.canonical(body) + s.INPUT_SUFFIX,
                    'text': {'format': {'type': 'json_object'}}, 'stream': True}
         record = {'endpoint': '/responses', 'request': request, 'response': {
             'id': 'r1', 'model': s.teacher.MODEL, 'reasoning': {'effort': 'high'},
@@ -142,10 +142,21 @@ class SemanticScoringTests(unittest.TestCase):
                 p.write_text(json.dumps(changed))
                 with self.assertRaises(ValueError): s.judgment_from_raw(p, body, case())
 
+    def test_format_recovery_does_not_accept_overload_or_completed_response(self):
+        rec = {'http_status': 429, 'response': {'error': {
+            'type': 'invalid_request_error', 'param': 'input',
+            'message': "Response input messages must contain the word 'json' to use json_object."}}}
+        self.assertTrue(s.json_format_rejection(rec))
+        for field, value in [('id', 'generated-response'), ('output', [{}]), ('usage', {'input_tokens': 1})]:
+            changed = copy.deepcopy(rec); changed['response'][field] = value
+            self.assertFalse(s.json_format_rejection(changed))
+        rec['response']['error']['type'] = 'rate_limit_error'
+        self.assertFalse(s.json_format_rejection(rec))
+
     def test_completed_invalid_judgment_is_not_rerolled_on_resume(self):
         c = case(); body = s.body_for(c, 'match', None)
         request = {'model': s.teacher.MODEL, 'reasoning': {'effort': 'high'}, 'max_output_tokens': 16384,
-                   'store': False, 'instructions': s.SYSTEM, 'input': s.canonical(body),
+                   'store': False, 'instructions': s.SYSTEM, 'input': s.canonical(body) + s.INPUT_SUFFIX,
                    'text': {'format': {'type': 'json_object'}}, 'stream': True}
         record = {'endpoint': '/responses', 'request': request, 'started_unix': 1,
                   'response': {'id': 'r1', 'model': s.teacher.MODEL, 'reasoning': {'effort': 'high'},

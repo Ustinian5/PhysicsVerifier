@@ -22,6 +22,8 @@ from scripts.run_retrieval_comparison import BatchBudget, Transport, canonical, 
 from scripts.experiment_manifest import sha256_file
 
 VERSION = 'step_semantic_root_matching_v1'
+INPUT_SUFFIX = '\nReturn only a JSON object matching the required schema.'
+LEGACY_CODE_SHA256 = 'adbbc77c18d268e743932dc1013f1dd090fea7baf56ef8fbcec44546b5abc395'
 ROOT = Path(__file__).resolve().parents[1]
 STAGES = ('match', 'audit')
 SYSTEM = """You evaluate physics error diagnoses, not the method that produced them.
@@ -187,7 +189,7 @@ def prepare(out, checks, annotations, endpoint):
                            'output_tokens': max(1, tasks * 6 * 16384)},
                 'platform_quota_floor': 1000000, 'runtime_policy': POLICY,
                 'human_gold': False, 'independent_test': False,
-                'reference_mutation_allowed': False,
+                'reference_mutation_allowed': False, 'input_suffix': INPUT_SUFFIX,
                 'denominator': 'all published diagnoses; duplicates retained',
                 'reference_disputes': 'block final primary metrics, never silently relabel'}
     manifest['configuration_sha256'] = digest(manifest)
@@ -200,6 +202,7 @@ def verify(out, endpoint=None, relocate=None):
     require(m['configuration_sha256'] == digest({k: v for k, v in m.items() if k != 'configuration_sha256'}), 'Manifest changed')
     require(m['protocol'] == VERSION and m['source_code'] == code_hashes()
             and m['prompt_sha256'] == digest([SYSTEM, TASKS]) and m['runtime_policy'] == POLICY, 'Scoring protocol/code drift')
+    require(m.get('input_suffix') == INPUT_SUFFIX, 'JSON input format correction required')
     if endpoint is not None:
         require(m['endpoint_sha256'] == digest(endpoint), 'Endpoint drift')
     for file, value in m['source_files'].items():
@@ -240,12 +243,71 @@ def body_for(case, stage, prior):
     return {'task': TASKS[stage], 'case': case, 'prior_judgments': prior}
 
 
-def validate_request(rec, body):
+def validate_request(rec, body, legacy=False):
     request = rec.get('request', {})
     expected = {'model': teacher.MODEL, 'reasoning': {'effort': 'high'}, 'max_output_tokens': 16384,
-                'store': False, 'instructions': SYSTEM, 'input': canonical(body),
+                'store': False, 'instructions': SYSTEM, 'input': canonical(body) + ('' if legacy else INPUT_SUFFIX),
                 'text': {'format': {'type': 'json_object'}}, 'stream': True}
     require(rec.get('endpoint') == '/responses' and request == expected, 'Raw request differs from protocol')
+
+
+def json_format_rejection(rec):
+    response = rec.get('response') or {}; error = response.get('error') or {}
+    message = str(error.get('message', '')).lower()
+    return (rec.get('http_status') in {400, 429} and error.get('type') == 'invalid_request_error'
+            and error.get('param') == 'input' and 'must contain the word' in message
+            and 'json_object' in message and 'json' in message
+            and not response.get('id') and not response.get('output') and not response.get('usage'))
+
+
+def recover_json_format(out):
+    """One explicit pre-generation correction, never a generic 429 retry."""
+    with (out / 'runner.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        old = read(out / 'manifest.json'); current = code_hashes()
+        expected = dict(current, **{'scripts/score_step_semantic.py': LEGACY_CODE_SHA256})
+        require(old['configuration_sha256'] == digest({k:v for k,v in old.items() if k!='configuration_sha256'})
+                and old['source_code'] == expected and old['prompt_sha256'] == digest([SYSTEM, TASKS])
+                and old['runtime_policy'] == POLICY and 'input_suffix' not in old,
+                'Only the known JSON-input format bug may be corrected')
+        require(not list(out.glob('arm*/*/result.json')), 'Completed judgments cannot be revised')
+        require(not (out / 'format_recovery.json').exists(), 'Format recovery already recorded')
+        cases = {c['id']: c for c in read(out/'blind_inputs.json')}
+        rejected = {}
+        for path in sorted(out.glob('arm*/*/request_*.json')):
+            rec = read(path)
+            require(path.parent.parent.name == 'arm_match' and json_format_rejection(rec),
+                    'Not an unambiguous pre-generation JSON format rejection')
+            validate_request(rec, body_for(cases[path.parent.name], 'match', None), legacy=True)
+            rejected[str(path.relative_to(out))] = sha256_file(path)
+        require(bool(rejected), 'No format rejection evidence')
+        new = dict(old, source_code=current, input_suffix=INPUT_SUFFIX)
+        new.pop('configuration_sha256'); new['configuration_sha256'] = digest(new)
+        receipt = {'previous_manifest': old, 'rejected_requests': rejected,
+                   'new_configuration_sha256': new['configuration_sha256'],
+                   'budget_before': read(out/'budget.json'), 'successful_judgments': 0,
+                   'reason': 'Provider requires literal JSON in input, despite JSON instructions. No scientific prompt or frozen data changed.',
+                   'updated_unix': time.time()}
+        # Check all sources before changing the manifest; counters/raw files stay intact.
+        for path, sha in old['source_files'].items(): require(sha256_file(Path(path)) == sha, 'Source changed')
+        for name, key in [('blind_inputs.json','inputs_sha256'),('operator_map.json','operator_map_sha256')]:
+            require(sha256_file(out/name) == old[key], 'Bundle changed')
+        write_json(out/'format_recovery.json', receipt)
+        write_json(out/'manifest.json', new)
+        return verify(out)
+
+
+def recovered_format_request(out, path, rec, body):
+    receipt_path = out/'format_recovery.json'
+    if not receipt_path.exists(): return False
+    receipt = read(receipt_path)
+    expected = receipt['rejected_requests'].get(str(path.relative_to(out)))
+    if expected is None: return False
+    require(expected == sha256_file(path) and json_format_rejection(rec)
+            and receipt['new_configuration_sha256'] == read(out/'manifest.json')['configuration_sha256'],
+            'Format-recovery evidence changed')
+    validate_request(rec, body, legacy=True)
+    return True
 
 
 def judgment_from_raw(path, body, case):
@@ -384,12 +446,15 @@ def run(out, endpoint, key):
                         path = paths[-1] if paths else None
                         rec = read(path) if path else None
                         for previous_path in paths:
-                            validate_request(read(previous_path), body)
+                            previous = read(previous_path)
+                            if not recovered_format_request(out, previous_path, previous, body):
+                                validate_request(previous, body)
                         if rec and (rec.get('response') or {}).get('status') == 'completed':
                             value = judgment_from_raw(path, body, case)  # invalid content stops, never rerolls
                             break
                         if rec:
-                            require(failure_kind(rec, folder) is not None, 'Unclassified failure; no automatic retry')
+                            require(recovered_format_request(out, path, rec, body) or failure_kind(rec, folder) is not None,
+                                    'Unclassified failure; no automatic retry')
                             require(len(paths) < 6, 'Technical attempts exhausted')
                             wait_until(max(task_ready_at(path, rec), circuit.state['next_request_unix']))
                         elif circuit.state['next_request_unix'] > time.time():
@@ -405,7 +470,7 @@ def run(out, endpoint, key):
                         path = folder / f'request_{len(paths)+1:03d}.json'
                         update('running', active_task={'id': case['id'], 'stage': stage, 'attempt': len(paths)+1})
                         try:
-                            transport.responses(instructions=SYSTEM, input=canonical(body),
+                            transport.responses(instructions=SYSTEM, input=canonical(body) + INPUT_SUFFIX,
                                                 text={'format': {'type': 'json_object'}}, stream=True)
                             value = judgment_from_raw(path, body, case)
                         except Exception:
@@ -456,7 +521,7 @@ def await_annotations(out, annotations):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('command', choices=['prepare', 'verify', 'run', 'score'])
+    p.add_argument('command', choices=['prepare', 'verify', 'run', 'score', 'recover-json-format'])
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--checks', type=Path); p.add_argument('--annotations', type=Path)
     p.add_argument('--env', type=Path)
@@ -490,6 +555,7 @@ def main():
         else:
             run(out, os.environ['OPENAI_BASE_URL'], os.environ['OPENAI_API_KEY'])
     elif a.command == 'verify': verify(out, relocate=a.relocate_source_root)
+    elif a.command == 'recover-json-format': recover_json_format(out)
     else: score(out, relocate=a.relocate_source_root)
 
 

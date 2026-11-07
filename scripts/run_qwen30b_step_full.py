@@ -30,6 +30,16 @@ ARMS = ['pure', 'case_rag', 'flat_skills', 'rule_tree']
 POOL = 'results/qwen30b_corpus'
 
 
+class CohortScreen(knowledge.FamilyScreen):
+    """Only actual held-out IDs are leakage hits; other sentinels are not IDs."""
+    def __init__(self, heldout):
+        super().__init__(heldout)
+        self.heldout_ids = {r['id'] for r in heldout}
+
+    def matches(self, row):
+        return [h for h in super().matches(row) if h['heldout_id'] in self.heldout_ids]
+
+
 def code_hashes():
     return {**checks.code_hashes(), **followup.source_hashes(),
             'scripts/run_qwen30b_step_full.py': vr.sha(Path(__file__)),
@@ -203,6 +213,53 @@ def construction_acceptance(out, plan):
     return a
 
 
+def accept_construction(out, audit_path):
+    """Bind the completed source audit before any formal calls, not physical certification."""
+    require(Path('/proc').exists(), 'Construction acceptance is server-only')
+    with base.r.run_lock(out/'active.lock'):
+        require((out/'STOP').exists(), 'Freeze formal execution before preflight revision')
+        old = vr.read(out/'plan.json'); c = old['configuration']
+        require(vr.digest(c) == old['configuration_sha256'], 'Previous plan changed')
+        require(not any((out/n).exists() for n in ('generated','raw','checks','annotations','skills'))
+                and not list(out.glob('arm*/*/request_*.json')), 'Cannot revise an executed batch')
+        require(not (out/'preflight_revision.json').exists(), 'Preflight already revised')
+        for n,h in c['frozen_files'].items(): require(vr.sha(out/n)==h, 'Frozen input changed')
+        for n,h in c['source_files'].items(): require(vr.sha(ROOT/n)==h, 'Source changed')
+        audit = vr.read(audit_path)
+        require(audit['state']=='audit_complete' and audit['provenance_passed'] is True
+                and audit['heldout_isolation_passed'] is True and audit['original_source_only'] is True
+                and audit['model_calls']==0 and not audit['overlaps']
+                and audit['error_experiences']==c['source_count'], 'Construction provenance audit failed')
+        for n,h in audit['source_files'].items(): require(vr.sha(Path(n))==h, 'Audit source changed')
+        require(audit['source_files'].get(str((out/'questions.json').resolve()))==vr.sha(out/'questions.json'),
+                'Construction audit used a different held-out cohort')
+        build = ROOT/cohort.BUILD
+        require(audit['source_files'].get(str((build/'catalog.json').resolve())) == vr.sha(build/'catalog.json')
+                and vr.read(build/'catalog.json') == vr.read(out/'catalog.json'),
+                'Construction audit used a different catalog')
+        require(audit['generation_binding']==vr.read(build/'source_release.json'), 'Generation binding changed')
+        # Only engineering code bindings change. No scientific inputs, prompts, budgets, or sources change.
+        new = copy.deepcopy(old); new['configuration']['source_hashes'] = code_hashes()
+        new['configuration_sha256'] = vr.digest(new['configuration'])
+        vr.atomic(out/'preflight_revision.json', {'previous_plan':old,
+            'previous_skills_plan':vr.read(out/'skills_plan.json'),
+            'new_configuration_sha256':new['configuration_sha256'], 'model_calls':0,
+            'reason':'Bind source acceptance and corrected heldout-ID screening before formal execution.'})
+        vr.atomic(out/'plan.json', new)
+        sp = vr.read(out/'skills_plan.json'); sp['configuration']['source_plan_sha256']=vr.sha(out/'plan.json')
+        sp['configuration_sha256']=vr.digest(sp['configuration']); vr.atomic(out/'skills_plan.json', sp)
+        vr.atomic(out/'construction_acceptance.json', {
+            'passed':True,'configuration_sha256':new['configuration_sha256'], 'original_source_only':True,
+            'answer_model':corpus.MODEL,'construction_model':base.r.EXPECTED_MODEL,'embedding_calls':0,
+            'heldout_questions_sha256':vr.sha(out/'questions.json'),'catalog_sha256':vr.sha(out/'catalog.json'),
+            'source_count':c['source_count'],'scope':'generation_and_library_provenance_and_heldout_isolation',
+            'human_gold':False,'physical_quality_certified':False,
+            'verified_answer_count':audit['verified_complete_30b_answers'],'rule_leaves':audit['rule_leaves'],
+            'evidence':{str(audit_path.resolve()):vr.sha(audit_path), **audit['source_files']},
+            'scope_note':'Reuse original-only v5 evidence; exclude external-textbook 5000 expansion. Automatic content errors remain measured outcomes.'})
+        return verify(out)
+
+
 def pilot_root(out, plan):
     return (out/plan['configuration']['pilot_relative']).resolve()
 
@@ -351,6 +408,7 @@ def skills(out, plan, tokenizer):
     with patch.object(followup.bench, 'protocol', knowledge), \
          patch.object(followup.bench, 'ProcedureJournal', followup.BoundedSkillJournal), \
          patch.object(followup.bench, 'check_pilot', followup.check_pilot), \
+         patch.object(knowledge, 'FamilyScreen', CohortScreen), \
          patch.object(base.p, 'PILOT_SIZE', knowledge.PILOT_SIZE):
         return followup.ORIGINAL_BUILD(out, sp, tokenizer)
 
@@ -445,9 +503,10 @@ def prepare_annotations(out, env):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('command', choices=['prepare','verify','generate','export','confirm-detached','checks','annotations'])
+    p.add_argument('command', choices=['prepare','verify','generate','export','confirm-detached','checks','annotations','accept-construction'])
     p.add_argument('--output', type=Path, required=True); p.add_argument('--pilot', type=Path)
     p.add_argument('--env', type=Path, default=ROOT/'.env')
+    p.add_argument('--audit', type=Path)
     a = p.parse_args(); out = a.output.resolve()
     if a.command == 'prepare': prepare(out, a.pilot.resolve())
     elif a.command == 'verify': verify(out)
@@ -455,6 +514,7 @@ def main():
     elif a.command == 'export': export(out, verify(out))
     elif a.command == 'checks': run_checks(out)
     elif a.command == 'annotations': prepare_annotations(out, a.env)
+    elif a.command == 'accept-construction': accept_construction(out, a.audit.resolve())
     else: confirm(out)
 
 

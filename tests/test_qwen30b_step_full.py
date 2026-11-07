@@ -8,6 +8,14 @@ from scripts import run_qwen30b_step_full as f
 
 
 class FullStepTests(unittest.TestCase):
+    def test_cohort_screen_retains_real_leakage_but_not_unrelated_parent_sentinel(self):
+        held=[{'id':'test','question':'The finite charged sphere inside a concentric insulating enclosure is surrounded by a second grounded conductor with radius twice that of the first sphere.'}]
+        screen=f.CohortScreen(held)
+        self.assertTrue(screen.matches(dict(held[0],id='source')))
+        self.assertEqual(screen.matches({'id':'unrelated','question':'Use the previous question to evaluate a gas cycle.'}),[])
+        self.assertTrue(screen.matches({'id':'embedded','question':'Different question',
+            'prediction':'Full text: '+held[0]['question']*3}))
+
     def test_formal_hold_precedes_any_generation_or_source_load(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp); (out/'STOP').write_text('source correction')
