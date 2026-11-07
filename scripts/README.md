@@ -6,6 +6,7 @@
 
 - `run_qwen30b_step_verifier.py prepare/verify/generate/confirm-detached/export --output <根目录>`：隔离并冻结问题，新生成30B回答；默认仅6题，`--full`须已有小样本验收记录。
 - `run_qwen30b_step_checks.py prepare/verify/run/confirm-detached --output <根目录/checks_pilot>`：纯120B与原题源规则树连续检查；prepare需指定`--source <生成根目录> --catalog <已绑定原题源catalog.json>`。
+- `score_step_semantic.py prepare --checks <checks_pilot> --annotations <annotation_pilot> --output <semantic_pilot> --env <env>`：四轮独立标签完成后冻结盲化语义评审输入；`run --output ... --env ...`以Sol high匹配并复核，成功项不重跑；`score --output ...`离线计算一对一语义指标。服务器镜像可用`--relocate-source-root <原结果根> <服务器结果根>`核验相同哈希，争议未解决不发布正式主指标。
 - `run_bench_reannotation.py --source <新30B annotation_inputs.json> --output <annotation_pilot> --env <私密配置> --mode pilot --expected-count 6 --pilot-size 6 --recover-technical`：独立Sol high四轮标注，不启动全量。
 - `start_qwen30b_step_service.sh`与`start_oss120b_step_service.sh`为个人服务器启动器，环境/模型/端口需按已核验资源使用；120B通过`serve_fixed_date_vllm.py`固定服务实际日期。
 
