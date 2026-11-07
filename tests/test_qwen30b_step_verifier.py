@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from scripts import run_qwen30b_step_verifier as s
 from scripts.serve_fixed_date_vllm import pinned_system_message
@@ -10,6 +11,38 @@ from scripts import run_bench_reannotation as annotation
 
 
 class StepVerifierTests(unittest.TestCase):
+    def test_prepared_checker_uses_continuous_packet_publication_and_bound_answers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);source=root/'source';source.mkdir();catalog=root/'catalog.json'
+            s.vr.atomic(catalog,{'domains':[]})
+            rows=[{'id':str(i),'question':'Q','context':'','prediction':'new'} for i in range(6)]
+            s.vr.atomic(source/'inputs.json',rows)
+            questions=[{k:x[k] for k in ('id','question','context')} for x in rows]
+            s.vr.atomic(source/'questions.json',questions)
+            ids=[x['id'] for x in rows]
+            config={'source_files':{s.BUILD+'/catalog.json':s.vr.sha(catalog)},'generator':s.corpus.MODEL,
+                    'pilot_ids':ids,'sample_ids':ids,'fixed_harmony_date':'2026-11-07'}
+            s.vr.atomic(source/'plan.json',{'configuration':config})
+            s.vr.atomic(source/'catalog_isolation.json',{'passed':True,'catalog_sha256':s.vr.sha(catalog),
+                'questions_sha256':s.vr.sha(source/'questions.json')})
+            s.vr.atomic(source/'original_source_mapping.json',{'matched':6,
+                'questions_sha256':s.vr.sha(source/'questions.json'),
+                'records':[{'id':sid,'original_pool_ids':['source'+sid]} for sid in ids]})
+            for row,q in zip(rows,questions):
+                raw=source/'raw'/(row['id']+'.json');s.vr.atomic(raw,{'model':s.corpus.MODEL})
+                s.vr.atomic(source/'generated'/(row['id']+'.json'),{'model':s.corpus.MODEL,'prediction':'new',
+                    'state':'complete','signature':s.corpus.p.digest([s.solver_row(q),config]),
+                    'evidence':{'file':str(raw.relative_to(source)),'sha256':s.vr.sha(raw)}})
+            with patch.object(s,'verify',return_value={'configuration':config}):
+                checks.prepare(root/'checks',source,catalog)
+                actual=s.vr.read(root/'checks/plan.json')['configuration']
+                self.assertEqual(actual['limits']['review_protocol'],checks.base.old.continuous.PROTOCOL)
+                self.assertEqual(actual['arms'],['pure','rule_tree'])
+                altered=s.vr.read(source/'generated/0.json');altered['signature']='old4b'
+                s.vr.atomic(source/'generated/0.json',altered)
+                with self.assertRaisesRegex(ValueError,'binding drift'):
+                    checks.prepare(root/'bad_checks',source,catalog)
+
     def test_new_scoring_counts_quote_at_first_character(self):
         from scripts.evaluate_physics_eval_sets import _match_by_location
         gt=[{'error_id':'E1','span_valid':True,'start_char':0,'end_char':3}]

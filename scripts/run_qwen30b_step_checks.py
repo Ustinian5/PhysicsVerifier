@@ -34,26 +34,38 @@ def prepare(output, source, catalog):
         require(isolation.get('passed') is True and isolation['catalog_sha256']==vr.sha(catalog)
                 and isolation['questions_sha256']==vr.sha(source/'questions.json'),
                 'Catalog visible-text isolation has not passed for this cohort')
+        origin=vr.read(source/'original_source_mapping.json')
+        require(origin['questions_sha256']==vr.sha(source/'questions.json') and
+                origin['matched']==len(pc['sample_ids']) and
+                {x['id'] for x in origin['records'] if x['original_pool_ids']}==set(pc['sample_ids']),
+                'Every benchmark question must map to the original physics source pool')
         rows=vr.read(source/'inputs.json')
         require([x['id'] for x in rows]==pc['pilot_ids'],'Pilot must contain all six fresh complete answers')
         require(all(set(x)=={'id','question','context','prediction'} for x in rows),'Checker input includes extra fields')
         source_receipts={}
+        questions={x['id']:x for x in vr.read(source/'questions.json')}
         for row in rows:
             path=source/'generated'/(row['id']+'.json');saved=vr.read(path)
             cohort.corpus.evidence_valid(source,saved)
-            require(saved['model']==pc['generator'] and saved['prediction']==row['prediction'],'Answer identity drift')
+            require(saved.get('evidence') and saved.get('state')=='complete' and
+                    saved['model']==pc['generator'] and saved['prediction']==row['prediction'] and
+                    all(row[k]==questions[row['id']][k] for k in ('id','question','context')) and
+                    saved['signature']==cohort.corpus.p.digest([cohort.solver_row(questions[row['id']]),pc]),
+                    'Answer identity/evidence/input binding drift')
             source_receipts[str(path)]=vr.sha(path)
         vr.atomic(output/'inputs.json',rows)
         vr.atomic(output/'catalog.json',vr.read(catalog))
         base.p.TreeMemory(vr.read(catalog))
         c={'protocol':VERSION,'source_parent':str(source),'source_plan_sha256':vr.sha(source/'plan.json'),
            'catalog_isolation_sha256':vr.sha(source/'catalog_isolation.json'),
+           'original_source_mapping_sha256':vr.sha(source/'original_source_mapping.json'),
            'source_receipts':source_receipts,'generator':pc['generator'],
            'source_hashes':code_hashes(),'inputs_sha256':vr.sha(output/'inputs.json'),
            'catalog_sha256':vr.sha(output/'catalog.json'),'api_base':'http://127.0.0.1:18083/v1',
            'model':base.r.EXPECTED_MODEL,'model_files':base.runtime.MODEL_FILES,
            'fixed_harmony_date':pc['fixed_harmony_date'],'reasoning_effort':'medium',
-           'limits':base.runtime.LIMITS,'check_prompt':base.p.STAGED_BASE,
+           'limits':{**base.runtime.LIMITS,'review_protocol':base.old.continuous.PROTOCOL},
+           'check_prompt':base.p.STAGED_BASE,
            'query_max_tokens':base.p.QUERY_MAX_TOKENS,'reference_token_cap':base.p.REFERENCE_TOKEN_CAP,
            'arms':['pure','rule_tree'],'sample_ids':[x['id'] for x in rows],
            'mode':'engineering_pilot_only','planned_checks':len(rows)*2,
@@ -71,6 +83,8 @@ def verify(output):
     require(vr.sha(Path(c['source_parent'])/'plan.json')==c['source_plan_sha256'],'Generation plan drift')
     require(vr.sha(Path(c['source_parent'])/'catalog_isolation.json')==c['catalog_isolation_sha256'],
             'Catalog isolation evidence drift')
+    require(vr.sha(Path(c['source_parent'])/'original_source_mapping.json')==c['original_source_mapping_sha256'],
+            'Original source mapping drift')
     for name,sha in c['source_receipts'].items():require(vr.sha(Path(name))==sha,'30B evidence drift')
     return plan
 
