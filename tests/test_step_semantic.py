@@ -33,6 +33,28 @@ def mapping():
 
 
 class SemanticScoringTests(unittest.TestCase):
+    def test_server_evidence_relocation_requires_same_hash_and_containment(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); (root / 'raw.json').write_text('{}')
+            sha = s.sha256_file(root / 'raw.json'); sources = {}
+            s.freeze_mirrored_file('/server/run/raw.json', sha, Path('/server/run'), root, sources)
+            self.assertEqual(sources[str((root / 'raw.json').resolve())], sha)
+            with self.assertRaises(ValueError):
+                s.freeze_mirrored_file('/server/other/raw.json', sha, Path('/server/run'), root, sources)
+            with self.assertRaises(ValueError):
+                s.freeze_mirrored_file('/server/run/raw.json', 'changed', Path('/server/run'), root, sources)
+
+    def test_dependency_wait_refuses_dead_incomplete_label_job(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); labels = root / 'labels'; labels.mkdir(); out = root / 'judge'; out.mkdir()
+            (labels / 'inputs.json').write_text('[{"id":"q"}]')
+            with self.assertRaisesRegex(ValueError, 'stopped incomplete'):
+                s.await_annotations(out, labels)
+            for stage in s.teacher.STAGES:
+                folder = labels / ('arm_' + stage) / 'q'; folder.mkdir(parents=True)
+                (folder / 'result.json').write_text('{}')
+            s.await_annotations(out, labels)  # readiness only; prepare still validates every raw record
+
     def test_duplicate_diagnoses_one_root_and_unlocated_reference_retained(self):
         result = s.calculate([case()], mapping(), {'q': judgment()}, ['a', 'b'])
         self.assertTrue(result['primary_metrics_ready'])

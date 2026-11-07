@@ -75,10 +75,22 @@ def read(path):
 
 
 def code_hashes():
-    return {p: sha256_file(ROOT / p) for p in (
+    files = set(checks_module.code_hashes()) | {
         'scripts/score_step_semantic.py', 'scripts/run_bench_reannotation.py',
         'scripts/bench_reannotation_runtime.py', 'scripts/run_retrieval_comparison.py',
-        'scripts/response_stream.py')}
+        'scripts/response_stream.py'}
+    return {p: sha256_file(ROOT / p) for p in sorted(files)}
+
+
+def freeze_mirrored_file(path, expected_hash, original_root, mirror_root, sources):
+    """Relocate only inside the recorded run; hash-check every raw artifact."""
+    original = Path(path)
+    require(original.is_relative_to(original_root), 'Evidence escapes original checker run')
+    local = (mirror_root / original.relative_to(original_root)).resolve()
+    require(local.is_relative_to(mirror_root.resolve()), 'Evidence escapes local mirror')
+    require(sha256_file(local) == expected_hash, 'Raw checker evidence changed')
+    sources[str(local)] = expected_hash
+    return local
 
 
 def blind_cases(rows, finals, predictions, arms):
@@ -123,7 +135,14 @@ def prepare(out, checks, annotations, endpoint):
     sources = {str(checks / n): sha256_file(checks / n) for n in ('plan.json', 'inputs.json', 'engineering_audit.json')}
     sources[str(annotations / 'manifest.json')] = sha256_file(annotations / 'manifest.json')
     for item in audit['preserved_results']:
-        sources[str(annotations / item['path'])] = item['sha256']
+        saved_path = annotations / item['path']; sources[str(saved_path)] = item['sha256']
+        saved = read(saved_path); raw = annotations / saved['response_record']
+        sources[str(raw)] = saved['response_record_sha256']
+        events = read(raw).get('stream_events')
+        if events:
+            event_path = raw.parent / events
+            require(event_path.resolve().is_relative_to(raw.parent.resolve()), 'Label event path escapes task')
+            sources[str(event_path)] = sha256_file(event_path)
     # Allow a verified local mirror, without rewriting server provenance paths.
     predictions = {arm: {} for arm in config['arms']}
     for arm in config['arms']:
@@ -132,8 +151,23 @@ def prepare(out, checks, annotations, endpoint):
             suffix = str(path.relative_to(checks))
             hashes = [h for p, h in engineering['result_files'].items() if p.endswith('/' + suffix)]
             require(hashes == [sha256_file(path)], 'Diagnosis not bound to engineering audit')
+            original_path = next(p for p in engineering['result_files'] if p.endswith('/' + suffix))
+            original_root = Path(original_path[:-len('/' + suffix)])
             result = read(path)
             require(result['id'] == row['id'] and result['configuration_sha256'] == plan['configuration_sha256'], 'Diagnosis identity drift')
+            require(result['model'] == config['model'], 'Wrong tested model')
+            evidence = result.get('trace', {}).get('response_evidence', [])
+            require(result['status'] != 'completed' or evidence, 'Completed diagnosis lacks model evidence')
+            require(len({e['turn'] for e in evidence}) == len(evidence), 'Duplicate response turn')
+            if result.get('first_diagnosis_path'):
+                freeze_mirrored_file(result['first_diagnosis_path'], result['first_diagnosis_sha256'], original_root, checks, sources)
+            for entry in evidence:
+                require(entry['model_ids'] == [config['model']], 'Raw tested model identity differs')
+                for k, h in (('request_path', 'request_sha256'), ('response_path', 'response_sha256'), ('raw_sse_path', 'raw_sse_sha256')):
+                    raw = freeze_mirrored_file(entry[k], entry[h], original_root, checks, sources)
+                    if k == 'response_path':
+                        response = read(raw)
+                        require(response.get('model_ids') == entry['model_ids'] and not response.get('error'), 'Raw checker response invalid')
             sources[str(path)] = sha256_file(path)
             predictions[arm][row['id']] = result
     finals = {r['id']: read(annotations / 'arm_final' / r['id'] / 'result.json')['annotation'] for r in rows}
@@ -395,12 +429,39 @@ def run(out, endpoint, key):
             for s, h in old.items(): signal.signal(s, h)
 
 
+def await_annotations(out, annotations):
+    """Serial dependency in this batch, not a recurring monitoring task."""
+    rows = read(annotations / 'inputs.json')
+    required = [annotations / ('arm_' + stage) / row['id'] / 'result.json'
+                for row in rows for stage in teacher.STAGES]
+    while True:
+        require(not (out / 'STOP').exists(), 'Operator stopped dependency wait')
+        with (annotations / 'runner.lock').open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                alive = False
+            except BlockingIOError:
+                alive = True
+            if not alive:
+                require(all(p.is_file() for p in required), 'Independent labeling stopped incomplete; no judging calls sent')
+                return
+        write_json(out / 'progress.json', {'state': 'waiting_for_independent_labels',
+            'pid': os.getpid(), 'updated_unix': time.time(),
+            'labels_complete': sum(p.is_file() for p in required), 'labels_required': len(required),
+            'judge_calls_started': 0})
+        for _ in range(15):
+            if (out / 'STOP').exists(): break
+            time.sleep(1)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('command', choices=['prepare', 'verify', 'run', 'score'])
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--checks', type=Path); p.add_argument('--annotations', type=Path)
     p.add_argument('--env', type=Path)
+    p.add_argument('--wait-annotations', action='store_true',
+                   help='Run only: wait for the existing label runner to finish, freeze bundle, then judge')
     p.add_argument('--relocate-source-root', nargs=2, metavar=('OLD_ROOT', 'NEW_ROOT'),
                    help='Offline verify/score of identical server mirror; all content hashes still checked')
     a = p.parse_args(); out = a.output.resolve()
@@ -408,7 +469,26 @@ def main():
         require(a.env is not None, '--env required')
         load_dotenv(a.env, override=False)
     if a.command == 'prepare': prepare(out, a.checks.resolve(), a.annotations.resolve(), os.environ['OPENAI_BASE_URL'])
-    elif a.command == 'run': run(out, os.environ['OPENAI_BASE_URL'], os.environ['OPENAI_API_KEY'])
+    elif a.command == 'run':
+        if a.wait_annotations:
+            require(a.checks is not None and a.annotations is not None, 'Dependency wait needs --checks and --annotations')
+            out.mkdir(parents=True, exist_ok=True)
+            with (out / 'workflow.lock').open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                (out / 'workflow.pid').write_text(str(os.getpid()))
+                try:
+                    if not (out / 'manifest.json').exists():
+                        await_annotations(out, a.annotations.resolve())
+                        prepare(out, a.checks.resolve(), a.annotations.resolve(), os.environ['OPENAI_BASE_URL'])
+                    run(out, os.environ['OPENAI_BASE_URL'], os.environ['OPENAI_API_KEY'])
+                except Exception as exc:
+                    write_json(out / 'workflow_status.json', {'state': 'stopped', 'error_type': type(exc).__name__,
+                        'error': str(exc)[:500], 'updated_unix': time.time()})
+                    raise
+                finally:
+                    (out / 'workflow.pid').unlink(missing_ok=True)
+        else:
+            run(out, os.environ['OPENAI_BASE_URL'], os.environ['OPENAI_API_KEY'])
     elif a.command == 'verify': verify(out, relocate=a.relocate_source_root)
     else: score(out, relocate=a.relocate_source_root)
 
