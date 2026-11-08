@@ -6,13 +6,13 @@
 
 `run_corrected_step_generation.py prepare --output <corrected/bench_generation> --prior <full> --inventory <source_question_inventory.json>`：绑定原源映射的同一100题，逐项核验旧回答的完整请求、模型、采样及响应哈希，只复用一致的32份。`run --output ...`在服务器独立后台执行；退出SSH后用`confirm-detached --output ...`放行，缺项从原协议断点补齐。`verify --output ...`离线核验，不调用模型。
 
-该入口仅生成bench回答，不引用旧知识库、不启动标签/检查/语义评分。2500题建库和新四组工具会话仍须完成冻结及试跑。30B启动器允许用STEP_RUN_ROOT指定本轮服务证据目录、STEP_CACHE_ROOT指定个人快速缓存，GPU仍须显式指定空闲卡及UUID。
+该入口仅生成bench回答，不引用旧知识库、不启动标签/检查/语义评分。2000题建库输入已冻结，新四组工具会话仍须完成适配及试跑。30B启动器允许用STEP_RUN_ROOT指定本轮服务证据目录、STEP_CACHE_ROOT指定个人快速缓存，GPU仍须显式指定空闲卡及UUID。
 
 ## 同源建库与600题评测的前置审查
 
 `run_combined_source_screen.py prepare --output <source_screen> --source-root <题源盘点目录> --source <combined_language_only.json>`一次提取原始参考与候选；参考独立保存，不送入审题请求。`verify`核对冻结输入；后台`run`只跑首批试跑，另一次SSH执行`confirm-detached`。复核原件并写入绑定哈希的pilot_acceptance.json后，后台`run --full`审查所有候选，再次独立断连确认；已完成批次不重跑。仅领域/题设完整性，不是最终答案标签，不自动启动下游。
 
-`partition_combined_source.py families --output <source_screen> --inventory <source_question_inventory.json>`缓存题族连通关系；`freeze --output <source_screen>`在审题全部结束后处理已记录的缺条件项，按固定种子整族划分2500建库与保留池，数量不足停止。已识别的前问缺失排除须保留原判词和助手复核记录。参考多版本冲突仍须在题级标注前核查。600题输入未冻结前不得称正式评测已开始。
+`partition_combined_source.py families --output <source_screen> --inventory <source_question_inventory.json>`缓存题族连通关系；`freeze --output <source_screen> --build-size 2000`在审题全部结束后处理已记录的缺条件项，显式指定用户授权的建库数量，按固定种子整族划分；冻结前检查至少剩余600候选，数量不足停止，不自动缩量。当前2702合格候选已划分2000建库＋702保留池。已识别的前问缺失排除须保留原判词和助手复核记录。参考多版本冲突仍须在题级标注前核查。600题输入未冻结前不得称正式评测已开始。
 
 题目级固定600题、四组2400项检查，无规模曲线。`final_answer_protocol.py`提供参考可见的独立标签提示与参考不可见的检查提示。旧`evaluate_question_level_sets.py`不能直接把步骤诊断非空当最终答案错误。
 

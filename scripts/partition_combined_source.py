@@ -1,4 +1,4 @@
-"""Cache source-family links once; freeze the 2500/held-out split after review.
+"""Cache source-family links once; freeze an explicitly sized build/held-out split.
 
 No model calls, answers, references or correctness scores influence the split.
 The existing conservative lexical/shared-prose policy is reused unchanged.
@@ -69,7 +69,8 @@ def family_cache(out, inventory_path):
     write(path,value);return value
 
 
-def freeze(out):
+def freeze(out, build_size):
+    require(2000 <= build_size <= 3000, 'Build size outside the user-authorized 2000–3000 range')
     plan=review.verify(out);cache=read(out/'family_components.json')
     require(cache['source_plan_sha256']==sha(out/'plan.json'),'Family cache input drift')
     require(all(sha(review.ROOT/p)==h for p,h in cache['code_hashes'].items()),'Family cache implementation drift')
@@ -97,13 +98,18 @@ def freeze(out):
                 self_contained='no',reason=issue['reason'],reviewer='Codex assistant',human_gold=False)
         else:
             require(issue['action']=='reference_alignment_verified','Unresolved source issue before split')
-    build,reserve=choose(cache['components'],eligible);by_id={r['id']:r for r in rows}
-    payload=dict(protocol='combined_2500_reserved_family_split_v1',seed=20261107,
+    require(len(eligible) >= build_size+600,
+            f'Eligible questions: {len(eligible)}; build {build_size} leaves {len(eligible)-build_size}, need at least 600. No automatic shrink.')
+    build,reserve=choose(cache['components'],eligible,size=build_size);by_id={r['id']:r for r in rows}
+    payload=dict(protocol='combined_reserved_family_split_v2',seed=20261107,build_target=build_size,
         source_plan_sha256=sha(out/'plan.json'),family_sha256=sha(out/'family_components.json'),
         review_evidence=evidence,pilot_acceptance_sha256=sha(out/'pilot_acceptance.json'),build=[by_id[x] for x in build],
         reserve=[by_id[x] for x in sorted(reserve,key=lambda x:digest([20261107,'heldout',x]))],
         excluded=[dict(decisions[r['id']],id=r['id']) for r in rows if r['id'] not in eligible],
-        benchmark_target=600,benchmark_frozen=False,semantic_family_independence_proven=False)
+        benchmark_target=600,benchmark_frozen=False,balanced_class_quota_guaranteed=False,
+        counts=dict(candidates=len(rows),eligible=len(eligible),build=len(build),reserve=len(reserve),
+                    excluded=len(rows)-len(eligible)),
+        semantic_family_independence_proven=False)
     path=out/'split.json'
     if path.exists():require(read(path)==payload,'Frozen split changed')
     else:write(path,payload)
@@ -114,12 +120,15 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('mode',choices=['families','freeze']);p.add_argument('--output',type=Path,required=True)
     p.add_argument('--inventory',type=Path)
+    p.add_argument('--build-size',type=int,help='Explicit authorized build size; required for freeze')
     a=p.parse_args();out=a.output.resolve()
     with review.corpus.r.run_lock(out/'partition.lock'):
         if a.mode=='families':
             require(a.inventory is not None,'Inventory required');v=family_cache(out,a.inventory)
             print('components',len(v['components']))
-        else:freeze(out)
+        else:
+            require(a.build_size is not None,'freeze requires explicit --build-size; never shrink implicitly')
+            freeze(out,a.build_size)
 
 
 if __name__=='__main__':main()
