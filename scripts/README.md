@@ -19,6 +19,7 @@
 ## 更正批次生成与独立标注
 
 - `run_corrected_collection.py prepare --output <collection> --screen <source_screen> --bench <bench_generation>`绑定已冻结2000/702划分；后台`run --output ...`仅生成30B回答。建库/保留池交替调度、分别导出，成功项复用，无旧库或标签输入。
+- 30B提速使用`run_corrected_collection_parallel.py --output <collection> --workers 4 --limit 8`先验收固定后续8题，省略`--limit`继续剩余题；独立请求滚动并发、输入/采样/逐题seed/成功签名不变，原入口`confirm-detached`仍负责断连验收。服务仅以`STEP_MAX_NUM_SEQS=4`提高调度容量。切换前须排空生成与依赖标注、保存原件哈希；切换记录在collection/concurrency_transition.json及scheduling/，并发浮点差异不宣称逐字复现。
 - `run_corrected_annotations.py prepare --output <annotations> --bench <bench_generation> --screen <source_screen> --inventory <source_question_inventory.json> --env <私密.env>`核验100份回答原件并绑定combined原参考；后台`run --output ... --env ...`调用已有Sol high四轮标注器。保留参考空项交独立标注器判断，不复用旧回答标签、不启动语义评分。
 - `run_final_answer_labels.py prepare --output <final_labels> --source <collection> --screen <source_screen>`冻结参考侧输入；后台`run --output ...`先跑4控制及固定前6个真实候选，等待生成时不重复请求。含参考空项记hold；不自动更换题。试跑验收文件绑定配置与原始结果后，使用`run_final_answer_labels_guarded.py run --output ...`继续整个候选池，底层标签提示/配置和成功前缀保持不变。配额保护每10秒按`已确认某类+尚可标注题数`计算可达上限，任一类上限<300则写STOP，保存在途响应并记录quota_stop.json；不改标签或配额。`inspect --output ...`可离线查看quota_status的同口径统计。
 

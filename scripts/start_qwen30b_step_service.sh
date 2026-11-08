@@ -4,6 +4,8 @@ set -euo pipefail
 RUN=${STEP_RUN_ROOT:-/slow_share2/huhengyuan/physicsverifier_results/qwen30b_step_verifier}
 export STEP_RUN_ROOT="$RUN"
 ENV=/home/visitor/huhengyuan/envs/physicsverifier
+STEP_MAX_NUM_SEQS=${STEP_MAX_NUM_SEQS:-1}
+case "$STEP_MAX_NUM_SEQS" in 1|2|4) ;; *) echo 'Unsupported concurrency'; exit 1;; esac
 export CONDA_PREFIX="$ENV" PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH=/home/visitor/huhengyuan/envs/vllm_gptoss120b/lib/python3.10/site-packages
 export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="${STEP_GPU_INDEX:?set free GPU index}"
@@ -42,5 +44,5 @@ PY
  --model /slow_share2/huhengyuan/models/Qwen3-30B-A3B-Instruct-2507 \
  --served-model-name Qwen3-30B-A3B-Instruct-2507 --host 127.0.0.1 --port 18084 \
  --dtype bfloat16 --tensor-parallel-size 1 --gpu-memory-utilization 0.90 \
- --max-model-len 32768 --max-num-seqs 1 --enforce-eager --safetensors-load-strategy eager \
+ --max-model-len 32768 --max-num-seqs "$STEP_MAX_NUM_SEQS" --enforce-eager --safetensors-load-strategy eager \
  --seed 20261107 --generation-config vllm --disable-log-requests
