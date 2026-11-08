@@ -16,6 +16,14 @@
 
 题目级固定600题、四组2400项检查，无规模曲线。`final_answer_protocol.py`提供参考可见的独立标签提示与参考不可见的检查提示。旧`evaluate_question_level_sets.py`不能直接把步骤诊断非空当最终答案错误。
 
+## 更正批次生成与独立标注
+
+- `run_corrected_collection.py prepare --output <collection> --screen <source_screen> --bench <bench_generation>`绑定已冻结2000/702划分；后台`run --output ...`仅生成30B回答。建库/保留池交替调度、分别导出，成功项复用，无旧库或标签输入。
+- `run_corrected_annotations.py prepare --output <annotations> --bench <bench_generation> --screen <source_screen> --inventory <source_question_inventory.json> --env <私密.env>`核验100份回答原件并绑定combined原参考；后台`run --output ... --env ...`调用已有Sol high四轮标注器。保留参考空项交独立标注器判断，不复用旧回答标签、不启动语义评分。
+- `run_final_answer_labels.py prepare --output <final_labels> --source <collection> --screen <source_screen>`冻结参考侧输入；后台`run --output ...`先跑4控制及固定前6个真实候选，等待生成时不重复请求。含参考空项记hold；不自动更换题。试跑验收文件绑定配置与原始结果后，`run --output ... --full`才可继续整个候选池；最终600题配额不足必须报告。
+
+每个新客户端退出启动SSH后，用其`confirm-detached --output ...`从新连接确认。三者分别互斥，生成复用18084服务；120B标注复用18083，持服务锁时不能启动其他120B客户端。当前仅这些前置阶段已运行，新知识构建和四组连续工具检查仍需适配、试跑，不能以旧共享PREPARE执行器代替。
+
 ## 原批次入口（仅追溯，不恢复旧批量）
 
 - `run_qwen30b_step_verifier.py prepare/verify/generate/confirm-detached/export --output <根目录>`：隔离并冻结问题，新生成30B回答；默认仅6题，`--full`须已有小样本验收记录。
