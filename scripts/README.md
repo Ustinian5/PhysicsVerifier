@@ -24,6 +24,8 @@
 
 120B标签客户端需显式提供个人vllm_gptoss120b环境的site-packages作为PYTHONPATH以加载tokenizer（路径见私人运行配置），不修改共享环境。guarded入口仍用原`run_final_answer_labels.py confirm-detached`验收。
 
+若步骤标注明确返回`account_rate_limit_exceeded`及滚动60秒窗口错误，可使用`resume_corrected_annotations.py --output <annotations> --env <私密.env>`恢复；仅识别这一精确错误，沿用原重试/余额保护，并将请求间隔至少设为61秒。冻结文件不变，原件继续核验，新运行代码哈希写入window_limit_recovery.json；未知429仍停止。使用原annotations的confirm-detached验收。
+
 每个新客户端退出启动SSH后，用其`confirm-detached --output ...`从新连接确认。三者分别互斥，生成复用18084服务；120B标注复用18083，持服务锁时不能启动其他120B客户端。当前仅这些前置阶段已运行，新知识构建和四组连续工具检查仍需适配、试跑，不能以旧共享PREPARE执行器代替。
 
 ## 原批次入口（仅追溯，不恢复旧批量）
