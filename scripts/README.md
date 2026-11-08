@@ -20,7 +20,9 @@
 
 - `run_corrected_collection.py prepare --output <collection> --screen <source_screen> --bench <bench_generation>`绑定已冻结2000/702划分；后台`run --output ...`仅生成30B回答。建库/保留池交替调度、分别导出，成功项复用，无旧库或标签输入。
 - `run_corrected_annotations.py prepare --output <annotations> --bench <bench_generation> --screen <source_screen> --inventory <source_question_inventory.json> --env <私密.env>`核验100份回答原件并绑定combined原参考；后台`run --output ... --env ...`调用已有Sol high四轮标注器。保留参考空项交独立标注器判断，不复用旧回答标签、不启动语义评分。
-- `run_final_answer_labels.py prepare --output <final_labels> --source <collection> --screen <source_screen>`冻结参考侧输入；后台`run --output ...`先跑4控制及固定前6个真实候选，等待生成时不重复请求。含参考空项记hold；不自动更换题。试跑验收文件绑定配置与原始结果后，`run --output ... --full`才可继续整个候选池；最终600题配额不足必须报告。
+- `run_final_answer_labels.py prepare --output <final_labels> --source <collection> --screen <source_screen>`冻结参考侧输入；后台`run --output ...`先跑4控制及固定前6个真实候选，等待生成时不重复请求。含参考空项记hold；不自动更换题。试跑验收文件绑定配置与原始结果后，使用`run_final_answer_labels_guarded.py run --output ...`继续整个候选池，底层标签提示/配置和成功前缀保持不变。配额保护每10秒按`已确认某类+尚可标注题数`计算可达上限，任一类上限<300则写STOP，保存在途响应并记录quota_stop.json；不改标签或配额。`inspect --output ...`可离线查看quota_status的同口径统计。
+
+120B标签客户端需显式提供个人vllm_gptoss120b环境的site-packages作为PYTHONPATH以加载tokenizer（路径见私人运行配置），不修改共享环境。guarded入口仍用原`run_final_answer_labels.py confirm-detached`验收。
 
 每个新客户端退出启动SSH后，用其`confirm-detached --output ...`从新连接确认。三者分别互斥，生成复用18084服务；120B标注复用18083，持服务锁时不能启动其他120B客户端。当前仅这些前置阶段已运行，新知识构建和四组连续工具检查仍需适配、试跑，不能以旧共享PREPARE执行器代替。
 
