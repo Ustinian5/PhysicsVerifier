@@ -1,6 +1,7 @@
 import copy
 import unittest
 import tempfile
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,6 +10,26 @@ from scripts.resume_corrected_annotations import known_window_limit
 
 
 class WindowLimitTests(unittest.TestCase):
+    def test_route_receipt_does_not_authorize_new_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / 'binding.json').write_text('{}')
+            record = dict(http_status=429, started_unix=1, request={'model':'gpt-6.1-sol'},
+                          response={'error':{'code':'model_not_found','type':'invalid_request_error',
+                          'message':'unknown provider for model gpt-6.1-sol'}})
+            (out / 'request.json').write_text(json.dumps(record))
+            receipt = dict(binding_sha256=recovery.runner.sha(out/'binding.json'),
+                authorization='user_requested_repair_and_resume_2026_11_09',
+                records=[dict(path='request.json', sha256=recovery.runner.sha(out/'request.json'))])
+            (out/'route_recovery.json').write_text(json.dumps(receipt))
+            allowed = recovery.approved_route_records(out)
+            self.assertIn(recovery.transport.digest(record), allowed)
+            record['started_unix'] = 2
+            self.assertNotIn(recovery.transport.digest(record), allowed)
+            (out/'request.json').write_text(json.dumps(record))
+            with self.assertRaises((ValueError, RuntimeError)):
+                recovery.approved_route_records(out)
+
     def test_recovery_entry_locks_binds_and_restores_classifiers(self):
         original = recovery.runtime.failure_kind
         with tempfile.TemporaryDirectory() as tmp:
