@@ -10,6 +10,8 @@
 
 ## 同源建库与600题评测的前置审查
 
+`audit_hipho_overlap.py --benchmark <hipho_frozen.jsonl> --results-root <结果根目录> --legacy-root <旧v5目录> --output <核验JSON>`只读核对新2000题、702保留候选、100题步骤bench、旧v5及扩容建库材料。复用现有规范化/数字模板/字面题族/共享题设筛查，同时对照HiPhO题干及context；输出命中原文入口、来源哈希和派生规则关联。非精确命中须审读，不自动当成重复，不改冻结样本或调用模型；当前提炼记录只代表核验时已落盘的快照，不包含后续产物。正式长时核验在服务器后台运行。
+
 `run_combined_source_screen.py prepare --output <source_screen> --source-root <题源盘点目录> --source <combined_language_only.json>`一次提取原始参考与候选；参考独立保存，不送入审题请求。`verify`核对冻结输入；后台`run`只跑首批试跑，另一次SSH执行`confirm-detached`。复核原件并写入绑定哈希的pilot_acceptance.json后，后台`run --full`审查所有候选，再次独立断连确认；已完成批次不重跑。仅领域/题设完整性，不是最终答案标签，不自动启动下游。
 
 `partition_combined_source.py families --output <source_screen> --inventory <source_question_inventory.json>`缓存题族连通关系；`freeze --output <source_screen> --build-size 2000`在审题全部结束后处理已记录的缺条件项，显式指定用户授权的建库数量，按固定种子整族划分；冻结前检查至少剩余600候选，数量不足停止，不自动缩量。当前2702合格候选已划分2000建库＋702保留池。已识别的前问缺失排除须保留原判词和助手复核记录。参考多版本冲突仍须在题级标注前核查。600题输入未冻结前不得称正式评测已开始。
