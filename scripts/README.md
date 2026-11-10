@@ -18,6 +18,7 @@
 
 ## 更正批次生成与独立标注
 
+- `run_corrected_extraction.py prepare --output <corrected/construction> --source <corrected/collection>`只导入冻结2000道建库题中的完整新30B回答，逐项核验生成签名和原件哈希；截断留档、不补题，702保留候选及参考标签不进入提炼。服务器后台`run --output ...`，退出启动SSH后以`confirm-detached --output ...`放行。复用原120B medium逐题连续核查＋提炼提示，每题最多2条规则、至多一次结构修复，单来源去重保留，不接embedding。首12份记录工程验收（不设物理零错误门槛）；全部结构无效则停止检查。成功响应精确恢复，身份/输入漂移停止；`verify`不调用模型。此入口只产出新错误经验与去重规则候选，树组织、平铺skills及正式四组检查另行执行，不自动接旧协调器。
 - `run_corrected_collection.py prepare --output <collection> --screen <source_screen> --bench <bench_generation>`绑定已冻结2000/702划分；后台`run --output ...`仅生成30B回答。建库/保留池交替调度、分别导出，成功项复用，无旧库或标签输入。
 - 30B提速使用`run_corrected_collection_parallel.py --output <collection> --workers 4 --limit 8`先验收固定后续8题，省略`--limit`继续剩余题；独立请求滚动并发、输入/采样/逐题seed/成功签名不变，原入口`confirm-detached`仍负责断连验收。服务仅以`STEP_MAX_NUM_SEQS=4`提高调度容量。切换前须排空生成与依赖标注、保存原件哈希；切换记录在collection/concurrency_transition.json及scheduling/，并发浮点差异不宣称逐字复现。
 - `run_corrected_annotations.py prepare --output <annotations> --bench <bench_generation> --screen <source_screen> --inventory <source_question_inventory.json> --env <私密.env>`核验100份回答原件并绑定combined原参考；后台`run --output ... --env ...`调用已有Sol high四轮标注器。保留参考空项交独立标注器判断，不复用旧回答标签、不启动语义评分。
