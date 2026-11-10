@@ -350,3 +350,5 @@ python -m scripts.run_rule_skill_comparison score --output <对照目录>
 `evaluation/case_review.json`按预先固定的哈希顺序，分别抽取规则组独有命中、skill组独有命中、共同漏检、命中相同但诊断数量不同的题，最多4个不同题；不存在的类别不补造。保存原题/原答、两组诊断、实际工具记录、已确认及未决参考，由主线Codex assistant补充物理解释和知识实际贡献，再整理为人类可读案例。自动抽样完成不等于案例复核完成。两组各50题均是开发对照，论文独立验证另留隔离测试集。
 
 模型路由拒绝默认不自动重试。用户明确要求修复恢复时，`route_recovery.json`必须绑定原binding、已核验错误记录的路径与SHA256；恢复入口只放行该历史拒绝，新的model_not_found仍停止，不更换型号/预算或重写旧响应。
+
+2026-11-10用户授权两项耗尽任务各追加6次技术尝试：`attempt_extension.json`绑定原binding及各6份历史失败SHA256，只允许`arm_blind/cl_258_182363`、`arm_review/trainphysics_7865`的固定总上限12次；其余任务仍6次。恢复不清零实际请求计数，不因重启继续扩额；冷却、模型、提示、每次及总token预算、余额保护不变。来源编号修正通过已有provenance_correction机制保留原件和理由。

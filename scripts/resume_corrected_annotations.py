@@ -53,9 +53,62 @@ def approved_route_records(out):
     return accepted
 
 
+def approved_attempt_extensions(out):
+    path = out / 'attempt_extension.json'
+    if not path.exists():
+        return {}
+    receipt = runner.read(path)
+    runner.require(receipt['binding_sha256'] == runner.sha(out / 'binding.json') and
+                   receipt['authorization'] == 'user_two_tasks_plus_six_2026_11_10',
+                   'Attempt extension binding/authorization mismatch')
+    expected = {'arm_blind/cl_258_182363', 'arm_review/trainphysics_7865'}
+    tasks = receipt['tasks']
+    runner.require(len(tasks) == 2 and {t['folder'] for t in tasks} == expected,
+                   'Attempt extension must cover exactly the two authorized tasks')
+    for task in tasks:
+        runner.require(task['original_limit'] == 6 and task['additional_attempts'] == 6
+                       and len(task['records']) == 6, 'Invalid attempt extension limits')
+        paths = set()
+        for item in task['records']:
+            raw = (out / item['path']).resolve()
+            runner.require(raw.parent == (out / task['folder']).resolve()
+                           and raw not in paths and runner.sha(raw) == item['sha256'],
+                           'Attempt extension historical evidence drift')
+            rec = runner.read(raw)
+            runner.require((rec.get('request') or {}).get('model') == 'gpt-6.1-sol'
+                           and runtime.failure_kind(rec, raw.parent) in {
+                               'upstream_startup_timeout', 'upstream_overload'}
+                           and not rec.get('response'), 'Extension requires known technical failures')
+            paths.add(raw)
+    return {t['folder']: 12 for t in tasks}
+
+
+class TaskAttemptPolicy(dict):
+    """Keep real attempt counts; change the ceiling only at the current task."""
+    def __init__(self, base, overrides):
+        super().__init__(base, task_attempt_overrides=overrides)
+        self.folder = None
+
+    def __getitem__(self, key):
+        if key == 'max_stream_attempts_per_task':
+            return self['task_attempt_overrides'].get(self.folder, super().__getitem__(key))
+        return super().__getitem__(key)
+
+
 def run(out, env):
     runner.verify(out)
     approved = approved_route_records(out)
+    extensions = approved_attempt_extensions(out)
+    old_policy = runner.teacher.POLICY
+    old_count = runner.teacher.provider_stream_attempts
+    policy = TaskAttemptPolicy(old_policy, extensions)
+
+    def count_attempts(records):
+        folders = {p.parent.resolve().relative_to(out.resolve()).as_posix() for p, _ in records}
+        runner.require(len(folders) <= 1, 'Mixed tasks in attempt count')
+        policy.folder = next(iter(folders), None)
+        return old_count(records)
+
     route_allowed = lambda rec: known_route_failure(rec) and transport.digest(rec) in approved
     # No original source file or frozen protocol binding is edited.
     old_kind = runtime.failure_kind
@@ -88,11 +141,18 @@ def run(out, env):
                    model_protocol_unchanged=True, started_unix=time.time())
     if approved:
         receipt['route_recovery_sha256'] = runner.sha(out / 'route_recovery.json')
+    if extensions:
+        receipt['attempt_extension_sha256'] = runner.sha(out / 'attempt_extension.json')
+        receipt['retry_policy'] = 'Original cooldown/backoff and budgets; only two authorized task caps 6→12; all actual attempts retained'
     with runner.generation.corpus.r.run_lock(out / 'window_limit_recovery.lock'):
         runner.write(out / 'window_limit_recovery.json', receipt)
         try:
+            runner.teacher.POLICY = policy
+            runner.teacher.provider_stream_attempts = count_attempts
             runner.run(out, env)
         finally:
+            runner.teacher.POLICY = old_policy
+            runner.teacher.provider_stream_attempts = old_count
             runtime.failure_kind = old_kind
             runner.teacher.failure_kind = old_kind
             transport.upstream_overloaded = old_overload
