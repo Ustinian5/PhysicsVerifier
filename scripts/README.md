@@ -2,11 +2,23 @@
 
 当前状态见[项目进展](../docs/项目进展.md)。2026-11-07用户批准更正方案并授权执行；旧full/STOP保留，旧协调器不得恢复。
 
+## 当前全流程入口（2026-11-10）
+
+`run_corrected_pipeline.py prepare --root <corrected> --output <corrected/pipeline>`核验已完成的1996份提炼、1074条候选、100题Sol四轮原件；从702候选的独立标签按冻结顺序取正误各300题。参考与检查输入分别保存，不把标签交给被测模型。
+
+服务器以个人conda后台启动`run --output ...`，退出启动SSH后从新连接执行`confirm-detached --output ...`。一个协调器持有批次锁和18083服务锁，依次执行：服务就绪 → 原生工具/上下文验收 → 树组织 → 同源平铺skills/原始经验RAG → 来源、结构与派生材料隔离验收 → 步骤级四组试跑/100题检查/离线计分 → 题目级四组试跑/600题检查/离线计分。用户已授权正常关口自动放行，不再逐阶段手动启动；预算、身份、隔离、未知协议异常仍停止并保留原件。
+
+检查协议在`rule_framework/corrected_verifier.py`，运行器在`run_corrected_checks.py`。保持层级BM25 Top2、同一模型连续工具会话、无共享PREPARE和独立checker。搜索分页10项，单次读一条完整内容；总输出16384、最多12响应，其余边界写入plan。不为模型内容错误或不使用知识重采样；未知用量保守占用本题剩余额度，不重置预算。步骤级沿用原离线位置分母，题级显式判定最终答案、弃权/技术失败单列。所有标签human_gold=false。
+
+本轮个人120B服务使用`serve_continuous_context_vllm.py`，在固定日期入口上补回原生Harmony解析器丢弃的工具调用前analysis；不修改已安装vLLM、权重、采样或其他人的服务。首批真实IO会核对服务返回的prompt_token_ids，而不只检查本地模板。模型服务重载期间协调器后台等待，不发生成请求。
+
+结果入口为`pipeline/execution_status.json`；三库在`materials/`，检查原件在`checks/{step,final}/{pilot,formal}/`，完成后自动保存`step_metrics.json`、`final_metrics.json`及两份原始案例JSON。中断后用同一`run`精确恢复，成功项不重跑；先核对PID和锁。`verify`离线检查绑定。`refresh-unstarted`仅限零请求入口；本次原生IO修复的前后绑定与失败证据保存在`engineering_repair.json`，不是放宽正式实验协议的通用开关。
+
 ## 已批准的独立生成入口
 
 `run_corrected_step_generation.py prepare --output <corrected/bench_generation> --prior <full> --inventory <source_question_inventory.json>`：绑定原源映射的同一100题，逐项核验旧回答的完整请求、模型、采样及响应哈希，只复用一致的32份。`run --output ...`在服务器独立后台执行；退出SSH后用`confirm-detached --output ...`放行，缺项从原协议断点补齐。`verify --output ...`离线核验，不调用模型。
 
-该入口仅生成bench回答，不引用旧知识库、不启动标签/检查/语义评分。2000题建库输入已冻结，新四组工具会话仍须完成适配及试跑。30B启动器允许用STEP_RUN_ROOT指定本轮服务证据目录、STEP_CACHE_ROOT指定个人快速缓存，GPU仍须显式指定空闲卡及UUID。
+该入口仅生成bench回答，不引用旧知识库、不启动标签/检查/语义评分。2000题建库输入已冻结，完成后的下游使用上方全流程入口。30B启动器允许用STEP_RUN_ROOT指定本轮服务证据目录、STEP_CACHE_ROOT指定个人快速缓存，GPU仍须显式指定空闲卡及UUID。
 
 ## 同源建库与600题评测的前置审查
 
@@ -30,7 +42,7 @@
 
 若步骤标注明确返回`account_rate_limit_exceeded`及滚动60秒窗口错误，可使用`resume_corrected_annotations.py --output <annotations> --env <私密.env>`恢复；仅识别这一精确错误，沿用原重试/余额保护，并将请求间隔至少设为61秒。冻结文件不变，原件继续核验，新运行代码哈希写入window_limit_recovery.json；未知429仍停止。使用原annotations的confirm-detached验收。
 
-每个新客户端退出启动SSH后，用其`confirm-detached --output ...`从新连接确认。三者分别互斥，生成复用18084服务；120B标注复用18083，持服务锁时不能启动其他120B客户端。当前仅这些前置阶段已运行，新知识构建和四组连续工具检查仍需适配、试跑，不能以旧共享PREPARE执行器代替。
+每个新客户端退出启动SSH后，用其`confirm-detached --output ...`从新连接确认。三者分别互斥，生成复用18084服务；120B标注复用18083，持服务锁时不能启动其他120B客户端。上述前置阶段已完成，下游由本页当前全流程入口接续，不能以旧共享PREPARE执行器代替。
 
 ## 原批次入口（仅追溯，不恢复旧批量）
 
