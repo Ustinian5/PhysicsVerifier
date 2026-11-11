@@ -205,6 +205,29 @@ def test_raw_harmony_does_not_infer_tools_and_accepts_constrained_final(monkeypa
         transport.decode_response(raw, **args)
 
 
+@pytest.mark.parametrize('label', ['diagnostics', 'quote_patches'])
+@pytest.mark.parametrize('text', ['[]', '{"diagnostics":[]}', 'invalid JSON'])
+def test_known_final_labels_preserve_body_for_caller_schema(monkeypatch, label, text):
+    import sys
+    import types
+    module=types.ModuleType('vllm.entrypoints.harmony_utils')
+    message=SimpleNamespace(channel='final',recipient='<|constrain|>'+label,
+                            content=[SimpleNamespace(text=text)])
+    module.parse_output_into_messages=lambda ids:SimpleNamespace(messages=[message],current_content='')
+    monkeypatch.setitem(sys.modules,'vllm.entrypoints.harmony_utils',module)
+    raw=dict(model=r.EXPECTED_MODEL,usage=dict(prompt_tokens=10,completion_tokens=2),
+             choices=[dict(token_ids=[5,200002],finish_reason='stop')])
+    kw=dict(model=r.EXPECTED_MODEL,max_tokens=10,native_tools=None)
+    assert transport.decode_response(raw,**kw)['content']==text
+    # Format labels may never turn analysis or unknown routing into a final.
+    message.channel='analysis'
+    with pytest.raises(ValueError):transport.decode_response(raw,**kw)
+    message.channel='final';message.recipient='<|constrain|>unknown'
+    with pytest.raises(ValueError):transport.decode_response(raw,**kw)
+    message.recipient='<|constrain|>'+label;raw['choices'][0]['token_ids'][-1]=200012
+    with pytest.raises(ValueError):transport.decode_response(raw,**kw)
+
+
 def test_plan_freezes_prompts_and_full_50_without_calls(tmp_path, monkeypatch, isolated_reference):
     runner.prepare(tmp_path)
     plan = runner.validate_plan(tmp_path)

@@ -135,6 +135,41 @@ def test_invalid_output_is_failure_not_successful_empty(tmp_path,monkeypatch):
     assert result['status']=='content_failure' and result['value'] is None
 
 
+def test_final_array_is_retained_failure_without_resampling(tmp_path,monkeypatch):
+    calls=mock_transport(monkeypatch,[final([dict(message='unchanged allegation',evidence={'quote':'A'})])])
+    row=dict(id='a',question='Q',prediction='A');cfg=configuration()
+    result=runner.run_case(tmp_path,row,'pure','step',None,cfg,Tokenizer())
+    assert result['status']=='content_failure' and result['value'] is None
+    assert result['reason']=='Expected diagnostics object'
+    originals={str(f):vr.sha(f) for f in (tmp_path/'raw').rglob('request_*.json')}
+    (tmp_path/'result.json').unlink()  # Recover after a complete stored final.
+    again=runner.run_case(tmp_path,row,'pure','step',None,cfg,Tokenizer())
+    assert again==result and len(calls)==1
+    assert originals=={str(f):vr.sha(f) for f in (tmp_path/'raw').rglob('request_*.json')}
+
+
+def test_format_repair_receipt_cannot_change_protocol_or_retained_results(tmp_path,monkeypatch):
+    repo=tmp_path/'repo';out=tmp_path/'run'
+    for n in pipeline.SOURCES:
+        f=repo/n;f.parent.mkdir(parents=True,exist_ok=True);f.write_text('original')
+    monkeypatch.setattr(pipeline.c,'ROOT',repo)
+    vr.atomic(out/'source_evidence.json',{})
+    cfg=dict(code={n:vr.sha(repo/n) for n in pipeline.SOURCES},frozen_files={},evidence_digest=vr.digest({}))
+    vr.atomic(out/'plan.json',dict(configuration=cfg,configuration_sha256=vr.digest(cfg)))
+    old_result=out/'checks/step/formal/pure/a/result.json';vr.atomic(old_result,{'status':'complete'})
+    (repo/'scripts/gpt_oss_harmony_transport.py').write_text('decoder repair')
+    receipt=dict(configuration_sha256=vr.digest(cfg),previous_code=cfg['code'],
+        code={n:vr.sha(repo/n) for n in pipeline.SOURCES},
+        retained_files={str(old_result.relative_to(out)):vr.sha(old_result)})
+    vr.atomic(out/'final_format_repair.json',receipt);pipeline.verify(out)
+    receipt['code']['rule_framework/corrected_verifier.py']='changed prompt'
+    vr.atomic(out/'final_format_repair.json',receipt)
+    with pytest.raises(ValueError,match='unrelated implementation'):pipeline.verify(out)
+    receipt['code']['rule_framework/corrected_verifier.py']=cfg['code']['rule_framework/corrected_verifier.py']
+    vr.atomic(out/'final_format_repair.json',receipt);vr.atomic(old_result,{'status':'changed'})
+    with pytest.raises(ValueError,match='retained evidence drift'):pipeline.verify(out)
+
+
 def test_step_reference_ambiguous_quote_not_assigned_first_occurrence():
     row=dict(id='x',question='Q',prediction='same same')
     refs={'x':dict(errors=[dict(root_id='E1',status='confirmed',quote='same',claim='error')])}

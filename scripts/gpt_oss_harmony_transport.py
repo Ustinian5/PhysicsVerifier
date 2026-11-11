@@ -42,7 +42,12 @@ def decode_response(raw, *, model, max_tokens, native_tools):
     for message in parsed.messages:
         text = "".join(part.text for part in message.content)
         recipient = message.recipient
-        if message.channel == "final" and recipient in {None, "", "<|constrain|>json"}:
+        # These are final serialization labels, not tool recipients. Preserve
+        # the body verbatim: the caller still validates the frozen JSON schema.
+        # In particular, a labelled array must NOT be wrapped into diagnostics.
+        if message.channel == "final" and recipient in {
+                None, "", "<|constrain|>json", "<|constrain|>diagnostics",
+                "<|constrain|>quote_patches"}:
             finals.append(text)
         elif recipient:
             if (message.channel not in {"analysis", "commentary"} or

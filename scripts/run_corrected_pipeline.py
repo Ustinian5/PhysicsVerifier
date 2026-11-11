@@ -192,6 +192,18 @@ def verify(out, full=False):
                 'Runtime repair changed unrelated implementation')
         require(all(vr.sha(out/n)==h for n,h in repair['retained_requests'].items()),'Runtime repair raw drift')
         effective_code=repair['code']
+    format_path=out/'final_format_repair.json'
+    if format_path.exists():
+        repair=vr.read(format_path)
+        require(repair['configuration_sha256']==plan['configuration_sha256'] and
+                repair['previous_code']==effective_code,'Final format repair binding drift')
+        allowed={'scripts/run_corrected_pipeline.py','scripts/gpt_oss_harmony_transport.py'}
+        require(set(repair['code'])==set(effective_code) and all(
+            n in allowed or repair['code'][n]==h for n,h in effective_code.items()),
+            'Final format repair changed unrelated implementation')
+        require(all(vr.sha(out/n)==h for n,h in repair['retained_files'].items()),
+                'Final format repair retained evidence drift')
+        effective_code=repair['code']
     require(all(vr.sha(c.ROOT/n)==h for n,h in effective_code.items()),'Pipeline code drift')
     require(all(vr.sha(out/n)==h for n,h in cfg['frozen_files'].items()),'Pipeline input drift')
     evidence=vr.read(out/'source_evidence.json')
@@ -201,6 +213,46 @@ def verify(out, full=False):
     cache=Path(cfg['parent_pipeline']) if cfg.get('check_prompt_revision') else out
     vr.EvidenceCache(cache/'source_verification.json').check(evidence,full=full)
     return plan
+
+
+def repair_final_format(out):
+    """Bind a decoder-only fix; no schema repair, resampling or budget reset."""
+    plan=vr.read(out/'plan.json');cfg=plan['configuration'];root=Path(cfg['root'])
+    require(cfg.get('check_prompt_revision')==protocol.BILINGUAL_REVISION,'Wrong checking revision')
+    with c.corpus.r.run_lock(out/'active.lock'),c.corpus.r.run_lock(root/'organization_service_18083.lock'):
+        if (out/'final_format_repair.json').exists():return verify(out)
+        require(not(out/'runner.pid').exists(),'Stop coordinator before repair')
+        stopped=vr.read(out/'execution_status.json')
+        require(stopped.get('state')=='stopped' and
+                stopped.get('error')=='Unregistered actual Harmony recipient','Different unreviewed failure')
+        previous=cfg['code']
+        local=out/'local_rendering_repair.json'
+        if local.exists():previous=vr.read(local)['code']
+        allowed={'scripts/run_corrected_pipeline.py','scripts/gpt_oss_harmony_transport.py'}
+        require(all(n in allowed or vr.sha(c.ROOT/n)==h for n,h in previous.items()),'Unrelated runtime change')
+        affected=out/'checks/step/formal/rule_tree/cl_258_182363'
+        require(not(affected/'result.json').exists(),'Affected response already finalized')
+        raw_path=affected/'raw/check/f706965c6e38ae7ff59de8db/request_001.json'
+        record=vr.read(raw_path);request=record['request']
+        require(record['status']=='received' and record['http_status']==200,'Response not received')
+        decoded=c.corpus.harmony.decode_response(record['response'],model=request['model'],
+            max_tokens=request['max_tokens'],native_tools=request.get('tools'))
+        # The observed body violates the existing diagnostics-object schema.
+        # It must reach that validator and become a retained content failure.
+        require(not decoded.get('tool_calls') and isinstance(json.loads(decoded['content']),list),
+                'Not the reviewed final-array failure')
+        kept={str(f.relative_to(out)):vr.sha(f) for f in (out/'checks').rglob('*.json')
+              if f.name in {'result.json','input.json','started.json','first_diagnosis.json'}
+              or f.name.startswith('request_') or f.parent.name=='request_limits'}
+        kept['plan.json']=vr.sha(out/'plan.json')
+        vr.atomic(out/'final_format_repair.json',dict(configuration_sha256=plan['configuration_sha256'],
+            previous_code=previous,code={n:vr.sha(c.ROOT/n) for n in previous},retained_files=kept,
+            stopped_state=stopped,affected_request=str(raw_path.relative_to(out)),
+            intended_outcome='content_failure under unchanged diagnostics-object schema',
+            reason='Recognize known final serialization labels; preserve body and original schema validation.',
+            new_model_calls=0,content_modified=False,request_parameters_changed=False,case_budget_reset=False,
+            created_unix=time.time()))
+        verify(out)
 
 
 def repair_local_rendering(out):
@@ -677,7 +729,7 @@ def run(out):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode',choices=['prepare','verify','run','confirm-detached','refresh-unstarted','repair-engineering','prepare-check-revision','repair-local-rendering'])
+    parser.add_argument('mode',choices=['prepare','verify','run','confirm-detached','refresh-unstarted','repair-engineering','prepare-check-revision','repair-local-rendering','repair-final-format'])
     parser.add_argument('--output',type=Path,required=True);parser.add_argument('--root',type=Path)
     parser.add_argument('--parent',type=Path)
     parser.add_argument('--revision',choices=[protocol.CHECK_REVISION,protocol.LANGUAGE_REVISION,protocol.BILINGUAL_REVISION],default=protocol.CHECK_REVISION)
@@ -685,6 +737,7 @@ def main():
     if args.mode=='prepare':prepare(out,args.root.resolve())
     elif args.mode=='prepare-check-revision':prepare_check_revision(out,args.parent.resolve(),args.revision)
     elif args.mode=='repair-local-rendering':repair_local_rendering(out)
+    elif args.mode=='repair-final-format':repair_final_format(out)
     elif args.mode=='verify':verify(out);print('verified')
     elif args.mode=='confirm-detached':confirm(out)
     elif args.mode=='refresh-unstarted':refresh_unstarted(out)
