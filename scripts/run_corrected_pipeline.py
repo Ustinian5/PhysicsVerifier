@@ -219,6 +219,20 @@ def verify(out, full=False):
         require(all(vr.sha(out/n)==h for n,h in repair['retained_files'].items()),
                 'Output boundary repair retained evidence drift')
         effective_code=repair['code']
+    channel_path=out/'invalid_channel_repair.json'
+    if channel_path.exists():
+        repair=vr.read(channel_path)
+        require(repair['configuration_sha256']==plan['configuration_sha256'] and
+                repair['previous_code']==effective_code and
+                repair['previous_receipt_sha256']==vr.sha(out/'output_boundary_repair.json'),
+                'Invalid channel repair binding drift')
+        allowed={'scripts/run_corrected_pipeline.py','scripts/gpt_oss_harmony_transport.py'}
+        require(set(repair['code'])==set(effective_code) and all(
+            n in allowed or repair['code'][n]==h for n,h in effective_code.items()),
+            'Invalid channel repair changed unrelated implementation')
+        require(all(vr.sha(out/n)==h for n,h in repair['retained_files'].items()),
+                'Invalid channel retained evidence drift')
+        effective_code=repair['code']
     require(all(vr.sha(c.ROOT/n)==h for n,h in effective_code.items()),'Pipeline code drift')
     require(all(vr.sha(out/n)==h for n,h in cfg['frozen_files'].items()),'Pipeline input drift')
     evidence=vr.read(out/'source_evidence.json')

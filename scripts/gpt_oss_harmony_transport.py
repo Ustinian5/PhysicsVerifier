@@ -50,6 +50,7 @@ def decode_response(raw, *, model, max_tokens, native_tools):
     if parsed.current_content:
         raise ValueError("Incomplete Harmony message")
     reasoning, finals, calls = [], [], []
+    invalid_tool_channel = False
     names = {t["function"]["name"] for t in native_tools or []}
     for message in parsed.messages:
         text = "".join(part.text for part in message.content)
@@ -60,9 +61,9 @@ def decode_response(raw, *, model, max_tokens, native_tools):
         if message.channel == "final" and is_final_format(recipient):
             finals.append(text)
         elif recipient:
-            if (message.channel not in {"analysis", "commentary"} or
-                    not recipient.startswith("functions.") or recipient[10:] not in names):
+            if (not recipient.startswith("functions.") or recipient[10:] not in names):
                 raise ValueError("Unregistered actual Harmony recipient")
+            invalid_tool_channel |= message.channel not in {"analysis", "commentary"}
             calls.append({"id": "call_" + hashlib.sha256((recipient + text).encode()).hexdigest()[:24],
                           "type": "function", "function": {"name": recipient[10:], "arguments": text}})
         elif message.channel == "analysis":
@@ -72,6 +73,8 @@ def decode_response(raw, *, model, max_tokens, native_tools):
     if calls:
         if len(calls) != 1 or finals or terminal != 200012:
             raise ValueError("Ambiguous tool yield")
+        if invalid_tool_channel:
+            raise ModelContentError("Registered tool emitted on invalid channel")
         try:
             arguments = json.loads(calls[0]["function"]["arguments"])
         except json.JSONDecodeError as exc:
