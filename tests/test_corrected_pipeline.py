@@ -102,6 +102,117 @@ def configuration():
     return dict(transport=dict(model=runner.c.corpus.r.EXPECTED_MODEL,auditor_api='http://unused',fixed_date='2026-11-07',timeout_seconds=1200))
 
 
+@pytest.mark.parametrize('task,bad', [
+    ('step', None), ('step', []), ('step', {'diagnostics': None}),
+    ('step', {'diagnostics': [None]}), ('step', {'diagnostics': ['wrong']}),
+    ('step', {'diagnostics': [{'message': []}]}),
+    ('step', {'diagnostics': [{'message': 'error', 'evidence': None}]}),
+    ('step', {'diagnostics': [{'message': 'error', 'evidence': {'quote': 1}}]}),
+    ('step', {'diagnostics': [{'message': 'error', 'evidence': {'quote': 'A'}, 'rule_refs': 'x'}]}),
+    ('step', {'diagnostics': [{'message': 'error', 'evidence': {'quote': 'A'}, 'rule_refs': [None]}]}),
+    ('final', None), ('final', []), ('final', {'diagnostics': []}),
+    ('final', {'verdict': [], 'reason': 'x', 'student_final_answer': 'A'}),
+    ('final', {'verdict': 'yes', 'reason': 'x', 'student_final_answer': 'A'}),
+    ('final', {'verdict': 'correct', 'reason': '', 'student_final_answer': 'A'}),
+    ('final', {'verdict': 'correct', 'reason': 'x', 'student_final_answer': ''}),
+    ('final', {'verdict': 'incorrect', 'reason': {}, 'student_final_answer': 'A'}),
+])
+@pytest.mark.parametrize('arm', ['pure', 'flat_skills'])
+def test_schema_fault_matrix_is_terminal_case_failure_not_a_reroll(tmp_path, monkeypatch, task, bad, arm):
+    calls = mock_transport(monkeypatch, [final(bad)])
+    row = dict(id='q', question='Q', prediction='A')
+    memory = None if arm == 'pure' else p.FlatMemory(docs())
+    result = runner.run_case(tmp_path, row, arm, task, memory, configuration(), Tokenizer())
+    assert result['status'] == 'content_failure' and result['value'] is None
+    assert result['usage']['requests'] == 1 and len(result['evidence']) == 1
+    before = vr.sha(tmp_path / 'result.json')
+    assert runner.run_case(tmp_path, row, arm, task, memory, configuration(), Tokenizer()) == result
+    assert len(calls) == 1 and vr.sha(tmp_path / 'result.json') == before
+
+
+@pytest.mark.parametrize('task', ['step', 'final'])
+def test_batch_continues_after_one_format_failure_without_deleting_case(tmp_path, monkeypatch, task):
+    good = {'diagnostics': []} if task == 'step' else dict(
+        verdict='correct', student_final_answer='A', reason='valid')
+    calls = mock_transport(monkeypatch, [final([])] + [final(good)] * 7)
+    monkeypatch.setattr(pipeline, 'check_condition', lambda *args: configuration())
+    rows = [dict(id=str(i), question='Q', prediction='A') for i in range(2)]
+    memories = dict(pure=None, case_rag=p.FlatMemory([dict(d, kind='case') for d in docs()]),
+        flat_skills=p.FlatMemory(docs()),
+        rule_tree=p.TreeMemory(finish(engine(tmp_path / 'tree', bundle(3)))['catalog']))
+    results = pipeline.checks(tmp_path, {}, Tokenizer(), task, 'formal', rows, memories)
+    assert len(calls) == 8 and all([r['id'] for r in results[a]] == ['0', '1'] for a in p.ARMS)
+    assert results['pure'][0]['status'] == 'content_failure'
+    assert sum(r['status'] == 'complete' for rs in results.values() for r in rs) == 7
+
+
+@pytest.mark.parametrize('message', ['Unregistered actual Harmony recipient', 'Ambiguous tool yield',
+    'Contradictory stop metadata', 'Missing or inconsistent token usage', 'Unexpected unrouted Harmony message'])
+def test_unreviewed_native_fault_remains_global_stop(tmp_path, monkeypatch, message):
+    mock_transport(monkeypatch, [final({'diagnostics': []})])
+    def decode(*args, **kwargs):
+        raise ValueError(message)
+    monkeypatch.setattr(runner.c.corpus.harmony, 'decode_response', decode)
+    with pytest.raises(ValueError, match=message):
+        runner.run_case(tmp_path, dict(id='q', question='Q', prediction='A'),
+                        'pure', 'step', None, configuration(), Tokenizer())
+    assert not (tmp_path / 'result.json').exists()
+    assert len(list((tmp_path / 'raw').rglob('request_*.json'))) == 1
+
+
+def test_step_failure_keeps_reference_denominator_and_is_not_successful_empty():
+    rows = [dict(id='q', question='Q', prediction='bad claim')]
+    refs, unresolved, _ = pipeline.reference_rows(rows, {'q': dict(errors=[dict(
+        root_id='E1', status='confirmed', quote='bad claim', claim='error')])})
+    score = pipeline.scoring.score(refs, [dict(id='q', diagnostics=[], execution_failure=True,
+        source_status='content_failure')], unresolved, preserve_zero_offsets=True)['summary']
+    assert score['dataset_size'] == score['total_gt_errors'] == score['failed_questions'] == 1
+    assert score['successful_empty_questions'] == 0 and score['recall'] == 0
+
+
+def test_preflight_uses_request_builder_without_model_call_and_flags_oversize(tmp_path, monkeypatch):
+    from scripts import audit_corrected_runtime as audit
+    rows = [dict(id=str(i), question='Q', prediction='A', context='') for i in range(100)]
+    vr.atomic(tmp_path / 'step_inputs.json', rows)
+    def forbidden(*args, **kwargs):
+        pytest.fail('Read-only audit must not invoke a model or finalize a case')
+    monkeypatch.setattr(runner.c.corpus.Journal, 'call', forbidden)
+    monkeypatch.setattr(runner, 'run_case', forbidden)
+    monkeypatch.setattr(runner, 'token_count', lambda *args: p.LIMITS['context_tokens'])
+    actual, report = audit.audit_cohort(tmp_path, 'step', configuration(), Tokenizer())
+    assert actual == rows and report['arm_conditions'] == len(report['oversized']) == 400
+    assert list(tmp_path.iterdir()) == [tmp_path / 'step_inputs.json']
+
+
+def test_preflight_reference_rehearsal_does_not_publish_fake_scores(tmp_path):
+    from scripts import audit_corrected_runtime as audit
+    rows = [dict(id=str(i)) for i in range(600)]
+    vr.atomic(tmp_path / 'final_labels_private.json', {r['id']: dict(
+        verdict='correct' if int(r['id']) < 300 else 'incorrect') for r in rows})
+    result = audit.audit_scoring(tmp_path, 'final', rows)
+    assert result['questions'] == 600 and result['label_balance'] == {'correct': 300, 'incorrect': 300}
+    assert not any('metric' in x.name for x in tmp_path.iterdir())
+
+
+def test_preflight_saved_failure_is_audited_without_rerun_and_tamper_stops(tmp_path, monkeypatch):
+    from scripts import audit_corrected_runtime as audit
+    row = dict(id='q', question='Q', prediction='A')
+    cfg = configuration()
+    monkeypatch.setattr(pipeline, 'check_condition', lambda *args: cfg)
+    calls = mock_transport(monkeypatch, [final([])])
+    folder = tmp_path / 'checks/step/formal/pure/q'
+    result = runner.run_case(folder, row, 'pure', 'step', None, cfg, Tokenizer())
+    before = vr.sha(folder / 'result.json')
+    report = audit.audit_results(tmp_path, cfg, {'step': [row], 'final': []})
+    assert report['snapshot_results'] == report['evidence_files'] == len(calls) == 1
+    assert report['outcomes']['step']['pure'] == {'content_failure': 1}
+    assert vr.sha(folder / 'result.json') == before
+    raw = folder / result['evidence'][0]['file']
+    raw.write_text(raw.read_text() + ' ')
+    with pytest.raises(ValueError, match='Saved raw evidence drift'):
+        audit.audit_results(tmp_path, cfg, {'step': [row], 'final': []})
+
+
 def test_full_conversation_tool_analysis_and_exact_success_replay(tmp_path,monkeypatch):
     answer={'diagnostics':[dict(message='unit error',evidence={'quote':'bad claim'},rule_refs=['k00'])]}
     calls=mock_transport(monkeypatch,[tool('search_memory',{'query':'磁场','offset':0},1),
