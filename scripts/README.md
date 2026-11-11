@@ -16,7 +16,11 @@
 
 本轮工具JSON本地校验误报的工程修复使用`repair-local-rendering --output <检查修订目录>`，仅接受该明确故障、原进程退出且无正式检查的状态；保留plan、请求指纹、原成功响应与预算，代码差异绑定到local_rendering_repair.json，不重新创建检查批次。之后仍用原run/confirm-detached续跑；此入口不能更改提示、模型或采样。
 
-当前结果入口为`pipeline/check_prompt_revision/execution_status.json`，原`pipeline/execution_status.json`保留为修正前停止记录。新目录中三库在`materials/`，检查原件在`checks/{step,final}/{pilot,formal}/`，完成后自动保存`step_metrics.json`、`final_metrics.json`及两份原始案例JSON。中断后用同一`run`精确恢复，成功项不重跑；先核对PID和锁。`verify`离线检查绑定。`refresh-unstarted`仅限零请求入口；原生IO修复记录`engineering_repair.json`仅适用于首次建库前，不得用于改写已完成实验的冻结计划。
+首轮最小提示仍未通过查库验收，用户进一步批准中文树查询及相关候选先读全文；冻结入口为`prepare-check-revision --revision chinese_tree_lookup_and_full_read_20261111 --parent <corrected/pipeline> --output <corrected/pipeline/check_prompt_revision_language>`。它额外绑定上一轮全部结果/请求和离线语言路由对照，预算及其他协议不变，不是反复重抽直到得分更高。
+
+完整树核验发现上层中文摘要与下层英文簇混合，用户最终批准仅树查询采用领域名＋中英双语词。入口为`prepare-check-revision --revision bilingual_tree_lookup_20261111 --parent <corrected/pipeline> --output <corrected/pipeline/check_prompt_revision_bilingual>`，校验并复用上一轮未改变提示的RAG/skills及原纯组18份试跑，只新增树组6份；已通过步骤级原验收门槛并进入正式运行。
+
+当前结果入口为`pipeline/check_prompt_revision_bilingual/execution_status.json`，原`pipeline/`及前两轮检查修订的状态保留为历史停止记录。新目录中三库在`materials/`，检查原件在`checks/{step,final}/{pilot,formal}/`，完成后自动保存`step_metrics.json`、`final_metrics.json`及两份原始案例JSON。中断后用同一`run`精确恢复，成功项不重跑；先核对PID和锁。`verify`离线检查绑定。`refresh-unstarted`仅限零请求入口；原生IO修复记录`engineering_repair.json`仅适用于首次建库前，不得用于改写已完成实验的冻结计划。
 
 ## 已批准的独立生成入口
 

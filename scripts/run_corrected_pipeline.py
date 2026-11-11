@@ -225,10 +225,12 @@ def repair_local_rendering(out):
         verify(out)
 
 
-def prepare_check_revision(out,parent):
+def prepare_check_revision(out,parent,revision=protocol.CHECK_REVISION):
     """User-approved suffix only; retain original construction and pilot records."""
     require(Path('/proc').exists(),'Prepare against server originals')
-    require(out==parent/'check_prompt_revision','Use the single registered checking revision')
+    names={protocol.CHECK_REVISION:'check_prompt_revision',protocol.LANGUAGE_REVISION:'check_prompt_revision_language',
+           protocol.BILINGUAL_REVISION:'check_prompt_revision_bilingual'}
+    require(revision in names and out==parent/names[revision],'Use the registered checking revision')
     old=vr.read(parent/'plan.json');cfg=old['configuration']
     require(vr.digest(cfg)==old['configuration_sha256'],'Parent plan drift')
     root=Path(cfg['root'])
@@ -267,6 +269,29 @@ def prepare_check_revision(out,parent):
         bindings[str(probe)]=vr.sha(probe)
         for name,h in receipt['files'].items():
             require(vr.sha(probe.parent/name)==h,'Native IO raw drift');bindings[str(probe.parent/name)]=h
+        if revision in {protocol.LANGUAGE_REVISION,protocol.BILINGUAL_REVISION}:
+            previous=parent/('check_prompt_revision_language' if revision==protocol.BILINGUAL_REVISION else 'check_prompt_revision')
+            require(not(previous/'runner.pid').exists(),'Previous checking revision still active')
+            require(not(previous/'STOP').exists(),'Previous STOP remains in force')
+            previous_plan=vr.read(previous/'plan.json');previous_cfg=previous_plan['configuration']
+            require(vr.digest(previous_cfg)==previous_plan['configuration_sha256'],'Previous plan digest drift')
+            for n,h in previous_cfg['parent_bindings'].items():
+                require(vr.sha(Path(n))==h,'Earlier bound evidence drift');bindings[n]=h
+            old_pilot=vr.read(previous/'step_pilot_acceptance.json')
+            require(not old_pilot['passed'] and not old_pilot['blocked'],'Unexpected preceding pilot outcome')
+            require(old_pilot['per_arm']['rule_tree']['read']==0,'Expected recorded missing tree reads')
+            require(not list((previous/'checks/step/formal').rglob('result.json')) and
+                    not list((previous/'checks/final').rglob('result.json')),'Previous formal checks already started')
+            records=['plan.json','step_pilot_acceptance.json']+(
+                ['routing_failure_audit.json'] if revision==protocol.BILINGUAL_REVISION else
+                ['local_rendering_repair.json','lookup_language_audit.json'])
+            for n in records:
+                bindings[str(previous/n)]=vr.sha(previous/n)
+            for n,h in old_pilot['output_files'].items():
+                f=previous/n;require(vr.sha(f)==h,'Previous pilot result drift');bindings[str(f)]=h
+                for ev in vr.read(f)['evidence']:
+                    raw=f.parent/ev['file'];require(vr.sha(raw)==ev['sha256'],'Previous pilot raw drift')
+                    bindings[str(raw)]=ev['sha256']
         out.mkdir(parents=True,exist_ok=True)
         for name in list(cfg['frozen_files'])+['source_evidence.json','construction_acceptance.json','material_isolation.json','materials','service']:
             link=out/name
@@ -276,15 +301,33 @@ def prepare_check_revision(out,parent):
         if pure_link.is_symlink():require(pure_link.resolve()==(parent/'checks/step/pilot/pure').resolve(),'Wrong pure link')
         else:require(not pure_link.exists(),'Unexpected pure output');pure_link.symlink_to(parent/'checks/step/pilot/pure')
         updated=dict(cfg,code={n:vr.sha(c.ROOT/n) for n in SOURCES},
-            check_prompt_revision=protocol.CHECK_REVISION,parent_pipeline=str(parent),parent_bindings=bindings,
+            check_prompt_revision=revision,parent_pipeline=str(parent),parent_bindings=bindings,
             pure_pilot_condition=check_condition(parent,cfg),
             prompt_change=dict(authorization='User 2026-11-11: adopt minimal suffix; pilot then automatically continue',
                 appended_user_suffix=protocol.REQUIRED_LOOKUP_SUFFIX,arms=list(protocol.ARMS[1:]),
                 unchanged='Original prompts intact; pure unchanged; tool_choice auto; same model, retrieval, materials, budget and scoring'))
+        if revision==protocol.LANGUAGE_REVISION:
+            updated['prompt_change'].update(authorization='User 2026-11-11: adopt Chinese tree queries and full-read relevance instructions; pilot then continue automatically',
+                additional_knowledge_suffix=protocol.READ_SUFFIX,additional_tree_suffix=protocol.TREE_LANGUAGE_SUFFIX,
+                previous_check_revision=str(parent/'check_prompt_revision'))
+        elif revision==protocol.BILINGUAL_REVISION:
+            require(previous_cfg['check_prompt_revision']==protocol.LANGUAGE_REVISION,'Wrong preceding prompt revision')
+            updated['prompt_change'].update(authorization='User 2026-11-11: bilingual tree queries with physical domain; reuse other three pilot arms; pilot then automatically continue',
+                additional_knowledge_suffix=protocol.READ_SUFFIX,additional_tree_suffix=protocol.TREE_BILINGUAL_SUFFIX,
+                previous_check_revision=str(previous),changed_from_previous=['rule_tree'])
+            updated['pilot_reuse_conditions']={'pure':updated['pure_pilot_condition']}
+            for arm in ('case_rag','flat_skills'):
+                for row in vr.read(parent/'pilot_inputs.json'):
+                    require(protocol.messages(row,arm,'step',revision=previous_cfg['check_prompt_revision'])==
+                            protocol.messages(row,arm,'step',revision=revision),'Cannot reuse changed pilot input')
+                link=out/'checks/step/pilot'/arm
+                if link.is_symlink():require(link.resolve()==(previous/'checks/step/pilot'/arm).resolve(),'Wrong reuse link')
+                else:require(not link.exists(),'Unexpected reuse output');link.symlink_to(previous/'checks/step/pilot'/arm)
+                updated['pilot_reuse_conditions'][arm]=check_condition(previous,previous_cfg)
         immutable(out/'plan.json',dict(configuration=updated,configuration_sha256=vr.digest(updated)))
         verify(out)
         emit(out,'prepared_check_prompt_revision',retained_original_pilots=24,reused_pure_pilots=6,
-             construction_model_calls=0)
+             reused_pilot_arms=list(updated.get('pilot_reuse_conditions',{'pure':None})),construction_model_calls=0)
 
 
 def refresh_unstarted(out):
@@ -538,6 +581,8 @@ def checks(out,cfg,tokenizer,task,phase,rows,memories):
                 require(not(Path(cfg['parent_pipeline'])/'STOP').exists(),'Parent STOP requested')
             active_condition=cfg['pure_pilot_condition'] if (cfg.get('check_prompt_revision') and
                 task=='step' and phase=='pilot' and arm=='pure') else condition
+            if task=='step' and phase=='pilot':
+                active_condition=cfg.get('pilot_reuse_conditions',{}).get(arm,active_condition)
             result=checking.run_case(out/'checks'/task/phase/arm/row['id'],row,arm,task,memories[arm],active_condition,tokenizer)
             results[arm].append(result)
             emit(out,'checking_'+task+'_'+phase,question_index=i+1,total=len(rows),arm=arm,outcome=result['status'])
@@ -635,9 +680,10 @@ def main():
     parser.add_argument('mode',choices=['prepare','verify','run','confirm-detached','refresh-unstarted','repair-engineering','prepare-check-revision','repair-local-rendering'])
     parser.add_argument('--output',type=Path,required=True);parser.add_argument('--root',type=Path)
     parser.add_argument('--parent',type=Path)
+    parser.add_argument('--revision',choices=[protocol.CHECK_REVISION,protocol.LANGUAGE_REVISION,protocol.BILINGUAL_REVISION],default=protocol.CHECK_REVISION)
     args=parser.parse_args();out=args.output.resolve()
     if args.mode=='prepare':prepare(out,args.root.resolve())
-    elif args.mode=='prepare-check-revision':prepare_check_revision(out,args.parent.resolve())
+    elif args.mode=='prepare-check-revision':prepare_check_revision(out,args.parent.resolve(),args.revision)
     elif args.mode=='repair-local-rendering':repair_local_rendering(out)
     elif args.mode=='verify':verify(out);print('verified')
     elif args.mode=='confirm-detached':confirm(out)

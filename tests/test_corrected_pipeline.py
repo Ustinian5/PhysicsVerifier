@@ -289,3 +289,25 @@ def test_local_tool_json_round_trip_does_not_hide_missing_context():
         runner.rendered(EscapedTemplate(),[dict(role='tool',content=text+'lost')],None)
     with pytest.raises(ValueError,match='Template dropped visible context'):
         runner.rendered(EscapedTemplate(),[dict(role='user',content=text)],None)
+
+
+@pytest.mark.parametrize('task',['step','final'])
+@pytest.mark.parametrize('arm',p.ARMS)
+def test_language_revision_changes_only_approved_group_suffixes(task,arm):
+    row=dict(question='Q',prediction='A')
+    prior=p.messages(row,arm,task,revision=p.CHECK_REVISION)
+    expected=copy.deepcopy(prior)
+    if arm!='pure':expected[-1]['content']+='\n\n'+p.READ_SUFFIX
+    if arm=='rule_tree':expected[-1]['content']+='\n\n'+p.TREE_LANGUAGE_SUFFIX
+    assert p.messages(row,arm,task,revision=p.LANGUAGE_REVISION)==expected
+
+
+@pytest.mark.parametrize('task',['step','final'])
+@pytest.mark.parametrize('arm',p.ARMS)
+def test_bilingual_amendment_changes_tree_only(task,arm):
+    row=dict(question='Q',prediction='A')
+    before=p.messages(row,arm,task,revision=p.LANGUAGE_REVISION)
+    after=p.messages(row,arm,task,revision=p.BILINGUAL_REVISION)
+    if arm=='rule_tree':
+        before[-1]['content']=before[-1]['content'].removesuffix(p.TREE_LANGUAGE_SUFFIX)+p.TREE_BILINGUAL_SUFFIX
+    assert after==before

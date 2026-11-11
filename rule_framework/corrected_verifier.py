@@ -13,7 +13,12 @@ from scripts import continuous_context_v2 as step
 
 VERSION = 'corrected_continuous_four_arm_v1'
 CHECK_REVISION = 'required_lookup_suffix_20261111'
+LANGUAGE_REVISION = 'chinese_tree_lookup_and_full_read_20261111'
+BILINGUAL_REVISION = 'bilingual_tree_lookup_20261111'
 REQUIRED_LOOKUP_SUFFIX = '''Before publishing your final JSON, actually call search_memory in this conversation. If it returns a potentially relevant candidate, call read_memory to read the COMPLETE item before continuing your check. Then continue checking the original answer and publish the final JSON in this same conversation. Even when you already have an independent judgment, do not omit the lookup. If no candidate is relevant, retain the actual lookup attempt and continue independently; do not force an unrelated item. Do not simulate tool results.'''
+READ_SUFFIX = '''If a returned candidate concerns the physical relationship you are checking, read its COMPLETE item with read_memory before deciding whether its conditions and advice apply. The search excerpt is only a preview, not the full item. A different historical setup or lack of an exact match to this problem is not by itself a reason to skip a candidate about the same physical relationship. Judge applicability after reading; reject inapplicable advice and do not force genuinely unrelated material.'''
+TREE_LANGUAGE_SUFFIX = '''The rule-tree directory is Chinese and routing is lexical BM25. Use short Chinese physics terms for the relationships and conditions being checked, translating the problem's concepts into Chinese for your query. If you already tried an English query and it returned no candidates, retry that issue once using Chinese physics terms before concluding that the tree has no relevant candidate. This remains within the original response and token budget; no extra allowance is granted.'''
+TREE_BILINGUAL_SUFFIX = '''The rule tree mixes languages: Domain/Topic names are English with Chinese summaries, while many lower-level cluster summaries are English. BM25 routes through EVERY level, so a single-language query can stop before reaching a relevant rule. In each search_memory query, include the corresponding physical domain name and BOTH Chinese and English physics terms for the relationship and conditions being checked. Infer those terms from the current problem and answer. The existing domains are Mechanics (力学), Electromagnetism (电磁学), Thermodynamics & Statistical Physics (热力学与统计物理), Optics (光学), Modern Physics (近代物理), and Experimental Physics (实验物理). Use the appropriate domain, not all domains. If an earlier single-language lookup missed, retry that issue once with a bilingual query before concluding that the library lacks relevant candidates. Read a potentially relevant full item as instructed above. All searches, reads and final output remain within the original response and token budget.'''
 ARMS = ('pure', 'case_rag', 'flat_skills', 'rule_tree')
 LIMITS = dict(responses=12, output_tokens=16384, input_tokens=600000,
               context_tokens=131072, seconds=1800, request_seconds=1200,
@@ -41,7 +46,7 @@ def tools():
 
 def messages(row, arm, task, *, revision=None):
     require(arm in ARMS and task in {'step', 'final'}, 'Unknown experiment')
-    require(revision in {None, CHECK_REVISION}, 'Unknown checking prompt revision')
+    require(revision in {None, CHECK_REVISION, LANGUAGE_REVISION, BILINGUAL_REVISION}, 'Unknown checking prompt revision')
     # Whitelist even when callers possess benchmark references or labels.
     public = {k: row.get(k, '') for k in ('question', 'prediction', 'context')}
     extra = USE + '\n' + DESCRIPTIONS[arm] if arm != 'pure' else ''
@@ -52,8 +57,12 @@ def messages(row, arm, task, *, revision=None):
         result = step.messages(public, rules=False, tree_root=None)
         if extra:
             result[0]['content'] += '\n\n' + extra
-    if revision == CHECK_REVISION and arm != 'pure':
+    if revision in {CHECK_REVISION, LANGUAGE_REVISION, BILINGUAL_REVISION} and arm != 'pure':
         result[-1]['content'] += '\n\n' + REQUIRED_LOOKUP_SUFFIX
+        if revision in {LANGUAGE_REVISION, BILINGUAL_REVISION}:
+            result[-1]['content'] += '\n\n' + READ_SUFFIX
+            if arm == 'rule_tree':result[-1]['content'] += '\n\n' + (
+                TREE_BILINGUAL_SUFFIX if revision==BILINGUAL_REVISION else TREE_LANGUAGE_SUFFIX)
     return result
 
 
