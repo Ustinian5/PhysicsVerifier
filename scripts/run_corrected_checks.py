@@ -21,6 +21,23 @@ def parsed(text):
     return value, dict(literal_control_positions=controls, literal_backslash_positions=positions)
 
 
+def rendered_tool_texts(value):
+    """HF's tool bodies are JSON strings; native vLLM bodies are raw text.
+
+    This is only the local estimate/guard. Decode the template's JSON layer
+    before checking exact equality; never weaken the actual server-input check.
+    """
+    texts=[]
+    for segment in value.split('<|start|>'):
+        header,sep,body=segment.partition('<|message|>')
+        if sep and header.startswith('functions.') and 'to=assistant' in header:
+            encoded=body.partition('<|end|>')[0]
+            try:decoded=json.loads(encoded)
+            except (ValueError,TypeError):continue
+            if isinstance(decoded,str):texts.append(decoded)
+    return texts
+
+
 def rendered(tokenizer, messages, native):
     value = tokenizer.apply_chat_template(messages, tools=native, tokenize=False,
         add_generation_prompt=True, reasoning_effort='medium')
@@ -33,7 +50,9 @@ def rendered(tokenizer, messages, native):
             if 'tool_calls' in message and any(m['role']=='assistant' and 'tool_calls' not in m
                                                for m in messages[messages.index(message)+1:]):
                 continue
-            require(not text or text in value, 'Template dropped visible context')
+            require(not text or text in value or
+                    (message['role']=='tool' and text in rendered_tool_texts(value)),
+                    'Template dropped visible context')
     return value
 
 

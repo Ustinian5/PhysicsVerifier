@@ -277,3 +277,15 @@ def test_revision_freezes_parent_and_reuses_only_pure(tmp_path,monkeypatch):
     vr.atomic(parent/'checks/step/pilot/case_rag/p0/result.json',{'changed':True})
     with pytest.raises(ValueError,match='Parent experiment evidence drift'):
         pipeline.verify(out)
+
+
+def test_local_tool_json_round_trip_does_not_hide_missing_context():
+    text=json.dumps({'公式':'x = \\frac{a}{b}','title':'"quoted"'},ensure_ascii=False)
+    class EscapedTemplate:
+        def apply_chat_template(self,messages,**kw):
+            return '<|start|>functions.search_memory to=assistant<|channel|>commentary<|message|>'+json.dumps(text)+'<|end|>'
+    assert text in runner.rendered_tool_texts(runner.rendered(EscapedTemplate(),[dict(role='tool',content=text)],None))
+    with pytest.raises(ValueError,match='Template dropped visible context'):
+        runner.rendered(EscapedTemplate(),[dict(role='tool',content=text+'lost')],None)
+    with pytest.raises(ValueError,match='Template dropped visible context'):
+        runner.rendered(EscapedTemplate(),[dict(role='user',content=text)],None)

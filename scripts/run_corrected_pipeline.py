@@ -181,7 +181,18 @@ def prepare(out, root):
 def verify(out, full=False):
     plan=vr.read(out/'plan.json');cfg=plan['configuration']
     require(vr.digest(cfg)==plan['configuration_sha256'],'Pipeline plan drift')
-    require(all(vr.sha(c.ROOT/n)==h for n,h in cfg['code'].items()),'Pipeline code drift')
+    effective_code=cfg['code']
+    repair_path=out/'local_rendering_repair.json'
+    if repair_path.exists():
+        repair=vr.read(repair_path)
+        require(repair['configuration_sha256']==plan['configuration_sha256'],'Runtime repair binding drift')
+        require(set(repair['code'])==set(effective_code),'Runtime repair file set drift')
+        allowed={'scripts/run_corrected_pipeline.py','scripts/run_corrected_checks.py'}
+        require(all(n in allowed or repair['code'][n]==h for n,h in effective_code.items()),
+                'Runtime repair changed unrelated implementation')
+        require(all(vr.sha(out/n)==h for n,h in repair['retained_requests'].items()),'Runtime repair raw drift')
+        effective_code=repair['code']
+    require(all(vr.sha(c.ROOT/n)==h for n,h in effective_code.items()),'Pipeline code drift')
     require(all(vr.sha(out/n)==h for n,h in cfg['frozen_files'].items()),'Pipeline input drift')
     evidence=vr.read(out/'source_evidence.json')
     require(vr.digest(evidence)==cfg['evidence_digest'],'Evidence manifest drift')
@@ -190,6 +201,28 @@ def verify(out, full=False):
     cache=Path(cfg['parent_pipeline']) if cfg.get('check_prompt_revision') else out
     vr.EvidenceCache(cache/'source_verification.json').check(evidence,full=full)
     return plan
+
+
+def repair_local_rendering(out):
+    """One bounded engineering repair; preserve signatures, bodies and budgets."""
+    plan=vr.read(out/'plan.json');cfg=plan['configuration'];root=Path(cfg['root'])
+    require(cfg.get('check_prompt_revision')==protocol.CHECK_REVISION,'Not the authorized checking revision')
+    with c.corpus.r.run_lock(out/'active.lock'),c.corpus.r.run_lock(root/'organization_service_18083.lock'):
+        if (out/'local_rendering_repair.json').exists():return verify(out)
+        require(not(out/'runner.pid').exists(),'Stop coordinator before repair')
+        require(vr.read(out/'execution_status.json').get('error')=='Template dropped visible context',
+                'This repair only addresses the recorded local tool-JSON guard failure')
+        require(not list((out/'checks/step/formal').rglob('result.json')) and
+                not list((out/'checks/final').rglob('result.json')),'Repair is pre-formal only')
+        allowed={'scripts/run_corrected_pipeline.py','scripts/run_corrected_checks.py'}
+        require(all(n in allowed or vr.sha(c.ROOT/n)==h for n,h in cfg['code'].items()),'Unrelated runtime change')
+        raw={str(f.relative_to(out)):vr.sha(f) for f in (out/'checks').rglob('request_*.json')}
+        require(bool(raw),'Missing successful prefix to preserve')
+        vr.atomic(out/'local_rendering_repair.json',dict(configuration_sha256=plan['configuration_sha256'],
+            retained_requests=raw,code={n:vr.sha(c.ROOT/n) for n in SOURCES},
+            reason='HF local template JSON-encodes tool strings. Decode that layer for exact context validation; actual request and deployed-input validation unchanged.',
+            request_parameters_changed=False,case_budget_reset=False,created_unix=time.time()))
+        verify(out)
 
 
 def prepare_check_revision(out,parent):
@@ -599,12 +632,13 @@ def run(out):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode',choices=['prepare','verify','run','confirm-detached','refresh-unstarted','repair-engineering','prepare-check-revision'])
+    parser.add_argument('mode',choices=['prepare','verify','run','confirm-detached','refresh-unstarted','repair-engineering','prepare-check-revision','repair-local-rendering'])
     parser.add_argument('--output',type=Path,required=True);parser.add_argument('--root',type=Path)
     parser.add_argument('--parent',type=Path)
     args=parser.parse_args();out=args.output.resolve()
     if args.mode=='prepare':prepare(out,args.root.resolve())
     elif args.mode=='prepare-check-revision':prepare_check_revision(out,args.parent.resolve())
+    elif args.mode=='repair-local-rendering':repair_local_rendering(out)
     elif args.mode=='verify':verify(out);print('verified')
     elif args.mode=='confirm-detached':confirm(out)
     elif args.mode=='refresh-unstarted':refresh_unstarted(out)
