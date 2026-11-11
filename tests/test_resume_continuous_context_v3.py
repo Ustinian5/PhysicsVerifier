@@ -80,7 +80,7 @@ def test_stored_quote_response_recovered_without_new_generation(tmp_path, monkey
 
 
 @pytest.mark.parametrize("kwargs", [
-    {"channel": "analysis"}, {"recipient": "<|constrain|>other"},
+    {"channel": "analysis"}, {"recipient": "functions.other"},
     {"content": '{"diagnostics":[]'}, {"content": '{"diagnostics":[],"extra":1}'},
     {"content": '{"diagnostics":{}}'}, {"terminal": 200012},
 ])

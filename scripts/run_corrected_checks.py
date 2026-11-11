@@ -8,6 +8,7 @@ from rule_framework import corrected_verifier as p
 from rule_framework import verified_resume as vr
 from scripts import run_corrected_collection as c
 from scripts import run_corrected_extraction as extraction
+from scripts.gpt_oss_harmony_transport import ModelContentError
 from scripts.run_qwen30b_step_checks import validate_effective_input
 
 require = c.require
@@ -147,6 +148,9 @@ def run_case(folder, row, arm, task, memory, configuration, tokenizer):
         used_in += prompt; used_out += completion
         try:
             decoded = c.corpus.harmony.decode_response(raw, model=cfg['model'],max_tokens=remaining,native_tools=active_tools)
+        except ModelContentError as exc:
+            status, reason = 'content_failure', str(exc)
+            break
         except ValueError as exc:
             if str(exc) not in {'Incomplete model output','No authoritative final/tool termination',
                                 'Incomplete Harmony message','Missing final message'}:
@@ -158,6 +162,8 @@ def run_case(folder, row, arm, task, memory, configuration, tokenizer):
             name = call['function']['name']; args = json.loads(call['function']['arguments'])
             assistant = p.assistant_tool_message(decoded)
             try:
+                if name=='search_memory':
+                    require(isinstance(args.get('query'),str),'Search query must be a string')
                 returned = knowledge.preview(name,args)
             except ValueError as exc:
                 returned = dict(error=str(exc), full_item_not_returned=True)

@@ -7,11 +7,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 
 import httpx
 
 from scripts import run_gpt_oss_selfcheck as r
+
+
+class ModelContentError(ValueError):
+    """Metered response with malformed arguments to an actually registered tool."""
+
+
+def is_final_format(recipient):
+    # Harmony's constrain metadata names a serialization format, not a tool.
+    # Accept a single label, never routing text, whitespace or control tokens.
+    return recipient is None or recipient == "" or (isinstance(recipient, str) and
+        re.fullmatch(r"<\|constrain\|>[A-Za-z_][A-Za-z0-9_.-]*", recipient) is not None)
 
 
 def decode_response(raw, *, model, max_tokens, native_tools):
@@ -45,17 +57,12 @@ def decode_response(raw, *, model, max_tokens, native_tools):
         # These are final serialization labels, not tool recipients. Preserve
         # the body verbatim: the caller still validates the frozen JSON schema.
         # In particular, a labelled array must NOT be wrapped into diagnostics.
-        if message.channel == "final" and recipient in {
-                None, "", "<|constrain|>json", "<|constrain|>diagnostics",
-                "<|constrain|>quote_patches"}:
+        if message.channel == "final" and is_final_format(recipient):
             finals.append(text)
         elif recipient:
             if (message.channel not in {"analysis", "commentary"} or
                     not recipient.startswith("functions.") or recipient[10:] not in names):
                 raise ValueError("Unregistered actual Harmony recipient")
-            arguments = json.loads(text)
-            if not isinstance(arguments, dict):
-                raise ValueError("Tool arguments must be an object")
             calls.append({"id": "call_" + hashlib.sha256((recipient + text).encode()).hexdigest()[:24],
                           "type": "function", "function": {"name": recipient[10:], "arguments": text}})
         elif message.channel == "analysis":
@@ -65,8 +72,14 @@ def decode_response(raw, *, model, max_tokens, native_tools):
     if calls:
         if len(calls) != 1 or finals or terminal != 200012:
             raise ValueError("Ambiguous tool yield")
+        try:
+            arguments = json.loads(calls[0]["function"]["arguments"])
+        except json.JSONDecodeError as exc:
+            raise ModelContentError("Registered tool arguments are not valid JSON") from exc
+        if not isinstance(arguments, dict):
+            raise ModelContentError("Tool arguments must be an object")
         content = r.canonical({"action": calls[0]["function"]["name"],
-                               "arguments": json.loads(calls[0]["function"]["arguments"])})
+                               "arguments": arguments})
     else:
         if len(finals) != 1 or terminal != 200002:
             raise ValueError("Missing final message")

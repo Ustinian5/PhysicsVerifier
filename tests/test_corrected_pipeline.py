@@ -148,6 +148,27 @@ def test_final_array_is_retained_failure_without_resampling(tmp_path,monkeypatch
     assert originals=={str(f):vr.sha(f) for f in (tmp_path/'raw').rglob('request_*.json')}
 
 
+def test_registered_tool_content_failure_does_not_abort_or_reroll(tmp_path,monkeypatch):
+    calls=mock_transport(monkeypatch,[final({})])
+    def bad(*args,**kw):raise runner.ModelContentError('Registered tool arguments are not valid JSON')
+    monkeypatch.setattr(runner.c.corpus.harmony,'decode_response',bad)
+    cfg=configuration();row=dict(id='bad',question='Q',prediction='A')
+    result=runner.run_case(tmp_path,row,'pure','step',None,cfg,Tokenizer())
+    assert result['status']=='content_failure' and result['value'] is None and result['usage']['requests']==1
+    assert runner.run_case(tmp_path,row,'pure','step',None,cfg,Tokenizer())==result and len(calls)==1
+
+
+@pytest.mark.parametrize('query',[None,13,[],{}])
+def test_invalid_search_query_gets_tool_error_with_unchanged_budget(tmp_path,monkeypatch,query):
+    calls=mock_transport(monkeypatch,[tool('search_memory',{'query':query,'offset':0},1),final({'diagnostics':[]})])
+    result=runner.run_case(tmp_path,dict(id='x',question='Q',prediction='A'),'flat_skills','step',
+                           p.FlatMemory(docs()),configuration(),Tokenizer())
+    assert result['status']=='complete' and len(calls)==2 and result['protocol_audit']['searches']==0
+    returned=json.loads(calls[1]['messages'][-1]['content'])
+    assert returned['result']['error']=='Search query must be a string'
+    assert returned['budget']['responses_left']==11
+
+
 def test_format_repair_receipt_cannot_change_protocol_or_retained_results(tmp_path,monkeypatch):
     repo=tmp_path/'repo';out=tmp_path/'run'
     for n in pipeline.SOURCES:

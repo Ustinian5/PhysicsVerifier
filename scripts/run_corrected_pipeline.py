@@ -204,6 +204,21 @@ def verify(out, full=False):
         require(all(vr.sha(out/n)==h for n,h in repair['retained_files'].items()),
                 'Final format repair retained evidence drift')
         effective_code=repair['code']
+    boundary_path=out/'output_boundary_repair.json'
+    if boundary_path.exists():
+        repair=vr.read(boundary_path)
+        require(repair['configuration_sha256']==plan['configuration_sha256'] and
+                repair['previous_code']==effective_code and
+                repair['previous_receipt_sha256']==vr.sha(out/'final_format_repair.json'),
+                'Output boundary repair binding drift')
+        allowed={'scripts/run_corrected_pipeline.py','scripts/run_corrected_checks.py',
+                 'scripts/gpt_oss_harmony_transport.py'}
+        require(set(repair['code'])==set(effective_code) and all(
+            n in allowed or repair['code'][n]==h for n,h in effective_code.items()),
+            'Output boundary repair changed unrelated implementation')
+        require(all(vr.sha(out/n)==h for n,h in repair['retained_files'].items()),
+                'Output boundary repair retained evidence drift')
+        effective_code=repair['code']
     require(all(vr.sha(c.ROOT/n)==h for n,h in effective_code.items()),'Pipeline code drift')
     require(all(vr.sha(out/n)==h for n,h in cfg['frozen_files'].items()),'Pipeline input drift')
     evidence=vr.read(out/'source_evidence.json')
@@ -213,6 +228,65 @@ def verify(out, full=False):
     cache=Path(cfg['parent_pipeline']) if cfg.get('check_prompt_revision') else out
     vr.EvidenceCache(cache/'source_verification.json').check(evidence,full=full)
     return plan
+
+
+def repair_output_boundary(out):
+    """Audit all stored native outputs before resuming the format-label fix."""
+    from collections import Counter
+    from scripts.gpt_oss_harmony_transport import ModelContentError
+    from vllm.entrypoints.harmony_utils import parse_output_into_messages
+    plan=vr.read(out/'plan.json');cfg=plan['configuration'];root=Path(cfg['root'])
+    require(cfg.get('check_prompt_revision')==protocol.BILINGUAL_REVISION,'Wrong checking revision')
+    with c.corpus.r.run_lock(out/'active.lock'),c.corpus.r.run_lock(root/'organization_service_18083.lock'):
+        if (out/'output_boundary_repair.json').exists():return verify(out)
+        require(not(out/'runner.pid').exists(),'Stop coordinator before repair')
+        stopped=vr.read(out/'execution_status.json')
+        require(stopped.get('state')=='stopped' and
+                stopped.get('error')=='Unregistered actual Harmony recipient','Different unreviewed failure')
+        prior=vr.read(out/'final_format_repair.json');previous=prior['code']
+        require(prior['configuration_sha256']==plan['configuration_sha256'],'Prior receipt binding drift')
+        allowed={'scripts/run_corrected_pipeline.py','scripts/run_corrected_checks.py',
+                 'scripts/gpt_oss_harmony_transport.py'}
+        require(all(n in allowed or vr.sha(c.ROOT/n)==h for n,h in previous.items()),'Unrelated runtime change')
+        affected=out/'checks/step/formal/rule_tree/cl_132_54083'
+        require(not(affected/'result.json').exists(),'Affected response already finalized')
+        raw_path=affected/'raw/check/6165cca8e0587c0f35794dfb/request_001.json'
+        labels=Counter();outcomes=Counter();affected_decoded=None
+        for path in sorted((out/'checks').rglob('request_*.json')):
+            record=vr.read(path)
+            if record['status']!='received':
+                outcomes['retained_transport_failure']+=1;continue
+            raw=record['response'];request=record['request']
+            for msg in parse_output_into_messages(raw['choices'][0]['token_ids']).messages:
+                if msg.channel=='final':labels[str(msg.recipient)]+=1
+            try:
+                decoded=c.corpus.harmony.decode_response(raw,model=request['model'],
+                    max_tokens=request['max_tokens'],native_tools=request.get('tools'))
+            except (ValueError,ModelContentError) as exc:
+                require(isinstance(exc,ModelContentError) or str(exc) in {
+                    'Incomplete model output','No authoritative final/tool termination',
+                    'Incomplete Harmony message','Missing final message'},'Unreviewed native output: '+str(exc))
+                outcomes['retained_content_failure']+=1
+            else:
+                outcomes['decoded_without_generation']+=1
+                if path==raw_path:affected_decoded=decoded
+        require(affected_decoded is not None and not affected_decoded.get('tool_calls'),
+                'Reviewed final response not recovered')
+        draft=json.loads(affected_decoded['content'])
+        require(isinstance(draft,dict) and set(draft)=={'diagnostics'},'Unexpected affected final schema')
+        c.corpus.r.validate_diagnostics(draft)
+        kept={str(f.relative_to(out)):vr.sha(f) for f in (out/'checks').rglob('*.json')
+              if f.name in {'result.json','input.json','started.json','first_diagnosis.json'}
+              or f.name.startswith('request_') or f.parent.name=='request_limits'}
+        kept['plan.json']=vr.sha(out/'plan.json')
+        vr.atomic(out/'output_boundary_repair.json',dict(configuration_sha256=plan['configuration_sha256'],
+            previous_code=previous,previous_receipt_sha256=vr.sha(out/'final_format_repair.json'),
+            code={n:vr.sha(c.ROOT/n) for n in previous},retained_files=kept,stopped_state=stopped,
+            affected_request=str(raw_path.relative_to(out)),stored_output_audit=dict(outcomes),
+            final_labels=dict(labels),new_model_calls=0,content_modified=False,case_budget_reset=False,
+            reason='Parse final serialization metadata structurally; keep original schema and strict actual routing. Registered-tool argument syntax is per-case content failure.',
+            created_unix=time.time()))
+        verify(out)
 
 
 def repair_final_format(out):
@@ -729,7 +803,7 @@ def run(out):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode',choices=['prepare','verify','run','confirm-detached','refresh-unstarted','repair-engineering','prepare-check-revision','repair-local-rendering','repair-final-format'])
+    parser.add_argument('mode',choices=['prepare','verify','run','confirm-detached','refresh-unstarted','repair-engineering','prepare-check-revision','repair-local-rendering','repair-final-format','repair-output-boundary'])
     parser.add_argument('--output',type=Path,required=True);parser.add_argument('--root',type=Path)
     parser.add_argument('--parent',type=Path)
     parser.add_argument('--revision',choices=[protocol.CHECK_REVISION,protocol.LANGUAGE_REVISION,protocol.BILINGUAL_REVISION],default=protocol.CHECK_REVISION)
@@ -738,6 +812,7 @@ def main():
     elif args.mode=='prepare-check-revision':prepare_check_revision(out,args.parent.resolve(),args.revision)
     elif args.mode=='repair-local-rendering':repair_local_rendering(out)
     elif args.mode=='repair-final-format':repair_final_format(out)
+    elif args.mode=='repair-output-boundary':repair_output_boundary(out)
     elif args.mode=='verify':verify(out);print('verified')
     elif args.mode=='confirm-detached':confirm(out)
     elif args.mode=='refresh-unstarted':refresh_unstarted(out)

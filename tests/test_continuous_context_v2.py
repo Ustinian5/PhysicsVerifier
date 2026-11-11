@@ -205,7 +205,7 @@ def test_raw_harmony_does_not_infer_tools_and_accepts_constrained_final(monkeypa
         transport.decode_response(raw, **args)
 
 
-@pytest.mark.parametrize('label', ['diagnostics', 'quote_patches'])
+@pytest.mark.parametrize('label', ['diagnostics', 'quote_patches', 'commentary', 'verdict', 'JSON', 'custom_format-1.0'])
 @pytest.mark.parametrize('text', ['[]', '{"diagnostics":[]}', 'invalid JSON'])
 def test_known_final_labels_preserve_body_for_caller_schema(monkeypatch, label, text):
     import sys
@@ -222,10 +222,29 @@ def test_known_final_labels_preserve_body_for_caller_schema(monkeypatch, label, 
     # Format labels may never turn analysis or unknown routing into a final.
     message.channel='analysis'
     with pytest.raises(ValueError):transport.decode_response(raw,**kw)
-    message.channel='final';message.recipient='<|constrain|>unknown'
+    message.channel='final';message.recipient='<|constrain|>json to=functions.search_rules'
     with pytest.raises(ValueError):transport.decode_response(raw,**kw)
     message.recipient='<|constrain|>'+label;raw['choices'][0]['token_ids'][-1]=200012
     with pytest.raises(ValueError):transport.decode_response(raw,**kw)
+
+
+@pytest.mark.parametrize('body', ['[]','null','{broken'])
+def test_bad_registered_tool_arguments_are_content_failure_only_after_routing_checks(monkeypatch,body):
+    import sys
+    import types
+    module=types.ModuleType('vllm.entrypoints.harmony_utils')
+    message=SimpleNamespace(channel='analysis',recipient='functions.search_rules',content=[SimpleNamespace(text=body)])
+    module.parse_output_into_messages=lambda ids:SimpleNamespace(messages=[message],current_content='')
+    monkeypatch.setitem(sys.modules,'vllm.entrypoints.harmony_utils',module)
+    raw=dict(model=r.EXPECTED_MODEL,usage=dict(prompt_tokens=10,completion_tokens=2),
+             choices=[dict(token_ids=[5,200012],finish_reason='tool_calls')])
+    kw=dict(model=r.EXPECTED_MODEL,max_tokens=10,native_tools=runner.native_tools(True))
+    with pytest.raises(transport.ModelContentError):transport.decode_response(raw,**kw)
+    for recipient,terminal,model in [('functions.UNKNOWN',200012,r.EXPECTED_MODEL),
+        ('functions.search_rules',200002,r.EXPECTED_MODEL),('functions.search_rules',200012,'wrong')]:
+        message.recipient=recipient;raw['choices'][0]['token_ids'][-1]=terminal;raw['model']=model
+        with pytest.raises(ValueError) as error:transport.decode_response(raw,**kw)
+        assert not isinstance(error.value,transport.ModelContentError)
 
 
 def test_plan_freezes_prompts_and_full_50_without_calls(tmp_path, monkeypatch, isolated_reference):
