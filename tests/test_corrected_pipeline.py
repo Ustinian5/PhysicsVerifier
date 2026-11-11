@@ -177,3 +177,103 @@ def test_identity_failure_stops_instead_of_becoming_empty_result(tmp_path,monkey
     with pytest.raises(runner.c.corpus.IdentityError):
         runner.run_case(tmp_path,dict(id='a',question='Q',prediction='A'),'pure','step',None,configuration(),Tokenizer())
     assert not(tmp_path/'result.json').exists()
+
+
+@pytest.mark.parametrize('task',['step','final'])
+@pytest.mark.parametrize('arm',p.ARMS)
+def test_approved_revision_is_only_user_suffix(task,arm):
+    row=dict(question='Q',prediction='A',context='C',reference='NEVER_VISIBLE')
+    old=p.messages(row,arm,task)
+    revised=p.messages(row,arm,task,revision=p.CHECK_REVISION)
+    expected=copy.deepcopy(old)
+    if arm!='pure':expected[-1]['content']+='\n\n'+p.REQUIRED_LOOKUP_SUFFIX
+    assert revised==expected
+    assert 'NEVER_VISIBLE' not in json.dumps(revised)
+    with pytest.raises(ValueError):p.messages(row,arm,task,revision='unapproved')
+
+
+def test_suffix_revision_keeps_auto_tools_and_total_budget(tmp_path,monkeypatch):
+    calls=mock_transport(monkeypatch,[tool('search_memory',{'query':'磁场','offset':0},1),
+        tool('read_memory',{'id':'k00'},2),final({'diagnostics':[]})])
+    cfg=dict(configuration(),check_prompt_revision=p.CHECK_REVISION)
+    result=runner.run_case(tmp_path,dict(id='x',question='Q',prediction='A'),
+        'flat_skills','step',p.FlatMemory(docs()),cfg,Tokenizer())
+    assert result['status']=='complete' and len(calls)==3
+    assert all(b['tool_choice']=='auto' and b['temperature']==0 and b['top_p']==1 for b in calls)
+    assert [b['max_tokens'] for b in calls]==[16384,16374,16364]
+    assert calls[0]['messages'][-1]['content'].endswith(p.REQUIRED_LOOKUP_SUFFIX)
+
+
+def test_revision_reuses_original_pure_pilot_condition(tmp_path,monkeypatch):
+    vr.atomic(tmp_path/'construction_acceptance.json',{'passed':True})
+    old=dict(configuration(),limits=p.LIMITS,protocol=p.VERSION,code={'old':'hash'})
+    old_condition=pipeline.check_condition(tmp_path,old)
+    cfg=dict(old,code={'new':'hash'},check_prompt_revision=p.CHECK_REVISION,
+        pure_pilot_condition=old_condition)
+    calls=[]
+    def saved(folder,row,arm,task,memory,condition,tokenizer):
+        calls.append((arm,condition));folder.mkdir(parents=True,exist_ok=True)
+        value=dict(id=row['id'],status='complete',protocol_audit=dict(searches=int(arm!='pure'),
+            reads=['k'] if arm!='pure' else []))
+        vr.atomic(folder/'result.json',value);return value
+    monkeypatch.setattr(pipeline.checking,'run_case',saved)
+    pipeline.checks(tmp_path,cfg,None,'step','pilot',[{'id':'x'}],dict.fromkeys(p.ARMS))
+    assert dict(calls)['pure']==old_condition
+    assert all(v.get('check_prompt_revision')==p.CHECK_REVISION for a,v in calls if a!='pure')
+    assert vr.read(tmp_path/'step_pilot_acceptance.json')['passed']
+
+
+def test_zero_lookup_still_stops_revised_pilot(tmp_path,monkeypatch):
+    vr.atomic(tmp_path/'construction_acceptance.json',{'passed':True})
+    cfg=dict(configuration(),limits=p.LIMITS,protocol=p.VERSION,code={})
+    def saved(folder,row,arm,*args):
+        value=dict(id=row['id'],status='complete',protocol_audit=dict(searches=0,reads=[]))
+        vr.atomic(folder/'result.json',value);return value
+    monkeypatch.setattr(pipeline.checking,'run_case',saved)
+    with pytest.raises(ValueError,match='Pilot engineering/budget'):
+        pipeline.checks(tmp_path,cfg,None,'step','pilot',[{'id':'x'}],dict.fromkeys(p.ARMS))
+    assert not vr.read(tmp_path/'step_pilot_acceptance.json')['passed']
+
+
+def test_revision_freezes_parent_and_reuses_only_pure(tmp_path,monkeypatch):
+    parent=tmp_path/'pipeline';out=parent/'check_prompt_revision';repo=tmp_path/'repo'
+    for name in pipeline.SOURCES:
+        path=repo/name;path.parent.mkdir(parents=True,exist_ok=True);path.write_text('old code')
+    monkeypatch.setattr(pipeline.c,'ROOT',repo)
+    exists=Path.exists
+    monkeypatch.setattr(Path,'exists',lambda path:True if str(path)=='/proc' else exists(path))
+    vr.atomic(parent/'pilot_inputs.json',[{'id':'p0'}])
+    vr.atomic(parent/'source_evidence.json',{})
+    cfg=dict(configuration(),root=str(tmp_path),limits=p.LIMITS,protocol=p.VERSION,
+        code={n:vr.sha(repo/n) for n in pipeline.SOURCES},evidence_digest=vr.digest({}),
+        frozen_files={'pilot_inputs.json':vr.sha(parent/'pilot_inputs.json')})
+    vr.atomic(parent/'plan.json',dict(configuration=cfg,configuration_sha256=vr.digest(cfg)))
+    vr.atomic(parent/'material_isolation.json',{'unresolved':[]})
+    materials={}
+    for name in ['catalog.json','tree_report.json','skills.json','skills_report.json','cases.json']:
+        vr.atomic(parent/'materials'/name,{});materials['materials/'+name]=vr.sha(parent/'materials'/name)
+    vr.atomic(parent/'construction_acceptance.json',dict(passed=True,files=materials))
+    outputs={}
+    for arm in p.ARMS:
+        for i in range(6):
+            f=parent/'checks/step/pilot'/arm/f'p{i}'/'result.json'
+            vr.atomic(f,dict(evidence=[]));outputs[str(f.relative_to(parent))]=vr.sha(f)
+    vr.atomic(parent/'step_pilot_acceptance.json',dict(passed=False,blocked=[],
+        per_arm={a:dict(completed=6,read=0,searched=0) for a in p.ARMS},output_files=outputs))
+    probe=parent/'native_io'/vr.sha(repo/'scripts/serve_continuous_context_vllm.py')[:16]/'acceptance.json'
+    vr.atomic(probe,dict(passed=True,configuration_sha256=vr.digest(cfg),files={}))
+    (parent/'service').mkdir()
+    original_plan=(parent/'plan.json').read_bytes()
+    (repo/'rule_framework/corrected_verifier.py').write_text('approved suffix')
+    pipeline.prepare_check_revision(out,parent)
+    assert (parent/'plan.json').read_bytes()==original_plan
+    assert (out/'materials').resolve()==parent/'materials'
+    assert (out/'checks/step/pilot/pure').resolve()==parent/'checks/step/pilot/pure'
+    assert not (out/'checks/step/pilot/case_rag').exists()
+    revised=vr.read(out/'plan.json')['configuration']
+    assert revised['pure_pilot_condition']==pipeline.check_condition(parent,cfg)
+    assert revised['transport']==cfg['transport'] and revised['limits']==cfg['limits']
+    pipeline.verify(out)
+    vr.atomic(parent/'checks/step/pilot/case_rag/p0/result.json',{'changed':True})
+    with pytest.raises(ValueError,match='Parent experiment evidence drift'):
+        pipeline.verify(out)

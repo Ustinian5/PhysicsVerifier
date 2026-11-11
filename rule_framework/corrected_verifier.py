@@ -12,6 +12,8 @@ from rule_framework import final_answer_protocol as final
 from scripts import continuous_context_v2 as step
 
 VERSION = 'corrected_continuous_four_arm_v1'
+CHECK_REVISION = 'required_lookup_suffix_20261111'
+REQUIRED_LOOKUP_SUFFIX = '''Before publishing your final JSON, actually call search_memory in this conversation. If it returns a potentially relevant candidate, call read_memory to read the COMPLETE item before continuing your check. Then continue checking the original answer and publish the final JSON in this same conversation. Even when you already have an independent judgment, do not omit the lookup. If no candidate is relevant, retain the actual lookup attempt and continue independently; do not force an unrelated item. Do not simulate tool results.'''
 ARMS = ('pure', 'case_rag', 'flat_skills', 'rule_tree')
 LIMITS = dict(responses=12, output_tokens=16384, input_tokens=600000,
               context_tokens=131072, seconds=1800, request_seconds=1200,
@@ -37,17 +39,21 @@ def tools():
                         required=['id'], additionalProperties=False)))]
 
 
-def messages(row, arm, task):
+def messages(row, arm, task, *, revision=None):
     require(arm in ARMS and task in {'step', 'final'}, 'Unknown experiment')
+    require(revision in {None, CHECK_REVISION}, 'Unknown checking prompt revision')
     # Whitelist even when callers possess benchmark references or labels.
     public = {k: row.get(k, '') for k in ('question', 'prediction', 'context')}
     extra = USE + '\n' + DESCRIPTIONS[arm] if arm != 'pure' else ''
     if task == 'final':
-        return final.verification_messages(public, tool_instructions=extra +
+        result = final.verification_messages(public, tool_instructions=extra +
             '\nAt most 12 responses and 16384 cumulative generated tokens including reasoning and tools.')
-    result = step.messages(public, rules=False, tree_root=None)
-    if extra:
-        result[0]['content'] += '\n\n' + extra
+    else:
+        result = step.messages(public, rules=False, tree_root=None)
+        if extra:
+            result[0]['content'] += '\n\n' + extra
+    if revision == CHECK_REVISION and arm != 'pure':
+        result[-1]['content'] += '\n\n' + REQUIRED_LOOKUP_SUFFIX
     return result
 
 

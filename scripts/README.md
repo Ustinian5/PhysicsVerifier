@@ -12,7 +12,9 @@
 
 本轮个人120B服务使用`serve_continuous_context_vllm.py`，在固定日期入口上补回原生Harmony解析器丢弃的工具调用前analysis；不修改已安装vLLM、权重、采样或其他人的服务。首批真实IO会核对服务返回的prompt_token_ids，而不只检查本地模板。模型服务重载期间协调器后台等待，不发生成请求。
 
-结果入口为`pipeline/execution_status.json`；三库在`materials/`，检查原件在`checks/{step,final}/{pilot,formal}/`，完成后自动保存`step_metrics.json`、`final_metrics.json`及两份原始案例JSON。中断后用同一`run`精确恢复，成功项不重跑；先核对PID和锁。`verify`离线检查绑定。`refresh-unstarted`仅限零请求入口；本次原生IO修复的前后绑定与失败证据保存在`engineering_repair.json`，不是放宽正式实验协议的通用开关。
+11月11日用户批准最小查库提示修正：三知识组仅追加末尾实际搜索/阅读要求，纯模型提示和tool_choice=auto不变。`prepare-check-revision --parent <corrected/pipeline> --output <corrected/pipeline/check_prompt_revision>`仅适用于已完成建库、原24份试跑均未查库、尚无正式检查的本轮状态。它校验并绑定原计划、三库、原件及IO验收；三库用引用继承，纯组6份试跑直接复用，原24份不覆盖。新目录用同一`run`与`confirm-detached`后台执行，跳过建库/提炼，不重跑已完成阶段。
+
+当前结果入口为`pipeline/check_prompt_revision/execution_status.json`，原`pipeline/execution_status.json`保留为修正前停止记录。新目录中三库在`materials/`，检查原件在`checks/{step,final}/{pilot,formal}/`，完成后自动保存`step_metrics.json`、`final_metrics.json`及两份原始案例JSON。中断后用同一`run`精确恢复，成功项不重跑；先核对PID和锁。`verify`离线检查绑定。`refresh-unstarted`仅限零请求入口；原生IO修复记录`engineering_repair.json`仅适用于首次建库前，不得用于改写已完成实验的冻结计划。
 
 ## 已批准的独立生成入口
 

@@ -61,7 +61,7 @@ def run_case(folder, row, arm, task, memory, configuration, tokenizer):
     # allowance. One unknown-usage request exhausts the case conservatively;
     # it is not resampled under a fresh budget. Construction uses its own policy.
     cfg = dict(configuration['transport'], technical_attempts=1)
-    history = p.messages(row, arm, task)
+    history = p.messages(row, arm, task, revision=configuration.get('check_prompt_revision'))
     knowledge = p.Knowledge(arm, memory)
     native = p.tools() if arm!='pure' else None
     used_in = used_out = 0

@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -196,7 +197,11 @@ def test_cache_rehashes_content_changes_even_if_mtime_is_restored(tmp_path):
     cache = vr.EvidenceCache(tmp_path / 'cache.json')
     assert cache.check(expected)['files_rehashed'] == 1
     assert cache.check(expected)['files_rehashed'] == 0
-    old = data.stat(); data.write_text('other'); os.utime(data, ns=(old.st_atime_ns, old.st_mtime_ns))
+    old = data.stat()
+    # Linux filesystem timestamps may share a clock tick for rapid writes.
+    # This test exercises ctime invalidation, not detection of identical stamps.
+    time.sleep(0.02)
+    data.write_text('other'); os.utime(data, ns=(old.st_atime_ns, old.st_mtime_ns))
     with pytest.raises(ValueError, match='Bound evidence changed'):
         cache.check(expected)
 

@@ -185,8 +185,73 @@ def verify(out, full=False):
     require(all(vr.sha(out/n)==h for n,h in cfg['frozen_files'].items()),'Pipeline input drift')
     evidence=vr.read(out/'source_evidence.json')
     require(vr.digest(evidence)==cfg['evidence_digest'],'Evidence manifest drift')
-    vr.EvidenceCache(out/'source_verification.json').check(evidence,full=full)
+    for path,h in cfg.get('parent_bindings',{}).items():
+        require(vr.sha(Path(path))==h,'Parent experiment evidence drift: '+path)
+    cache=Path(cfg['parent_pipeline']) if cfg.get('check_prompt_revision') else out
+    vr.EvidenceCache(cache/'source_verification.json').check(evidence,full=full)
     return plan
+
+
+def prepare_check_revision(out,parent):
+    """User-approved suffix only; retain original construction and pilot records."""
+    require(Path('/proc').exists(),'Prepare against server originals')
+    require(out==parent/'check_prompt_revision','Use the single registered checking revision')
+    old=vr.read(parent/'plan.json');cfg=old['configuration']
+    require(vr.digest(cfg)==old['configuration_sha256'],'Parent plan drift')
+    root=Path(cfg['root'])
+    with c.corpus.r.run_lock(parent/'active.lock'),c.corpus.r.run_lock(root/'organization_service_18083.lock'):
+        if (out/'plan.json').exists():return verify(out)
+        require(not(parent/'runner.pid').exists(),'Parent coordinator must be stopped')
+        require(not(parent/'STOP').exists(),'Parent STOP remains in force')
+        # These are the only three implementation files needed for this change.
+        allowed={'scripts/run_corrected_pipeline.py','scripts/run_corrected_checks.py',
+                 'rule_framework/corrected_verifier.py'}
+        require(all(n in allowed or vr.sha(c.ROOT/n)==h for n,h in cfg['code'].items()),
+                'Unrelated frozen implementation changed')
+        require(not list((parent/'checks/step/formal').glob('*/*/result.json')) and
+                not list((parent/'checks/final').rglob('result.json')),'Formal/new final checks already exist')
+        require(all(vr.sha(parent/n)==h for n,h in cfg['frozen_files'].items()),'Parent frozen data drift')
+        evidence=vr.read(parent/'source_evidence.json')
+        require(vr.digest(evidence)==cfg['evidence_digest'],'Parent evidence manifest drift')
+        vr.EvidenceCache(parent/'source_verification.json').check(evidence)
+        accept_materials(parent,cfg)  # existing receipt only; no construction/API
+        pilot=vr.read(parent/'step_pilot_acceptance.json')
+        require(not pilot['passed'] and not pilot['blocked'],'Unexpected failed pilot boundary')
+        require(all(v['completed']==6 and v['read']==v['searched']==0 for v in pilot['per_arm'].values()),
+                'This revision is authorized only for the recorded zero-lookup pilot')
+        bindings={str(parent/n):vr.sha(parent/n) for n in
+            ['plan.json','construction_acceptance.json','material_isolation.json','step_pilot_acceptance.json']}
+        bindings.update({str(parent/n):h for n,h in vr.read(parent/'construction_acceptance.json')['files'].items()})
+        for name,h in pilot['output_files'].items():
+            path=parent/name;require(vr.sha(path)==h,'Original pilot changed');bindings[str(path)]=h
+            result=vr.read(path)
+            for ev in result['evidence']:
+                raw=path.parent/ev['file'];require(vr.sha(raw)==ev['sha256'],'Pilot raw changed')
+                bindings[str(raw)]=ev['sha256']
+        probe=parent/'native_io'/vr.sha(c.ROOT/'scripts/serve_continuous_context_vllm.py')[:16]/'acceptance.json'
+        receipt=vr.read(probe)
+        require(receipt['passed'] and receipt['configuration_sha256']==vr.digest(cfg),'Native IO acceptance drift')
+        bindings[str(probe)]=vr.sha(probe)
+        for name,h in receipt['files'].items():
+            require(vr.sha(probe.parent/name)==h,'Native IO raw drift');bindings[str(probe.parent/name)]=h
+        out.mkdir(parents=True,exist_ok=True)
+        for name in list(cfg['frozen_files'])+['source_evidence.json','construction_acceptance.json','material_isolation.json','materials','service']:
+            link=out/name
+            if link.is_symlink():require(link.resolve()==(parent/name).resolve(),'Wrong inherited link')
+            else:require(not link.exists(),'Unexpected revision file');link.symlink_to(parent/name)
+        pure_link=out/'checks/step/pilot/pure';pure_link.parent.mkdir(parents=True,exist_ok=True)
+        if pure_link.is_symlink():require(pure_link.resolve()==(parent/'checks/step/pilot/pure').resolve(),'Wrong pure link')
+        else:require(not pure_link.exists(),'Unexpected pure output');pure_link.symlink_to(parent/'checks/step/pilot/pure')
+        updated=dict(cfg,code={n:vr.sha(c.ROOT/n) for n in SOURCES},
+            check_prompt_revision=protocol.CHECK_REVISION,parent_pipeline=str(parent),parent_bindings=bindings,
+            pure_pilot_condition=check_condition(parent,cfg),
+            prompt_change=dict(authorization='User 2026-11-11: adopt minimal suffix; pilot then automatically continue',
+                appended_user_suffix=protocol.REQUIRED_LOOKUP_SUFFIX,arms=list(protocol.ARMS[1:]),
+                unchanged='Original prompts intact; pure unchanged; tool_choice auto; same model, retrieval, materials, budget and scoring'))
+        immutable(out/'plan.json',dict(configuration=updated,configuration_sha256=vr.digest(updated)))
+        verify(out)
+        emit(out,'prepared_check_prompt_revision',retained_original_pilots=24,reused_pure_pilots=6,
+             construction_model_calls=0)
 
 
 def refresh_unstarted(out):
@@ -422,15 +487,25 @@ def wait_service(out,cfg):
         time.sleep(30)
 
 
-def checks(out,cfg,tokenizer,task,phase,rows,memories):
+def check_condition(out,cfg):
     condition=dict(transport=cfg['transport'],limits=cfg['limits'],protocol=cfg['protocol'],
         material_receipt_sha256=vr.sha(out/'construction_acceptance.json'),code=cfg['code'])
+    if cfg.get('check_prompt_revision'):condition['check_prompt_revision']=cfg['check_prompt_revision']
+    return condition
+
+
+def checks(out,cfg,tokenizer,task,phase,rows,memories):
+    condition=check_condition(out,cfg)
     results={a:[] for a in protocol.ARMS}
     for i,row in enumerate(rows):
         arms=protocol.ARMS[i%4:]+protocol.ARMS[:i%4]
         for arm in arms:
             require(not(out/'STOP').exists(),'STOP requested')
-            result=checking.run_case(out/'checks'/task/phase/arm/row['id'],row,arm,task,memories[arm],condition,tokenizer)
+            if cfg.get('parent_pipeline'):
+                require(not(Path(cfg['parent_pipeline'])/'STOP').exists(),'Parent STOP requested')
+            active_condition=cfg['pure_pilot_condition'] if (cfg.get('check_prompt_revision') and
+                task=='step' and phase=='pilot' and arm=='pure') else condition
+            result=checking.run_case(out/'checks'/task/phase/arm/row['id'],row,arm,task,memories[arm],active_condition,tokenizer)
             results[arm].append(result)
             emit(out,'checking_'+task+'_'+phase,question_index=i+1,total=len(rows),arm=arm,outcome=result['status'])
     if phase=='pilot':
@@ -485,7 +560,8 @@ def score(out,task,rows,results):
 
 def run(out):
     require(Path('/proc').exists(),'Formal execution is server-only')
-    with c.corpus.r.run_lock(out/'active.lock'),c.corpus.r.run_lock(out.parent/'organization_service_18083.lock'):
+    root=Path(vr.read(out/'plan.json')['configuration']['root'])
+    with c.corpus.r.run_lock(out/'active.lock'),c.corpus.r.run_lock(root/'organization_service_18083.lock'):
         plan=verify(out);cfg=plan['configuration'];code=1
         (out/'runner.pid').write_text(str(os.getpid()))
         try:
@@ -495,8 +571,12 @@ def run(out):
             from transformers import AutoTokenizer
             tokenizer=AutoTokenizer.from_pretrained(cfg['transport']['model'],local_files_only=True)
             require(not(out/'STOP').exists(),'STOP requested')
-            emit(out,'native_transport_probe');native_probe(out,cfg,tokenizer)
-            build_materials(out,cfg,tokenizer)
+            if not cfg.get('check_prompt_revision'):
+                emit(out,'native_transport_probe');native_probe(out,cfg,tokenizer)
+                build_materials(out,cfg,tokenizer)
+            else:
+                require(not(Path(cfg['parent_pipeline'])/'STOP').exists(),'Parent STOP requested')
+                emit(out,'reuse_frozen_materials_and_native_io',construction_model_calls=0)
             emit(out,'accepting_materials');accept_materials(out,cfg)
             memories=memory_set(out)
             for task in ('step','final'):
@@ -519,10 +599,12 @@ def run(out):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode',choices=['prepare','verify','run','confirm-detached','refresh-unstarted','repair-engineering'])
+    parser.add_argument('mode',choices=['prepare','verify','run','confirm-detached','refresh-unstarted','repair-engineering','prepare-check-revision'])
     parser.add_argument('--output',type=Path,required=True);parser.add_argument('--root',type=Path)
+    parser.add_argument('--parent',type=Path)
     args=parser.parse_args();out=args.output.resolve()
     if args.mode=='prepare':prepare(out,args.root.resolve())
+    elif args.mode=='prepare-check-revision':prepare_check_revision(out,args.parent.resolve())
     elif args.mode=='verify':verify(out);print('verified')
     elif args.mode=='confirm-detached':confirm(out)
     elif args.mode=='refresh-unstarted':refresh_unstarted(out)
