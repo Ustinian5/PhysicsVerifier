@@ -61,6 +61,12 @@ def decode_response(raw, *, model, max_tokens, native_tools):
         if message.channel == "final" and is_final_format(recipient):
             finals.append(text)
         elif recipient:
+            malformed = re.fullmatch(r"functions\.([A-Za-z_][A-Za-z0-9_]*)<\|channel\|>[A-Za-z_][A-Za-z0-9_]*", recipient)
+            if malformed and malformed[1] in names:
+                # A repeated channel delimiter is malformed model output. Only
+                # classify it; the invalid-channel check below forbids execution.
+                recipient = 'functions.' + malformed[1]
+                invalid_tool_channel = True
             if (not recipient.startswith("functions.") or recipient[10:] not in names):
                 raise ValueError("Unregistered actual Harmony recipient")
             invalid_tool_channel |= message.channel not in {"analysis", "commentary"}

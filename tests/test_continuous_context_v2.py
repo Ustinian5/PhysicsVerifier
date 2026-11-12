@@ -329,15 +329,19 @@ def test_incomplete_or_unmetered_harmony_is_not_scored(change):
 
 
 @pytest.mark.parametrize('channel',['comment','final','unknown'])
-def test_invalid_channel_never_executes_registered_tool(monkeypatch,channel):
+@pytest.mark.parametrize('embedded_channel',[False,True])
+def test_invalid_channel_never_executes_registered_tool(monkeypatch,channel,embedded_channel):
     import sys,types
     module=types.ModuleType('vllm.entrypoints.harmony_utils')
     msg=SimpleNamespace(channel=channel,recipient='functions.search_rules',content=[SimpleNamespace(text='{"query":"x"}')])
+    if embedded_channel:
+        msg.recipient += '<|channel|>' + channel
+        msg.channel = 'analysis'
     module.parse_output_into_messages=lambda ids:SimpleNamespace(messages=[msg],current_content='')
     monkeypatch.setitem(sys.modules,'vllm.entrypoints.harmony_utils',module)
     raw=dict(model=r.EXPECTED_MODEL,usage=dict(prompt_tokens=10,completion_tokens=2),choices=[dict(token_ids=[5,200012],finish_reason='tool_calls')])
     kw=dict(model=r.EXPECTED_MODEL,max_tokens=10,native_tools=runner.native_tools(True))
     with pytest.raises(transport.ModelContentError,match='invalid channel'):transport.decode_response(raw,**kw)
-    msg.recipient='functions.unknown'
+    msg.recipient='functions.unknown'+('<|channel|>'+channel if embedded_channel else '')
     with pytest.raises(ValueError) as exc:transport.decode_response(raw,**kw)
     assert not isinstance(exc.value,transport.ModelContentError)
