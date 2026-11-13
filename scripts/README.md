@@ -2,6 +2,8 @@
 
 当前状态见[项目进展](../docs/项目进展.md)。2026-11-07用户批准更正方案并授权执行；旧full/STOP保留，旧协调器不得恢复。
 
+服务器资源约定（2026-11-13）：禁止编写或运行占卡程序，不以显存占位、空转或无效请求保留GPU。历史`training/openrlhf/gpu_bundle_utils.py reserve`及调用它的`adaptive_four_gpu_worker.sh`、`adaptive_four_gpu_watchdog.sh`不得启用。实际任务结束后确认无请求或其他任务依赖，关闭本人的闲置模型服务；资源不足时等待协调，不动他人进程。
+
 11月13日两项实验已结束。只读复查使用 `python -m scripts.audit_corrected_results <检查目录>`：核验全部题级结果/原请求、冻结初始提示和回答、模型身份、计分及逐题配对，写入唯一 `evaluation_audit.json`，不调用模型或改写正式成绩。`--inspect-source <combined原文件>` 追溯报告中20个定向案例的原始题面/参考；`--inspect-mechanisms` 复现本次查询、候选预览及题族反例检查。前者可读取本机原始题源；正式结果复算在服务器个人conda后台执行。定向案例不是随机抽样，不据此估计标签错误率；原输入或成绩哈希变更时停止，不覆盖不同批次的报告。
 
 ## 当前全流程入口（2026-11-10）
