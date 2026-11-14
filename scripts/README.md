@@ -1,6 +1,10 @@
 # 脚本入口
 
-当前状态见[项目进展](../docs/项目进展.md)。2026-11-07用户批准更正方案并授权执行；旧full/STOP保留，旧协调器不得恢复。
+当前状态见[项目进展](../docs/项目进展.md)。2026-11-14用户要求恢复旧99题v15方法，只更正题源与30B bench；旧full/STOP保留，旧协调器不恢复。
+
+当前方法恢复入口为[run_aligned_organization.py](run_aligned_organization.py)：`prepare --output <独立恢复目录> --legacy <已完成旧99目录> --current <已完成更正批次>`只绑定输入和离线核验396份原始请求；`verify`不调用模型。服务器后台`pilot`运行12来源的原case_note/skills和36份工程/开发检查，退出启动SSH后用`confirm-detached`从新连接放行；通过后`build`可按原协议补齐材料，成功项不重跑。formal尚未放行，不能自动调用旧协调器。旧树算法、全文注入、共享PREPARE、同上下文CHECK及每题预算直接复用旧实现；旧解码器从哈希核验的Git版本载入内存，不另存源码副本。服务使用固定日期入口，PV_HARMONY_DATE=2026-11-03；此流程无原生search/read工具消息，不需要工具适配服务。
+
+以下更正批次各入口为已完成实验的追溯说明，不能作为当前自动续跑队列。
 
 服务器资源约定（2026-11-13）：禁止编写或运行占卡程序，不以显存占位、空转或无效请求保留GPU。历史`training/openrlhf/gpu_bundle_utils.py reserve`及调用它的`adaptive_four_gpu_worker.sh`、`adaptive_four_gpu_watchdog.sh`不得启用。实际任务结束后确认无请求或其他任务依赖，关闭本人的闲置模型服务；资源不足时等待协调，不动他人进程。
 

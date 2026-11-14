@@ -5,7 +5,7 @@ export STEP_OSS_RUN_ROOT="$RUN"
 ENV=/home/visitor/huhengyuan/envs/physicsverifier
 export CONDA_PREFIX="$ENV" PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH=/home/visitor/huhengyuan/envs/vllm_gptoss120b/lib/python3.10/site-packages
-export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="${STEP_OSS_GPU_INDEX:-1}" PV_HARMONY_DATE=2026-11-07
+export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="${STEP_OSS_GPU_INDEX:-1}" PV_HARMONY_DATE="${PV_HARMONY_DATE:-2026-11-07}"
 export STEP_OSS_GPU_UUID="${STEP_OSS_GPU_UUID:-GPU-1f91ae4b-c681-68b6-385e-250e0acc1941}"
 export TIKTOKEN_ENCODINGS_BASE=/home/visitor/huhengyuan/.cache/gptoss120b/harmony
 export XDG_CACHE_HOME="${STEP_OSS_CACHE_ROOT:-/slow_share2/huhengyuan/cache/oss120b_steps}"
