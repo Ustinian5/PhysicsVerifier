@@ -4,13 +4,15 @@
 
 当前方法恢复入口为[run_aligned_organization.py](run_aligned_organization.py)：`prepare --output <独立恢复目录> --legacy <已完成旧99目录> --current <已完成更正批次>`只绑定输入和离线核验396份原始请求；`verify`不调用模型。服务器后台`pilot`运行12来源的原case_note/skills和36份工程/开发检查，退出启动SSH后用`confirm-detached`从新连接放行；通过后`build`可按原协议补齐材料，成功项不重跑。formal尚未放行，不能自动调用旧协调器。旧树算法、全文注入、共享PREPARE、同上下文CHECK及每题预算直接复用旧实现；旧解码器从哈希核验的Git版本载入内存，不另存源码副本。服务使用固定日期入口，PV_HARMONY_DATE=2026-11-03；此流程无原生search/read工具消息，不需要工具适配服务。
 
+11月15日材料补齐核验入口：[audit_aligned_organization.py](audit_aligned_organization.py)。在服务器个人conda后台执行`python -m scripts.audit_aligned_organization --output <恢复目录>`，核对全部原始材料请求、渲染、来源、试跑原件及完整库输入边界，禁止模型POST请求，不修改冻结材料。只更新readiness_audit.json及进度；正文明确区分材料验证与正式评测放行。当前报告formal_ready=false：适配器漏接旧v15的来源筛查/派生剔除，新100题正式执行及计分入口尚未完成，标签与已知题族问题未收尾。不能直接调用硬编码旧99标签的score函数，也不能因材料结束自动重启服务。
+
 以下更正批次各入口为已完成实验的追溯说明，不能作为当前自动续跑队列。
 
 服务器资源约定（2026-11-13）：禁止编写或运行占卡程序，不以显存占位、空转或无效请求保留GPU。历史`training/openrlhf/gpu_bundle_utils.py reserve`及调用它的`adaptive_four_gpu_worker.sh`、`adaptive_four_gpu_watchdog.sh`不得启用。实际任务结束后确认无请求或其他任务依赖，关闭本人的闲置模型服务；资源不足时等待协调，不动他人进程。
 
 11月13日两项实验已结束。只读复查使用 `python -m scripts.audit_corrected_results <检查目录>`：核验全部题级结果/原请求、冻结初始提示和回答、模型身份、计分及逐题配对，写入唯一 `evaluation_audit.json`，不调用模型或改写正式成绩。`--inspect-source <combined原文件>` 追溯报告中20个定向案例的原始题面/参考；`--inspect-mechanisms` 复现本次查询、候选预览及题族反例检查。前者可读取本机原始题源；正式结果复算在服务器个人conda后台执行。定向案例不是随机抽样，不据此估计标签错误率；原输入或成绩哈希变更时停止，不覆盖不同批次的报告。
 
-## 当前全流程入口（2026-11-10）
+## 已完成更正批次入口（2026-11-10，供追溯）
 
 `run_corrected_pipeline.py prepare --root <corrected> --output <corrected/pipeline>`核验已完成的1996份提炼、1074条候选、100题Sol四轮原件；从702候选的独立标签按冻结顺序取正误各300题。参考与检查输入分别保存，不把标签交给被测模型。
 
@@ -74,7 +76,7 @@
 
 若步骤标注明确返回`account_rate_limit_exceeded`及滚动60秒窗口错误，可使用`resume_corrected_annotations.py --output <annotations> --env <私密.env>`恢复；仅识别这一精确错误，沿用原重试/余额保护，并将请求间隔至少设为61秒。冻结文件不变，原件继续核验，新运行代码哈希写入window_limit_recovery.json；未知429仍停止。使用原annotations的confirm-detached验收。
 
-每个新客户端退出启动SSH后，用其`confirm-detached --output ...`从新连接确认。三者分别互斥，生成复用18084服务；120B标注复用18083，持服务锁时不能启动其他120B客户端。上述前置阶段已完成，下游由本页当前全流程入口接续，不能以旧共享PREPARE执行器代替。
+每个新客户端退出启动SSH后，用其`confirm-detached --output ...`从新连接确认。三者分别互斥，生成曾复用18084服务、120B标注曾复用18083，持服务锁时不能启动其他120B客户端。上述阶段及其工具流程下游均已结束；当前用户已要求恢复旧共享PREPARE方法，以本页开头的恢复入口及验收状态为准，不重启历史协调器。
 
 ## 原批次入口（仅追溯，不恢复旧批量）
 
