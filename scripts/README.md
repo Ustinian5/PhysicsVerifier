@@ -2,11 +2,13 @@
 
 当前状态见[项目进展](../docs/项目进展.md)。2026-11-14用户要求恢复旧99题v15方法，只更正题源与30B bench；旧full/STOP保留，旧协调器不恢复。
 
-当前方法恢复入口为[run_aligned_organization.py](run_aligned_organization.py)：`prepare --output <独立恢复目录> --legacy <已完成旧99目录> --current <已完成更正批次>`只绑定输入和离线核验396份原始请求；`verify`不调用模型。服务器后台`pilot`运行12来源的原case_note/skills和36份工程/开发检查，退出启动SSH后用`confirm-detached`从新连接放行；通过后`build`可按原协议补齐材料，成功项不重跑。formal尚未放行，不能自动调用旧协调器。旧树算法、全文注入、共享PREPARE、同上下文CHECK及每题预算直接复用旧实现；旧解码器从哈希核验的Git版本载入内存，不另存源码副本。服务使用固定日期入口，PV_HARMONY_DATE=2026-11-03；此流程无原生search/read工具消息，不需要工具适配服务。
+当前方法恢复入口为[run_aligned_organization.py](run_aligned_organization.py)：`prepare --output <独立恢复目录> --legacy <已完成旧99目录> --current <已完成更正批次>`只绑定输入和离线核验396份原始请求；`verify`不调用模型。服务器后台`pilot`运行12来源的原case_note/skills和36份工程/开发检查，退出启动SSH后用`confirm-detached`从新连接放行；通过后`build`可按原协议补齐材料，成功项不重跑。该材料入口不执行formal；正式入口见下方run_aligned_step_evaluation，旧协调器不恢复。旧树算法、全文注入、共享PREPARE、同上下文CHECK及每题预算直接复用旧实现；旧解码器从哈希核验的Git版本载入内存，不另存源码副本。服务使用固定日期入口，PV_HARMONY_DATE=2026-11-03；此流程无原生search/read工具消息，不需要工具适配服务。
 
-11月15日材料补齐核验入口：[audit_aligned_organization.py](audit_aligned_organization.py)。在服务器个人conda后台执行`python -m scripts.audit_aligned_organization --output <恢复目录>`，核对全部原始材料请求、渲染、来源、试跑原件及完整库输入边界，禁止模型POST请求，不修改冻结材料。只更新readiness_audit.json及进度；正文明确区分材料验证与正式评测放行。当前报告formal_ready=false：适配器漏接旧v15的来源筛查/派生剔除，新100题正式执行及计分入口尚未完成，标签与已知题族问题未收尾。不能直接调用硬编码旧99标签的score函数，也不能因材料结束自动重启服务。
+11月15日材料补齐核验入口：[audit_aligned_organization.py](audit_aligned_organization.py)。在服务器个人conda后台执行`python -m scripts.audit_aligned_organization --output <恢复目录>`，核对全部原始材料请求、渲染、来源、试跑原件及完整库输入边界，禁止模型POST请求，不修改冻结材料。只更新readiness_audit.json及进度；正文明确区分材料验证与正式评测放行。修正前报告formal_ready=false记录了来源筛查、标签收尾和正式入口三项缺口；该原报告不改写，后续修正依据见evaluation/发布证据。不能直接调用硬编码旧99标签的score函数。
 
 以下更正批次各入口为已完成实验的追溯说明，不能作为当前自动续跑队列。
+
+11月15日用户授权补齐上述缺口后的正式入口：[run_aligned_step_evaluation.py](run_aligned_step_evaluation.py)。`prepare --output <恢复根/evaluation> --parent <恢复根>`离线重验原件、调用旧来源筛查/派生剔除、应用已审读的label_review.json、重验400份Sol标注并复算旧396份预测；只在新发布目录保存材料视图及新100题参考，原件不改。`verify`检查冻结输入和代码，`run`须服务器后台执行，退出启动SSH后以`confirm-detached`放行。先20项工程控制、后100题×4组，最终`score`直接复用原位置函数而非旧99题数据包装器；原提示/检索/预算/解码不改。已有正式成功项不重跑，异常保留；600题不在本入口范围。已发布742份RAG、1477条skills、899叶，180确认错误可唯一定位、2未决单列。结果见evaluation/execution_status.json、engineering_acceptance.json和metrics.json。
 
 服务器资源约定（2026-11-13）：禁止编写或运行占卡程序，不以显存占位、空转或无效请求保留GPU。历史`training/openrlhf/gpu_bundle_utils.py reserve`及调用它的`adaptive_four_gpu_worker.sh`、`adaptive_four_gpu_watchdog.sh`不得启用。实际任务结束后确认无请求或其他任务依赖，关闭本人的闲置模型服务；资源不足时等待协调，不动他人进程。
 
