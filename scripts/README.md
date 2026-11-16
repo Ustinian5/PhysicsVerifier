@@ -14,6 +14,8 @@
 
 本批已于11月15日完成，11月16日离线验收通过，勿重新启动。验收入口：[audit_aligned_step_evaluation.py](audit_aligned_step_evaluation.py)，服务器个人环境运行`python -m scripts.audit_aligned_step_evaluation --output <同一evaluation>`。离线重建各组检索材料和实际消息，复解码响应、核对失败及预算、重算完整分数并复现旧396预测计分；禁止网络调用，原结果不修改。结果为acceptance.json；400项包含382正常完成、18内容失败，不能把400项都称为成功。指标与证据入口见[项目进展](../docs/项目进展.md)。
 
+降分核对入口：[analyze_aligned_step_drop.py](analyze_aligned_step_drop.py)，服务器个人环境后台运行`python -m scripts.analyze_aligned_step_drop --output <同一evaluation>`。只汇总原分数、诊断和空结果数量、41道相同题干、原请求用量，并绑定树组全部5个命中和标注定义冲突案例；不调用模型、不生成新分数或改原件。输出score_drop_analysis.json，已存在时拒绝覆盖；助手案例判读不是语义金标或因果收益证明。
+
 服务器资源约定（2026-11-13）：禁止编写或运行占卡程序，不以显存占位、空转或无效请求保留GPU。历史`training/openrlhf/gpu_bundle_utils.py reserve`及调用它的`adaptive_four_gpu_worker.sh`、`adaptive_four_gpu_watchdog.sh`不得启用。实际任务结束后确认无请求或其他任务依赖，关闭本人的闲置模型服务；资源不足时等待协调，不动他人进程。
 
 11月13日两项实验已结束。只读复查使用 `python -m scripts.audit_corrected_results <检查目录>`：核验全部题级结果/原请求、冻结初始提示和回答、模型身份、计分及逐题配对，写入唯一 `evaluation_audit.json`，不调用模型或改写正式成绩。`--inspect-source <combined原文件>` 追溯报告中20个定向案例的原始题面/参考；`--inspect-mechanisms` 复现本次查询、候选预览及题族反例检查。前者可读取本机原始题源；正式结果复算在服务器个人conda后台执行。定向案例不是随机抽样，不据此估计标签错误率；原输入或成绩哈希变更时停止，不覆盖不同批次的报告。
