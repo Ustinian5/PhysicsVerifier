@@ -16,6 +16,8 @@
 
 降分核对入口：[analyze_aligned_step_drop.py](analyze_aligned_step_drop.py)，服务器个人环境后台运行`python -m scripts.analyze_aligned_step_drop --output <同一evaluation>`。只汇总原分数、诊断和空结果数量、41道相同题干、原请求用量，并绑定树组全部5个命中和标注定义冲突案例；不调用模型、不生成新分数或改原件。输出score_drop_analysis.json，已存在时拒绝覆盖；助手案例判读不是语义金标或因果收益证明。
 
+11月16日获批的最小离线评分修正入口：[review_aligned_step_scoring.py](review_aligned_step_scoring.py)。仅用于本批100题、400终态、234条诊断；原评分器及生成结果不变。依次`prepare --root <evaluation>`、审查全部标签、`freeze-labels`、审查全部诊断、`freeze-evidence`，先冻结判断再看分数。保守格式定位保留所有重复位置；助手对改写引文、同根因同方向及自我纠错逐项登记原文证据，不由模糊匹配自动判中。服务器后台执行`score --root <evaluation> --await-release`，启动会话退出后新SSH核验runner_status中的进程，再创建offline_review/ALLOW_SCORE放行（60秒超时）。不调用模型，旧分数逐项复现且407份原件哈希不变后，输出原分数、证据修复、证据及纠错口径修复三个视图。每条诊断/根因最多匹配一次，可定位的重复诊断仍计P分母，全部失败保留R分母；另报全发布P分母与未决敏感性结果。复核和新指标仅在offline_review/，human_gold=false，不称独立人工盲审或生成能力提升；已有冻结复核及指标拒绝覆盖。
+
 服务器资源约定（2026-11-13）：禁止编写或运行占卡程序，不以显存占位、空转或无效请求保留GPU。历史`training/openrlhf/gpu_bundle_utils.py reserve`及调用它的`adaptive_four_gpu_worker.sh`、`adaptive_four_gpu_watchdog.sh`不得启用。实际任务结束后确认无请求或其他任务依赖，关闭本人的闲置模型服务；资源不足时等待协调，不动他人进程。
 
 11月13日两项实验已结束。只读复查使用 `python -m scripts.audit_corrected_results <检查目录>`：核验全部题级结果/原请求、冻结初始提示和回答、模型身份、计分及逐题配对，写入唯一 `evaluation_audit.json`，不调用模型或改写正式成绩。`--inspect-source <combined原文件>` 追溯报告中20个定向案例的原始题面/参考；`--inspect-mechanisms` 复现本次查询、候选预览及题族反例检查。前者可读取本机原始题源；正式结果复算在服务器个人conda后台执行。定向案例不是随机抽样，不据此估计标签错误率；原输入或成绩哈希变更时停止，不覆盖不同批次的报告。
