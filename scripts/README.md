@@ -12,6 +12,8 @@
 
 同日共享PREPARE格式失败恢复入口：[resume_aligned_step_evaluation.py](resume_aligned_step_evaluation.py)。第11题返回4条查询，超出原最多3条；原执行器未分类处理而全局退出。`register --output <同一evaluation>`先离线复验原请求/响应和冻结前缀；`run`及`confirm-detached`沿用服务器后台/新连接验收。仅对模型身份、HTTP、完整结束及用量均正常、但未通过原查询schema的响应，将同题四组记为CHECK未执行的内容失败，保持100题分母、原查询及预算，不截取、合并或重新生成查询。成功项和正常空诊断不重跑；网络、身份、不完整响应及未知异常仍停止。恢复凭据preparation_failure_recovery.json绑定原件和恢复代码；计分仍调用原函数，另报共享PREPARE失败数量。后续续跑本批使用此恢复入口。
 
+本批已于11月15日完成，11月16日离线验收通过，勿重新启动。验收入口：[audit_aligned_step_evaluation.py](audit_aligned_step_evaluation.py)，服务器个人环境运行`python -m scripts.audit_aligned_step_evaluation --output <同一evaluation>`。离线重建各组检索材料和实际消息，复解码响应、核对失败及预算、重算完整分数并复现旧396预测计分；禁止网络调用，原结果不修改。结果为acceptance.json；400项包含382正常完成、18内容失败，不能把400项都称为成功。指标与证据入口见[项目进展](../docs/项目进展.md)。
+
 服务器资源约定（2026-11-13）：禁止编写或运行占卡程序，不以显存占位、空转或无效请求保留GPU。历史`training/openrlhf/gpu_bundle_utils.py reserve`及调用它的`adaptive_four_gpu_worker.sh`、`adaptive_four_gpu_watchdog.sh`不得启用。实际任务结束后确认无请求或其他任务依赖，关闭本人的闲置模型服务；资源不足时等待协调，不动他人进程。
 
 11月13日两项实验已结束。只读复查使用 `python -m scripts.audit_corrected_results <检查目录>`：核验全部题级结果/原请求、冻结初始提示和回答、模型身份、计分及逐题配对，写入唯一 `evaluation_audit.json`，不调用模型或改写正式成绩。`--inspect-source <combined原文件>` 追溯报告中20个定向案例的原始题面/参考；`--inspect-mechanisms` 复现本次查询、候选预览及题族反例检查。前者可读取本机原始题源；正式结果复算在服务器个人conda后台执行。定向案例不是随机抽样，不据此估计标签错误率；原输入或成绩哈希变更时停止，不覆盖不同批次的报告。
