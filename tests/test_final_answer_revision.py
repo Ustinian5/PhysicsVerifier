@@ -1,0 +1,256 @@
+import json
+
+import pytest
+
+from rule_framework import final_answer_revision as p
+from scripts.audit_final_answer_metrics import measure
+
+
+ROW = dict(id='q1', question='What is 100 m divided by 10 s?',
+           prediction='My final answer is 10 m/s.', context='')
+
+
+def review(verdict='correct', **kwargs):
+    value = dict(question_status='complete', reference_status='consistent', verdict=verdict,
+                 student_final_answer='10 m/s', condition_check='Distance and time are given.',
+                 reference_check='100/10=10 in m/s.', answer_check='The committed answer is 10 m/s.')
+    value.update(kwargs)
+    return dict(status='complete', value=value)
+
+
+@pytest.mark.parametrize('label,prediction,cell', [
+    ('incorrect','incorrect','TP'), ('incorrect','correct','FN'),
+    ('correct','correct','TN'), ('correct','incorrect','FP')])
+def test_error_positive_truth_table(label, prediction, cell):
+    measured=measure({'x':label},{'x':dict(status='complete',value=dict(verdict=prediction))})
+    assert measured['counts'][cell] == 1
+    assert sum(measured['counts'].values()) == 1
+    assert p.CONFUSION[label,prediction] == cell
+
+
+def test_precision_and_recall_not_swapped():
+    labels={str(i): 'incorrect' if i<4 else 'correct' for i in range(6)}
+    values=['incorrect','correct','correct','correct','incorrect','correct']
+    result=measure(labels,{str(i):dict(status='complete',value=dict(verdict=x)) for i,x in enumerate(values)})
+    assert result['original_binary_view']['precision'] == .5
+    assert result['original_binary_view']['recall'] == .25
+    assert result['original_binary_view']['f1'] == pytest.approx(1/3)
+
+
+def test_failed_positive_remains_a_failure():
+    result=measure({'x':'incorrect'}, {'x':dict(status='content_failure',value=None)})
+    assert result['counts']['failed_positive'] == 1
+    assert result['counts']['FN'] == result['counts']['TN'] == 0
+    assert result['whole_cohort_view']['recall'] == 0
+    assert result['coverage'] == 0
+
+
+def test_review_never_sees_old_label_or_verifier():
+    row=dict(ROW, old_verdict='incorrect', verifier='SECRET_TEST_OUTPUT', reference='SECRET_PRIVATE_VALUE')
+    messages=p.review_messages(row,['10 m/s'])
+    payload=json.loads(messages[1]['content'])
+    assert set(payload) == {'question','student_answer','original_reference_answers'}
+    assert payload['original_reference_answers'] == ['10 m/s']
+    assert 'SECRET' not in str(messages)
+
+
+def test_check_never_sees_reference_gold():
+    row=dict(ROW, old_verdict='incorrect', reference='SECRET_GOLD', label='SECRET_LABEL')
+    messages=p.query_messages(row)
+    payload,_=json.JSONDecoder().raw_decode(messages[1]['content'])
+    assert set(payload) == {'question','prediction','context'}
+    assert 'SECRET' not in str(messages)
+    assert p.original.COMMON in messages[0]['content']
+    assert p.original.OUTPUT in messages[0]['content']
+
+
+def test_extra_context_cannot_sneak_in():
+    with pytest.raises(ValueError,match='additional context'):
+        p.query_messages(dict(ROW,context='private reference'))
+
+
+@pytest.mark.parametrize('change', [dict(question_status='missing_conditions'),
+                                  dict(reference_status='conflicting'),
+                                  dict(reference_status='insufficient')])
+def test_bad_inputs_cannot_receive_definite_labels(change):
+    with pytest.raises(ValueError,match='Unsafe definite'):
+        p.validate_review(review(**change)['value'])
+    p.validate_review(review(verdict='uncertain',**change)['value'])
+
+
+def test_machine_disagreement_cannot_automatically_flip_label():
+    d=p.decision(dict(ROW,old_verdict='incorrect'),review())
+    assert d['state'] == 'pending_adjudication'
+    assert d['reason'] == 'independent_review_disagrees'
+
+
+def test_uncertain_is_not_a_negative_or_exclusion_without_review():
+    d=p.decision(dict(ROW,old_verdict='correct'),review(verdict='uncertain'))
+    assert d['state'] == 'pending_adjudication'
+
+
+def test_explicit_adjudication_and_missing_reference():
+    candidate=dict(ROW,eligibility_failure='original_reference_missing')
+    assert p.decision(candidate,None)['state'] == 'excluded'
+    d=dict(id='q1',action='set_label',verdict='incorrect',basis='An independently checkable mismatch.',human_gold=False)
+    assert p.decision(ROW,None,d)['verdict'] == 'incorrect'
+    with pytest.raises(ValueError,match='incomplete generation/reference'):
+        p.decision(candidate,None,d)
+    with pytest.raises(ValueError,match='authority|adjudication'):
+        p.decision(ROW,None,dict(d,human_gold=True))
+
+
+def test_quota_uses_frozen_order_not_score_or_confidence():
+    rows=[dict(ROW,id=str(i)) for i in range(6)]
+    ds={str(i):dict(state='eligible',verdict='incorrect' if i%2 else 'correct') for i in range(6)}
+    assert [r['id'] for r in p.select_balanced(rows,ds,quota=2)] == ['0','1','2','3']
+    ds['1']=dict(state='excluded')
+    assert [r['id'] for r in p.select_balanced(rows,ds,quota=2)] == ['0','2','3','5']
+    ds['3']=dict(state='pending_adjudication')
+    with pytest.raises(ValueError,match='incomplete'):
+        p.select_balanced(rows,ds,quota=2)
+    ds['3']=dict(state='excluded')
+    with pytest.raises(ValueError,match='quota'):
+        p.select_balanced(rows,ds,quota=2)
+
+
+def test_shared_prefix_and_rag_object_binding():
+    queries={'queries':['速度 speed 距离 distance']}
+    ref=dict(id='c1',title='Historical example',text='Historical student answered 20 m/s; wrong.')
+    rag=p.continuation_messages(ROW,queries,[ref],arm='case_rag')
+    pure=p.continuation_messages(ROW,queries,[],arm='pure')
+    assert rag[:3] == pure[:3]
+    assert p.RAG_BINDING in rag[-1]['content']
+    assert p.RAG_BINDING not in pure[-1]['content']
+    assert 'diagnostics JSON' not in rag[-1]['content']
+    with pytest.raises(ValueError,match='Pure arm'):
+        p.continuation_messages(ROW,queries,[ref],arm='pure')
+
+
+def test_original_reference_selection_and_full_item_admission_are_reused():
+    store=p.memory.FlatMemory([dict(id='c1',kind='case',title='speed distance',text='full text speed distance',source_ids=['old1'])])
+    before=p.memory.continuation_messages
+    packet=p.reference_packet(ROW,'case_rag',{'queries':['speed distance 速度']},store,lambda m:len(str(m)))
+    assert p.memory.continuation_messages is before
+    assert packet['retrieval']['algorithm']=='flat_bm25'
+    assert packet['retrieval']['provided_complete_ids']==['c1']
+    assert packet['references'][0]['text']=='full text speed distance'
+    assert packet['messages'][-1]['content'].endswith(p.RAG_BINDING)
+    assert packet['retrieval']['embedding_calls']==0
+
+
+def test_review_extra_output_fields_rejected():
+    value=review()['value'];value['verifier_output']='should not be here'
+    with pytest.raises(ValueError,match='schema'):
+        p.validate_review(value)
+
+
+def request_fixture(tmp_path, monkeypatch, *, content=None, model=None, error=None):
+    from scripts import run_final_answer_revision as r
+    c=dict(model='expected-model',api_base='http://127.0.0.1:18083/v1',fixed_harmony_date='2026-11-03',
+           limits=dict(context_window=131072,request_timeout_seconds=1200))
+    plan=dict(configuration=c,configuration_sha256=r.vr.digest(c))
+    messages=[dict(role='user',content='test input')]
+    class Tokenizer:
+        def apply_chat_template(self,*args,**kwargs): return 'test input'
+        def encode(self,*args,**kwargs): return [1,2]
+        def decode(self,*args,**kwargs): return 'test input'
+    calls=[]
+    def transport(client,**kw):
+        calls.append(kw)
+        req=dict(messages=kw['messages'],max_tokens=kw['max_tokens'],model=kw['model'],
+                 temperature=0,top_p=1,reasoning_effort='medium')
+        raw=dict(model=model or c['model'],choices=[dict(finish_reason='stop')],prompt_token_ids=[1,2],
+                 usage=dict(prompt_tokens=2,completion_tokens=3,total_tokens=5))
+        r.vr.atomic(kw['request_path'],dict(request=req,request_sha256=r.base.r.sha256_value(req)))
+        r.vr.atomic(kw['raw_path'],raw)
+        rec=dict(http_status=200,model_ids=[raw['model']],raw_sse_sha256=r.vr.sha(kw['raw_path']),
+                 content=content or json.dumps({'queries':['speed 速度']}),elapsed_seconds=1)
+        if error:rec['error']=error
+        r.vr.atomic(kw['response_path'],rec)
+        if error:raise ValueError(error)
+        return rec
+    monkeypatch.setattr(r.base.runtime.transport,'chat_response',transport)
+    monkeypatch.setattr(r,'validate_effective_input',lambda raw,tok,date:
+                        dict(sha256=r.vr.digest(raw['prompt_token_ids']),token_count=2))
+    invoke=lambda:r.request_once(tmp_path,tmp_path/'call',messages,20,p.memory.validate_queries,
+                                 plan,Tokenizer(),None)
+    return r,invoke,calls
+
+
+def test_success_is_replayed_without_new_request(tmp_path,monkeypatch):
+    r,invoke,calls=request_fixture(tmp_path,monkeypatch)
+    first=invoke();assert first['status']=='complete'
+    assert invoke()==first and len(calls)==1
+    path=tmp_path/'call/result.json';value=r.vr.read(path);value['value']={'queries':['tampered']};r.vr.atomic(path,value)
+    with pytest.raises(ValueError,match='differs from original'):
+        invoke()
+    assert len(calls)==1
+
+
+def test_complete_invalid_content_is_not_retried(tmp_path,monkeypatch):
+    r,invoke,calls=request_fixture(tmp_path,monkeypatch,content='not a JSON object')
+    result=invoke();assert result['status']=='content_failure' and result['value'] is None
+    assert invoke()==result and len(calls)==1
+
+
+def test_wrong_model_stops_without_recording_a_terminal_case(tmp_path,monkeypatch):
+    r,invoke,calls=request_fixture(tmp_path,monkeypatch,model='different-model')
+    for _ in range(2):
+        with pytest.raises(ValueError,match='identity'):
+            invoke()
+    assert len(calls)==1 and not (tmp_path/'call/result.json').exists()
+
+
+def test_interrupted_request_cannot_be_resampled(tmp_path,monkeypatch):
+    r,invoke,calls=request_fixture(tmp_path,monkeypatch)
+    r.vr.atomic(tmp_path/'call/request.json',dict(request={}))
+    with pytest.raises(ValueError,match='Interrupted request'):
+        invoke()
+    assert calls==[]
+
+
+def test_unknown_decoder_error_stops(tmp_path,monkeypatch):
+    r,invoke,calls=request_fixture(tmp_path,monkeypatch,error='Unknown envelope structure')
+    with pytest.raises(ValueError,match='Unclassified decoder'):
+        invoke()
+    assert len(calls)==1 and not (tmp_path/'call/result.json').exists()
+
+
+def test_retained_evidence_cannot_change(tmp_path,monkeypatch):
+    r,invoke,calls=request_fixture(tmp_path,monkeypatch)
+    invoke();path=tmp_path/'call/response.json';value=r.vr.read(path);value['content']='changed';r.vr.atomic(path,value)
+    with pytest.raises(ValueError,match='evidence drift'):
+        invoke()
+    assert len(calls)==1
+
+
+def test_failed_shared_prepare_propagates_without_check_calls(tmp_path,monkeypatch):
+    from scripts import run_final_answer_revision as r
+    prefix=dict(status='content_failure',value=None,reason='Too many queries',
+                usage=dict(prompt_tokens=10,completion_tokens=5,total_tokens=15),files={})
+    calls=[]
+    def failed(out,folder,*args):
+        calls.append(folder)
+        r.immutable(folder/'result.json',prefix)
+        return prefix
+    monkeypatch.setattr(r,'request_once',failed)
+    c=dict(max_requests_per_sample=12,output_tokens_per_sample=16384,input_tokens_per_sample=600000)
+    plan=dict(configuration=dict(limits=c),configuration_sha256='frozen')
+    r.run_question(tmp_path,ROW,'formal',plan,None,None,{})
+    assert len(calls)==1
+    for arm in r.ARMS:
+        f=tmp_path/'formal'/arm/r.vr.digest(ROW['id'])[:24]/'result.json'
+        got=r.vr.read(f)
+        assert got['status']=='content_failure' and got['value'] is None
+        assert got['actual_response_count']==1 and got['usage']==prefix['usage']
+
+
+def test_assistant_decision_must_bind_the_actual_answer(tmp_path):
+    from scripts import run_final_answer_revision as r
+    candidate=dict(ROW,question_sha256='q',answer_sha256='a',reference_sha256='r')
+    decision=dict(id='q1',action='set_label',verdict='incorrect',basis='reason',human_gold=False,
+                  question_sha256='q',answer_sha256='changed',reference_sha256='r')
+    r.vr.atomic(tmp_path/'assistant_review.json',dict(reviewer='Codex assistant',human_gold=False,decisions=[decision]))
+    with pytest.raises(ValueError,match='different question/answer/reference'):
+        r.read_overrides(tmp_path,[candidate])

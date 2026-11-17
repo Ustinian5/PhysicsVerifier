@@ -2,6 +2,15 @@
 
 当前状态见[项目进展](../docs/项目进展.md)。2026-11-14用户要求恢复旧99题v15方法，只更正题源与30B bench；旧full/STOP保留，旧协调器不恢复。
 
+题目级修订使用独立入口[run_final_answer_revision.py](run_final_answer_revision.py)，不恢复旧600题工具执行器。四组共享PREPARE与原BM25全文投递，CHECK仅判当前回答的最终答案；使用当前739 RAG/1471 skills/895树叶，medium、日期、原预算不改。所有命令在服务器个人conda后台执行，使用同一`--output <final_revision>`：
+
+1. `prepare --root <qwen30b_step_verifier> --await-release`核验702份原30B回答、参考及旧标签，并冻结材料/输入哈希，不调用模型。重连后用`confirm-detached`放行；下列离线写入命令同样加`--await-release`并重连确认。
+2. 有实际空闲GPU及独立120B服务后，后台`pilot`先运行固定6题工程验收；后台`review`对候选作参考可见的独立核查，均需从新SSH运行`confirm-detached`。助手显式处理分歧的依据写入`assistant_review.json`并绑定题目、回答、参考哈希；不能以四组输出或得分作为改标签依据。
+3. `freeze --await-release`只在无pending、正误各300且隔离通过时发布新bench。`rescore-archive --await-release`在同一批存活旧题上用旧/新标签分别重算，原2400输出及旧成绩不变。
+4. 后台`run`经重连确认后完成新600×4检查并离线计分。成功、正常空/不确定结果和内容失败不重抽；错误模型身份、鉴权、证据不完整或未知协议故障停止。实际任务结束后核实无在途请求/依赖再释放本人服务，禁止占卡。
+
+错误为正类：TP=标错判错、FN=标错判对、FP=标对判错、TN=标对判对。P/R/F1用标准公式；失败/uncertain单列，报告二分类覆盖及全题检出视图，不伪造标签。新标签为机器及助手复核，human_gold=false。新600题尚未冻结或完成时，不将准备、局部修正或旧工具版结果称为新版成绩。
+
 11月17日修订批已完成：400项终态（383正常/17内容失败），109项变化的CHECK产生138次新正式请求；225条诊断复核及离线计分、4408份证据验收通过，模型服务已释放。以下入口供复现和追溯，不自动重新运行已完成任务。
 
 11月17日已批准的最小修正入口：[run_aligned_step_revision.py](run_aligned_step_revision.py)。在服务器个人conda执行`prepare --parent <aligned_old99/evaluation> --output <aligned_old99/evaluation_revision>`，只隔离已审读的3份来源并沿用原prune_catalog传播，保留其余材料；仅RAG的CHECK增加当前回答绑定，原件不覆盖。离线重放全部400项模型可见消息、查询前缀用量及预算，tasks.json明确279项复用、12项原PREPARE失败保留、109项CHECK重跑。`run`必须服务器后台并以`confirm-detached`从新SSH连接放行；固定6道开发题×4组只验工程/对象绑定，`pilot_acceptance.json`绑定实际输出审读依据，未验收不进入正式批次，等待超过5分钟则停止并释放本人服务。正式调用前再次核对冻结材料包；成功、空结果、内容失败不按得分重抽，保留原失败处理与quote-only预算。原600题生成不在此入口范围。
