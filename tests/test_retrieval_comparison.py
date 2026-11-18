@@ -8,7 +8,7 @@ from scripts.run_retrieval_comparison import (
     Corpus, Transport, digest, model_input, tool_definitions, validate_selection,
     execute_tool_batch,
     transient_retry_jobs, write_json, BatchBudget, BatchBudgetExceeded,
-    validate_batch_inputs, sha256_file, ASTRA, TERRA,
+    validate_batch_inputs, sha256_file, ASTRA, TERRA, QWEN,
     OVERLOAD_BACKOFF_SECONDS,
     run_ancestry, evidence_path, exclusive_run_lock,
     run_recovery,
@@ -412,6 +412,26 @@ class RetrievalComparisonTests(unittest.TestCase):
             self.assertEqual(set(jobs), {("paused", 2), ("not_started", 2)})
             self.assertTrue(jobs[("not_started", 2)]["new_pending"])
             self.assertEqual(jobs[("paused", 2)]["source_run"], str(original.resolve()))
+
+    def test_continuation_replays_completed_prefix_after_process_interruption(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = {"sample_ids": ["interrupted"]}
+            write_json(root / "manifest.json", config)
+            job = root / "arm1" / hashlib.sha256(b"interrupted").hexdigest()[:16]
+            body = {"model": QWEN, "messages": [{"role": "user", "content": "step"}]}
+            response = {"id": "response", "model": QWEN, "usage": {"prompt_tokens": 12, "completion_tokens": 8}}
+            write_json(job / "request_001.json", {"request": body, "endpoint": "/chat/completions", "http_status": 200, "response": response})
+            write_json(job / "request_002.json", {"request": body, "endpoint": "/chat/completions", "started_unix": 1})
+            jobs = transient_retry_jobs(root, config, [1], include_pending=True)
+            self.assertEqual(set(jobs), {("interrupted", 1)})
+            self.assertEqual(jobs[("interrupted", 1)]["completed_prefix_requests"], 1)
+            self.assertEqual(jobs[("interrupted", 1)]["source_run"], str(root.resolve()))
+
+            transport = Transport(base="https://not-used.invalid", key="unused", output=root / "resume", limits={}, model=QWEN, replay_source=job)
+            self.assertEqual(transport.post("/chat/completions", body), response)
+            self.assertEqual(transport.requests, 0)
 
     def test_moved_runs_preserve_ancestry_budget_and_response_replay(self):
         import hashlib
