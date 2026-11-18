@@ -2,7 +2,7 @@
 
 当前状态见[项目进展](../docs/项目进展.md)。2026-11-14用户要求恢复旧99题v15方法，只更正题源与30B bench；旧full/STOP保留，旧协调器不恢复。
 
-题目级修订使用独立入口[run_final_answer_revision.py](run_final_answer_revision.py)，不恢复旧600题工具执行器。四组共享PREPARE与原BM25全文投递，CHECK仅判当前回答的最终答案；使用当前739 RAG/1471 skills/895树叶，medium、日期、原预算不改。所有命令在服务器个人conda后台执行，使用同一`--output <final_revision>`：
+题目级修订使用[run_final_answer_revision.py](run_final_answer_revision.py)。四组共享PREPARE，三个知识组按原BM25投递全文，CHECK仅判当前回答的最终答案。冻结材料为739份RAG案例、1471条skills、895个树叶。启动四组试跑前需修正已确认的累计时限执行问题，旧输出复算前需补齐候选处置表的哈希校验。依据见[项目进展](../docs/项目进展.md#当前600题修订)。以下命令在服务器个人conda后台执行，使用同一 `--output <final_revision>`。
 
 1. `prepare --root <qwen30b_step_verifier> --await-release`核验702份原30B回答、参考及旧标签，并冻结材料/输入哈希，不调用模型。重连后用`confirm-detached`放行；下列离线写入命令同样加`--await-release`并重连确认。
 2. 有实际空闲GPU及独立120B服务后，后台`pilot`先运行固定6题工程验收；后台`review`对候选作参考可见的独立核查，均需从新SSH运行`confirm-detached`。助手显式处理分歧的依据写入`assistant_review.json`并绑定题目、回答、参考哈希；不能以四组输出或得分作为改标签依据。

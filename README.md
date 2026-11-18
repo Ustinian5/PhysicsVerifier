@@ -2,9 +2,9 @@
 
 检查物理竞赛题的模型解答，输出对应规则、错误说明和原文位置，并提供训练奖励接口。
 
-当前科研主线：GPT-OSS-120B在连续上下文中完成全文检查、规则检索和诊断，使用冻结C4提示比较旧1,123叶与新2,065叶。入口是[run_catalog_comparison.py](scripts/run_catalog_comparison.py)，实际状态与对照边界见[项目进展](docs/项目进展.md)。
+当前评测由 Qwen3-30B 作答，GPT-OSS-120B medium 检查。纯模型、经验 RAG、平铺 skills 和规则树共用查询提示。100 题步骤级评测已完成，600 题最终答案评测正在修订。成绩和训练奖励接入状态见[项目进展](docs/项目进展.md)。
 
-现有默认verifier及训练接口保留分段流程；下方示例属于这一入口：
+下图为默认 verifier 和现有规则奖励服务使用的分段流程。
 
 ```text
 题目与上下文 → 背景分析 → Domain → Topic → Scenario Cluster → Rule
