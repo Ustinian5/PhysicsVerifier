@@ -14,7 +14,7 @@
 
 参考答案不进入 verifier。符号核查可选；规则可达、流程完成和诊断正确是不同的验收项目。
 
-## 运行
+## 分段 verifier 的运行示例
 
 Python 统一使用 conda `physicsverifier` 环境：
 

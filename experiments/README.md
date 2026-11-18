@@ -2,7 +2,9 @@
 
 本目录只保存需要进入 Git 的冻结实验 manifest；大型数据、模型输出和 trace 继续保存在被忽略的 `data/` 与 `results/`。
 
-正式运行使用 `scripts/run_physics_eval_pipeline.py --manifest-output experiments/manifests/<run-id>.json`。脚本会自动记录：
+当前30B评测在结果目录保存冻结配置、原始请求、响应与逐题计分。入口见[脚本说明](../scripts/README.md)。
+
+以下为历史分段评测的清单格式。`scripts/run_physics_eval_pipeline.py --manifest-output experiments/manifests/<run-id>.json` 用于复现该流程，记录下列内容。
 
 - Git HEAD、分支、dirty 状态、tracked diff SHA；
 - 全部运行源码的逐文件 SHA 和聚合 SHA；

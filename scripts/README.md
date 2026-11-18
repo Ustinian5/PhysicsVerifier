@@ -1,15 +1,20 @@
 # 脚本入口
 
-当前状态见[项目进展](../docs/项目进展.md)。2026-11-14用户要求恢复旧99题v15方法，只更正题源与30B bench；旧full/STOP保留，旧协调器不恢复。
+当前 600 题最终答案评测使用 `scripts.run_final_answer_revision`。原题、30B 回答、参考、三库及实验参数均由准备配置绑定。11月18日用户只授权修复和验证，在线批次另行确认。[题目级执行器](run_final_answer_revision.py) · [项目进展](../docs/项目进展.md)
 
-题目级修订使用[run_final_answer_revision.py](run_final_answer_revision.py)。四组共享PREPARE，三个知识组按原BM25投递全文，CHECK仅判当前回答的最终答案。冻结材料为739份RAG案例、1471条skills、895个树叶。启动四组试跑前需修正已确认的累计时限执行问题，旧输出复算前需补齐候选处置表的哈希校验。依据见[项目进展](../docs/项目进展.md#当前600题修订)。以下命令在服务器个人conda后台执行，使用同一 `--output <final_revision>`。
+| 环节 | 服务器入口与产物 |
+|---|---|
+| 冻结准备 | 已完成的 `prepare` 生成 `plan.json`。本次 `register-repair --await-release` 用独立的 `confirm-repair` 核验断连后的进程，将原配置与修复后的执行器绑定在 `execution_repair.json`。`verify` 检查两份依据。 |
+| 开发题和候选标签 | 确认执行后，`pilot` 在固定6道开发题验收四组。`review` 先执行6个标签控制，再独立复核候选。真实检查须使用冻结的120B分词器与服务环境，两者均运行在服务器上。 |
+| 发布与旧输出复算 | `freeze --await-release` 从处置完的702题中按原序选正误各300，绑定全部处置以及选中题的输入和标签。`rescore-archive --await-release` 校验同一处置表后，按两版标签对同一旧输出子集复算。 |
+| 正式检查与计分 | `run` 验收开发题回执后执行600题四组。共享 PREPARE 的耗时计入每一组，CHECK 受本组剩余时限和单请求上限约束。断点复用及离线 `score --await-release` 同样复核原始记录。 |
 
-1. `prepare --root <qwen30b_step_verifier> --await-release`核验702份原30B回答、参考及旧标签，并冻结材料/输入哈希，不调用模型。重连后用`confirm-detached`放行；下列离线写入命令同样加`--await-release`并重连确认。
-2. 有实际空闲GPU及独立120B服务后，后台`pilot`先运行固定6题工程验收；后台`review`对候选作参考可见的独立核查，均需从新SSH运行`confirm-detached`。助手显式处理分歧的依据写入`assistant_review.json`并绑定题目、回答、参考哈希；不能以四组输出或得分作为改标签依据。
-3. `freeze --await-release`只在无pending、正误各300且隔离通过时发布新bench。`rescore-archive --await-release`在同一批存活旧题上用旧/新标签分别重算，原2400输出及旧成绩不变。
-4. 后台`run`经重连确认后完成新600×4检查并离线计分。成功、正常空/不确定结果和内容失败不重抽；错误模型身份、鉴权、证据不完整或未知协议故障停止。实际任务结束后核实无在途请求/依赖再释放本人服务，禁止占卡。
+上述入口统一使用 `--output <final_revision>`。在线和离线批次都在服务器个人 conda 环境后台运行，由新的 SSH 连接确认。实验输入、标签可见性、检索与计分定义见[评测口径](../docs/效果测评.md)。
 
-错误为正类：TP=标错判错、FN=标错判对、FP=标对判错、TN=标对判对。P/R/F1用标准公式；失败/uncertain单列，报告二分类覆盖及全题检出视图，不伪造标签。新标签为机器及助手复核，human_gold=false。新600题尚未冻结或完成时，不将准备、局部修正或旧工具版结果称为新版成绩。
+复核数据来历使用 `scripts.audit_verifier_lineage`。在持有授权原始题库的位置运行 `source`，服务器运行 `evidence` 逐份核对原始回答、材料、步骤标注和诊断计分。`repair` 用固定6题的已存查询和原分词器比较修复前后的消息、输出上限及全文材料。参数为 `--root <qwen30b_step_verifier> --output <回执目录>`。结果写入独立回执。[复核脚本](audit_verifier_lineage.py)
+
+<details>
+<summary>历史实验的复现入口及各批次运行记录</summary>
 
 11月17日修订批已完成：400项终态（383正常/17内容失败），109项变化的CHECK产生138次新正式请求；225条诊断复核及离线计分、4408份证据验收通过，模型服务已释放。以下入口供复现和追溯，不自动重新运行已完成任务。
 
@@ -21,7 +26,7 @@
 
 题目级复算入口：[audit_final_answer_metrics.py](audit_final_answer_metrics.py)：服务器后台`--root <旧600题目录> --output <同目录/final_metric_audit.json> --await-release`，新SSH核验同名.ready.json中的进程，再创建同名.ALLOW文件。核对2400份冻结结果哈希、混淆矩阵和原P/R/F1，另报覆盖、全题检出、平衡准确率/Macro-F1/MCC及恒定预测对照；原600题标签、输出与正式metrics不改。不把步骤级非空诊断当作最终答案错误，也不因指标高而修改公式。
 
-当前方法恢复入口为[run_aligned_organization.py](run_aligned_organization.py)：`prepare --output <独立恢复目录> --legacy <已完成旧99目录> --current <已完成更正批次>`只绑定输入和离线核验396份原始请求；`verify`不调用模型。服务器后台`pilot`运行12来源的原case_note/skills和36份工程/开发检查，退出启动SSH后用`confirm-detached`从新连接放行；通过后`build`可按原协议补齐材料，成功项不重跑。该材料入口不执行formal；正式入口见下方run_aligned_step_evaluation，旧协调器不恢复。旧树算法、全文注入、共享PREPARE、同上下文CHECK及每题预算直接复用旧实现；旧解码器从哈希核验的Git版本载入内存，不另存源码副本。服务使用固定日期入口，PV_HARMONY_DATE=2026-11-03；此流程无原生search/read工具消息，不需要工具适配服务。
+11月14日的材料恢复入口为[run_aligned_organization.py](run_aligned_organization.py)：`prepare --output <独立恢复目录> --legacy <已完成旧99目录> --current <已完成更正批次>`只绑定输入和离线核验396份原始请求；`verify`不调用模型。服务器后台`pilot`运行12来源的原case_note/skills和36份工程/开发检查，退出启动SSH后用`confirm-detached`从新连接放行；通过后`build`可按原协议补齐材料，成功项不重跑。该材料入口不执行formal；正式入口见下方run_aligned_step_evaluation，旧协调器不恢复。旧树算法、全文注入、共享PREPARE、同上下文CHECK及每题预算直接复用旧实现；旧解码器从哈希核验的Git版本载入内存，不另存源码副本。服务使用固定日期入口，PV_HARMONY_DATE=2026-11-03；此流程无原生search/read工具消息，不需要工具适配服务。
 
 11月15日材料补齐核验入口：[audit_aligned_organization.py](audit_aligned_organization.py)。在服务器个人conda后台执行`python -m scripts.audit_aligned_organization --output <恢复目录>`，核对全部原始材料请求、渲染、来源、试跑原件及完整库输入边界，禁止模型POST请求，不修改冻结材料。只更新readiness_audit.json及进度；正文明确区分材料验证与正式评测放行。修正前报告formal_ready=false记录了来源筛查、标签收尾和正式入口三项缺口；该原报告不改写，后续修正依据见evaluation/发布证据。不能直接调用硬编码旧99标签的score函数。
 
@@ -432,3 +437,5 @@ python -m scripts.run_rule_skill_comparison score --output <对照目录>
 模型路由拒绝默认不自动重试。用户明确要求修复恢复时，`route_recovery.json`必须绑定原binding、已核验错误记录的路径与SHA256；恢复入口只放行该历史拒绝，新的model_not_found仍停止，不更换型号/预算或重写旧响应。
 
 2026-11-10用户授权两项耗尽任务各追加6次技术尝试：`attempt_extension.json`绑定原binding及各6份历史失败SHA256，只允许`arm_blind/cl_258_182363`、`arm_review/trainphysics_7865`的固定总上限12次；其余任务仍6次。恢复不清零实际请求计数，不因重启继续扩额；冷却、模型、提示、每次及总token预算、余额保护不变。来源编号修正通过已有provenance_correction机制保留原件和理由。
+
+</details>
