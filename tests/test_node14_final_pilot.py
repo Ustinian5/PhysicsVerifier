@@ -1,7 +1,8 @@
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import httpx
+import pytest
 
 from scripts import run_node14_final_pilot as pilot
 
@@ -36,3 +37,56 @@ def test_shutdown_reads_both_gauges_across_engines():
     transport = httpx.MockTransport(lambda _: httpx.Response(200, text=metrics))
     with httpx.Client(transport=transport) as client:
         assert pilot.request_counts(client, 'http://127.0.0.1') == dict(running=1, waiting=2)
+
+
+def test_shutdown_tracks_vllm_worker_by_session_with_an_empty_environ():
+    with patch.object(pilot.os, 'getpgid', return_value=33), patch.object(pilot.os, 'getsid', return_value=33), \
+            patch.object(Path, 'read_bytes', return_value=b''):
+        assert pilot.owns_gpu_process('34', 33, Path('/private/service'))
+        assert not pilot.owns_gpu_process('34', 44, Path('/private/service'))
+
+
+def test_launcher_exit_does_not_release_gpu_while_recorded_worker_lives(tmp_path):
+    service = Mock(pid=33, returncode=0)
+    service.poll.return_value = 0
+    worker = {'34': '1234'}
+    busy = dict(compute_processes=[['gpu', '34']])
+    free = dict(compute_processes=[])
+    with patch.object(pilot, 'session_workers', side_effect=[worker.copy(), worker, {}]), \
+            patch.object(pilot, 'resources', side_effect=[busy, free]), \
+            patch.object(pilot, 'sockets', return_value=''), patch.object(pilot, 'owns_gpu_process', return_value=True), \
+            patch.object(pilot.final.base.runtime, 'process_identity', return_value='1234'), \
+            patch.object(pilot.time, 'monotonic', side_effect=[0, 46]), patch.object(pilot.time, 'sleep'), \
+            patch.object(pilot.os, 'killpg') as terminate, patch.object(pilot.os, 'kill') as force:
+        pilot.release(service, dict(gpu_uuid='gpu'), tmp_path, False, '')
+    terminate.assert_called_once_with(33, pilot.signal.SIGTERM)
+    force.assert_called_once_with(34, pilot.signal.SIGKILL)
+    result = pilot.vr.read(tmp_path / 'release.json')
+    assert result['forced_pids'] == worker and result['owned_gpu_pids'] == [] and result['session_workers'] == {}
+
+
+def test_hot_storage_preserves_served_id_and_rechecks_weight_bytes(tmp_path):
+    hot = tmp_path / 'hot'
+    local = hot / 'models/gpt-oss-120b'
+    local.mkdir(parents=True)
+    folder = tmp_path / 'attempt'
+    folder.mkdir()
+    index = local / 'model.safetensors.index.json'
+    shard = local / 'shard.safetensors'
+    pilot.vr.atomic(index, {'weight_map': {'layer.weight': shard.name}})
+    shard.write_bytes(b'original')
+    files = {p.name: dict(bytes=p.stat().st_size, mtime_ns=p.stat().st_mtime_ns, sha256=pilot.vr.sha(p))
+             for p in (index, shard)}
+    served_id = '/shared/original-gpt-oss'
+    receipt = tmp_path / 'weights.json'
+    pilot.vr.atomic(receipt, dict(verified=True, source=served_id, local=str(local), shards=[shard.name], files=files))
+    config = dict(model=served_id)
+    with patch.object(pilot, 'HOT', hot), patch.object(pilot, 'CONTROL', tmp_path), \
+            patch.object(pilot.final.base.runtime, 'MODEL_FILES', {index.name: pilot.vr.sha(index)}):
+        path = pilot.weight_location(config, folder, pilot.vr.sha(receipt))
+        assert pilot.vr.read(path) == {served_id: str(local)}
+        stat = shard.stat()
+        shard.write_bytes(b'modified')
+        pilot.os.utime(shard, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        with pytest.raises(ValueError, match='Bound evidence changed'):
+            pilot.weight_location(config, folder, pilot.vr.sha(receipt))

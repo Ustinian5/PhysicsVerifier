@@ -47,6 +47,31 @@ def service_script(config):
     return script, paths
 
 
+def weight_location(config, folder, receipt_hash):
+    if receipt_hash is None:
+        return None
+    receipt = CONTROL / 'weights.json'
+    require(vr.sha(receipt) == receipt_hash, 'Weight transfer receipt changed')
+    proof = vr.read(receipt)
+    local = HOT / 'models/gpt-oss-120b'
+    require(proof['verified'] and proof['source'] == config['model'] and proof['local'] == str(local),
+            'Weight transfer belongs to another checkpoint or storage path')
+    files = proof['files']
+    require(set(files) == {p.name for p in local.iterdir()} and all((local / n).is_file() for n in files),
+            'Missing or unexpected hot checkpoint files')
+    require(set(vr.read(local / 'model.safetensors.index.json')['weight_map'].values()) == set(proof['shards'])
+            == {n for n in files if n.endswith('.safetensors')}, 'Checkpoint shard inventory changed')
+    require(all(files[n]['sha256'] == h for n, h in final.base.runtime.MODEL_FILES.items()), 'Model metadata drift')
+    for name, entry in files.items():
+        stat = (local / name).stat()
+        require((stat.st_size, stat.st_mtime_ns) == (entry['bytes'], entry['mtime_ns']), 'Hot checkpoint stat drift')
+    vr.EvidenceCache(folder / 'weight_cache.json').check(
+        {str(local / n): v['sha256'] for n, v in files.items()}, full=True, workers=3)
+    redirect = folder / 'model_location.json'
+    final.immutable(redirect, {config['model']: str(local)})
+    return redirect
+
+
 def set_environment():
     cache = HOT / 'cache/gptoss120b'
     locations = dict(XDG_CACHE_HOME=cache, HF_HOME=cache / 'huggingface', TRITON_CACHE_DIR=cache / 'triton',
@@ -90,7 +115,10 @@ def sockets(options):
 def owned_listener(pid):
     listeners = sockets(['-Hltnp'])
     pids = [int(p) for p in re.findall(r'pid=(\d+)', listeners)]
-    return bool(pids) and all(os.getpgid(p) == pid for p in pids)
+    try:
+        return bool(pids) and all(os.getpgid(p) == pid for p in pids)
+    except ProcessLookupError:
+        return False
 
 
 def request_counts(client, url):
@@ -105,42 +133,90 @@ def request_counts(client, url):
     return counts
 
 
+def owns_gpu_process(pid, leader, run_root):
+    try:
+        # vLLM sets the worker title and can erase its original /proc environ.
+        if os.getpgid(int(pid)) == leader and os.getsid(int(pid)) == leader:
+            return True
+        return os.fsencode('STEP_OSS_RUN_ROOT=' + str(run_root)) in Path(f'/proc/{pid}/environ').read_bytes().split(b'\0')
+    except (PermissionError, FileNotFoundError, ProcessLookupError):
+        return False
+
+
+def session_workers(leader):
+    result = subprocess.run(['ps', '--sid', str(leader), '-o', 'pid=,stat='], text=True, capture_output=True)
+    require(result.returncode in (0, 1) and not result.stderr, 'Cannot inspect service session')
+    workers = {}
+    for line in result.stdout.splitlines():
+        pid, state = line.split()
+        if state.startswith('Z'):
+            continue
+        try:
+            if os.getsid(int(pid)) == leader:
+                workers[pid] = final.base.runtime.process_identity(pid)
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    return workers
+
+
 def release(service, record, folder, ready, url):
     idle = {}
+    leader = service.pid
+    run_root = folder / 'service'
     if service.poll() is None:
         pid = service.pid
         identity = Path(f'/proc/{pid}/environ').read_bytes().split(b'\0')
         require(final.base.runtime.process_identity(pid) == record['start'] and os.getpgid(pid) == pid
                 and os.fsencode('STEP_OSS_RUN_ROOT=' + str(folder / 'service')) in identity,
                 'Service process identity changed')
-        if ready or owned_listener(pid):
-            while True:
-                require(owned_listener(pid), 'Service port ownership changed')
-                with httpx.Client(trust_env=False, timeout=10) as client:
-                    idle = request_counts(client, url)
-                if not any(idle.values()) and not sockets(['-Htn', 'state', 'established']):
-                    break
-                time.sleep(3)
-        os.killpg(pid, signal.SIGTERM)
-        service.wait(timeout=150)
-    deadline = time.monotonic() + 150
+    if owned_listener(leader) or (ready and service.poll() is None):
+        while True:
+            require(owned_listener(leader), 'Service port ownership changed')
+            with httpx.Client(trust_env=False, timeout=10) as client:
+                idle = request_counts(client, url)
+            if not any(idle.values()) and not sockets(['-Htn', 'state', 'established']):
+                break
+            time.sleep(3)
+    tracked = session_workers(leader)
+    if tracked:
+        try:
+            os.killpg(leader, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    grace = time.monotonic() + 45
+    forced = {}
     while True:
+        service.poll()
         snapshot = resources()
         gpu_pids = [pid for uuid, pid in snapshot['compute_processes'] if uuid == record['gpu_uuid']]
         ours = []
         for pid in gpu_pids:
-            proc_env = Path(f'/proc/{pid}/environ')
-            try:
-                if os.fsencode('STEP_OSS_RUN_ROOT=' + str(folder / 'service')) in proc_env.read_bytes().split(b'\0'):
-                    ours.append(pid)
-            except (PermissionError, FileNotFoundError, ProcessLookupError):
-                continue
-        if not ours and not owned_listener(service.pid):
+            if owns_gpu_process(pid, leader, run_root):
+                ours.append(pid)
+            elif pid in tracked:
+                try:
+                    if final.base.runtime.process_identity(pid) == tracked[pid]:
+                        ours.append(pid)
+                except (FileNotFoundError, ProcessLookupError):
+                    ours.append(pid)  # The driver still lists the process that just exited.
+        workers = session_workers(leader)
+        tracked.update(workers)
+        if not ours and not workers and not owned_listener(leader):
             break
-        require(time.monotonic() < deadline, 'Owned GPU process or listener still active')
+        if time.monotonic() >= grace:
+            for pid in set(ours).union(workers):
+                try:
+                    start = final.base.runtime.process_identity(pid)
+                    owned = workers.get(pid) == start or owns_gpu_process(pid, leader, run_root)
+                    if forced.get(pid) != start and owned and tracked.get(pid, start) == start:
+                        os.kill(int(pid), signal.SIGKILL)
+                        forced[pid] = start
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
         time.sleep(2)
     vr.atomic(folder / 'release.json', dict(unix=time.time(), gauges=idle, exit_code=service.returncode,
-              owned_gpu_pids=ours, gpu_snapshot=snapshot, port_listeners=sockets(['-Hltnp'])))
+              owned_gpu_pids=ours, session_workers=workers, tracked_processes=tracked, forced_pids=forced,
+              gpu_snapshot=snapshot, port_listeners=sockets(['-Hltnp'])))
 
 
 def audit_results(plan, tokenizer, folder):
@@ -199,7 +275,7 @@ def audit_results(plan, tokenizer, folder):
               accepted=receipt.exists(), configuration_sha256=CONFIG, offline_model_calls=0))
 
 
-def run(folder, plan, signature):
+def run(folder, plan, signature, weights_hash):
     from transformers import AutoTokenizer
 
     cfg = plan['configuration']
@@ -213,6 +289,7 @@ def run(folder, plan, signature):
     tokenizer = AutoTokenizer.from_pretrained(cfg['model'], local_files_only=True, trust_remote_code=False)
     final.a.historical_transport()
     script, paths = service_script(cfg)
+    redirect = weight_location(cfg, folder, weights_hash)
     url = cfg['api_base'].removesuffix('/v1')
     with final.base.r.run_lock(OUT / 'active.lock'), final.base.r.run_lock(LOCK):
         final.base.runtime.wait_detached(folder, signature)
@@ -228,6 +305,9 @@ def run(folder, plan, signature):
         env = dict(os.environ, STEP_OSS_GPU_INDEX=index, STEP_OSS_GPU_UUID=uuid,
                    STEP_OSS_RUN_ROOT=str(folder / 'service'), STEP_OSS_CACHE_ROOT=str(HOT / 'cache/gptoss120b'),
                    PV_HARMONY_DATE=cfg['fixed_harmony_date'])
+        env.pop('VLLM_MODEL_REDIRECT_PATH', None)
+        if redirect is not None:
+            env['VLLM_MODEL_REDIRECT_PATH'] = str(redirect)
         with (folder / 'service.log').open('ab') as log:
             service = subprocess.Popen(['/bin/bash', '-c', script], cwd=ROOT, env=env, start_new_session=True,
                                        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
@@ -236,15 +316,20 @@ def run(folder, plan, signature):
                       gpu_index=index, preflight=snapshot, port=PORT, source_lock=cfg['service_lock'],
                       active_lock=str(LOCK), source_launcher_sha256=cfg['source_hashes'][LAUNCHER],
                       wrapper_sha256=vr.sha(Path(__file__)), infrastructure_paths=paths,
-                      configuration_sha256=plan['configuration_sha256'], environment_sha256=vr.sha(CONTROL / 'environment.json'))
+                      configuration_sha256=plan['configuration_sha256'], environment_sha256=vr.sha(CONTROL / 'environment.json'),
+                      weights_receipt_sha256=weights_hash, storage_redirect=vr.read(redirect) if redirect else {})
         try:
             vr.atomic(folder / 'deployment.json', record)
             vr.atomic(folder / 'execution_status.json', dict(state='starting_service', unix=time.time(), pid=service.pid))
-            start = time.monotonic()
+            last_progress = time.monotonic()
+            log_stamp = None
             with httpx.Client(trust_env=False, timeout=10) as client:
                 while True:
                     require(service.poll() is None, 'Service exited before readiness; see service.log')
-                    require(time.monotonic() - start < 3600, 'Service startup timed out')
+                    stamp = (folder / 'service.log').stat().st_mtime_ns
+                    if stamp != log_stamp:
+                        last_progress, log_stamp = time.monotonic(), stamp
+                    require(time.monotonic() - last_progress < 3600, 'No startup progress for one hour')
                     require(not (OUT / 'STOP').exists(), 'STOP requested')
                     if owned_listener(service.pid):
                         try:
@@ -278,7 +363,9 @@ def main():
     plan = final.verify(OUT)
     require(plan['configuration_sha256'] == CONFIG and plan['configuration']['pilot_sha256'] == PILOT,
             'Wrong frozen configuration or pilot')
-    signature = vr.digest([CONFIG, PILOT, str(LOCK), vr.sha(Path(__file__)), vr.sha(CONTROL / 'environment.json')])
+    weights = CONTROL / 'weights.json'
+    weights_hash = vr.sha(weights) if weights.is_file() else None
+    signature = vr.digest([CONFIG, PILOT, str(LOCK), vr.sha(Path(__file__)), vr.sha(CONTROL / 'environment.json'), weights_hash])
     if args.mode == 'confirm':
         final.confirm(folder, signature)
         return
@@ -288,7 +375,7 @@ def main():
         raise InterruptedError('Supervisor received SIGTERM')
     signal.signal(signal.SIGTERM, stop)
     try:
-        run(folder, plan, signature)
+        run(folder, plan, signature, weights_hash)
         vr.atomic(folder / 'execution_status.json', dict(state='passed', unix=time.time()))
         code = 0
     except BaseException as exc:
