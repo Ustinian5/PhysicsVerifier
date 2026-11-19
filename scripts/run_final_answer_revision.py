@@ -170,6 +170,9 @@ def execution_plan(out, *, register=False, prepared=None):
     require(vr.digest(c) == plan['configuration_sha256'] and c['protocol'] == p.VERSION, 'Revision plan drift')
     require(c['contract'] == p.contract(), 'Revision protocol drift')
     live = source_hashes()
+    if (out/'replay_repair.json').is_file():
+        from scripts.final_answer_replay_binding import bound_generation_sources
+        live = bound_generation_sources(out, plan, live)
     receipt = out/'execution_repair.json'
     if c['source_hashes'] == live:
         require(not register and not receipt.exists(), 'Unexpected repair receipt for unchanged code')
@@ -571,7 +574,14 @@ def verify_arm(row, arm, path, value, prefix, plan):
     if prefix['status'] == 'complete':
         packet_path = path.parent/'reference_packet.json'
         packet = bind(files, packet_path)
-        expected = p.continuation_messages(row, prefix['value'], packet['references'], arm=arm)
+        # FlatMemory.view sends id, title, text. Atomic JSON sorts the stored object keys.
+        # Restore the send order only when replaying the archived packet.
+        fields = ('id', 'title', 'text')
+        references = packet['references']
+        require(isinstance(references, list) and all(isinstance(ref, dict) and set(ref) == set(fields)
+                for ref in references), 'Invalid stored full-material fields')
+        sent = [{k: ref[k] for k in fields} for ref in references]
+        expected = p.continuation_messages(row, prefix['value'], sent, arm=arm)
         require(packet['messages'] == expected and packet['retrieval'] == value['retrieval']
                 and (arm != 'pure' or not packet['references']), 'Wrong shared prefix or supplied materials')
         limit = min(limits['max_tokens_per_response'], limits['output_tokens_per_sample'] - usage['completion_tokens'])

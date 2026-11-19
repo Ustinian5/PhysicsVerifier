@@ -306,6 +306,35 @@ def test_shared_prepare_charged_once_per_arm_and_verified_on_resume(tmp_path,mon
     assert len(calls) == 5 and not (tmp_path/'metrics.json').exists()
 
 
+def test_nonempty_material_survives_resume_and_scoring_without_new_calls(tmp_path, monkeypatch):
+    r, plan, tokenizer, calls = fake_runtime(monkeypatch)
+    monkeypatch.setattr(r, 'ARMS', ('case_rag',))
+    material = dict(id='c1', kind='case', title='speed distance', text='full text speed distance', source_ids=['old'])
+    store = {'case_rag': p.memory.FlatMemory([material])}
+    def run():
+        r.run_question(tmp_path, ROW, 'formal', plan, tokenizer, None, store)
+    run()
+    key = r.vr.digest(ROW['id'])[:24]
+    packet_file = tmp_path/'formal/case_rag'/key/'reference_packet.json'
+    packet = r.vr.read(packet_file)
+    assert list(packet['references'][0]) == ['id', 'text', 'title']
+    sent = packet['messages'][-1]['content']
+    assert sent.index('"title"') < sent.index('"text"')
+    run()
+    monkeypatch.setattr(r, 'verify', lambda out: plan)
+    monkeypatch.setattr(r, 'released', lambda out, plan: {})
+    r.vr.atomic(tmp_path/'inputs.json', [ROW])
+    r.vr.atomic(tmp_path/'labels_private.json', {ROW['id']: {'verdict': 'correct'}})
+    r.vr.atomic(tmp_path/'bench_release.json', {'synthetic': True})
+    r.score(tmp_path)
+    assert (tmp_path/'metrics.json').is_file() and len(calls) == 2
+    packet['references'][0]['text'] = 'different material'
+    r.vr.atomic(packet_file, packet)
+    with pytest.raises(ValueError, match='Wrong shared prefix or supplied materials'):
+        run()
+    assert len(calls) == 2
+
+
 def test_1000_plus_1000_refused_on_first_call_and_raw_recovery(tmp_path,monkeypatch):
     r,_,calls,run = simulated_question(tmp_path,monkeypatch,1000)
     folder = tmp_path/'formal'/r.ARMS[0]/r.vr.digest(ROW['id'])[:24]
@@ -404,3 +433,28 @@ def test_repair_can_only_bind_the_prepared_code_and_preserves_its_plan(tmp_path,
     live[r.RUNNER]='unregistered change'
     with pytest.raises(ValueError,match='Missing or changed'):
         r.execution_plan(tmp_path)
+
+
+def test_replay_binding_keeps_online_hash_and_rejects_other_source_or_receipt_changes(tmp_path, monkeypatch):
+    from scripts import final_answer_replay_binding as repair, run_final_answer_revision as r
+    original = dict(source_hashes={r.RUNNER:r.PREPARED_RUNNER,'retrieval':'fixed'})
+    parent = r.vr.digest(original)
+    live = {r.RUNNER:repair.REPLAY_RUNNER, 'retrieval':'fixed'}
+    online = {**live, r.RUNNER:repair.ONLINE_RUNNER}
+    config = r.vr.digest(dict(original, source_hashes=online))
+    monkeypatch.setattr(repair, 'CONFIG', config)
+    monkeypatch.setattr(r, 'PREPARED_CONFIGURATION', parent)
+    plan = dict(configuration=original, configuration_sha256=parent)
+    r.vr.atomic(tmp_path/'plan.json', plan)
+    r.vr.atomic(tmp_path/'execution_repair.json', dict(runner_after=repair.ONLINE_RUNNER,
+                configuration_sha256=config, parent_configuration_sha256=parent, preparation_sha256=r.vr.sha(tmp_path/'plan.json')))
+    receipt = repair.binding(tmp_path, plan, live)
+    r.vr.atomic(tmp_path/'replay_repair.json', receipt)
+    assert repair.bound_generation_sources(tmp_path, plan, live) == online
+    with pytest.raises(ValueError, match='Source drift'):
+        repair.bound_generation_sources(tmp_path, plan, dict(live, retrieval='changed'))
+    with pytest.raises(ValueError, match='Unknown replay'):
+        repair.bound_generation_sources(tmp_path, plan, {**live,r.RUNNER:'changed'})
+    r.vr.atomic(tmp_path/'replay_repair.json', dict(receipt, binding_code_sha256='changed'))
+    with pytest.raises(ValueError, match='Changed replay'):
+        repair.bound_generation_sources(tmp_path, plan, live)

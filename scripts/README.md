@@ -1,15 +1,15 @@
 # 脚本入口
 
-当前 600 题最终答案评测使用 `scripts.run_final_answer_revision`。原题、30B 回答、参考、三库及实验参数均由准备配置绑定。11月18日用户只授权修复和验证，在线批次另行确认。[题目级执行器](run_final_answer_revision.py) · [项目进展](../docs/项目进展.md)
+当前600题最终答案评测使用 `scripts.run_final_answer_revision`。原题、30B回答、参考、三库及实验参数均由准备配置绑定。11月20日已完成 node14 固定6题在线验收与原件复核，正式批次另候用户确认。[题目级执行器](run_final_answer_revision.py) · [项目进展](../docs/项目进展.md)
 
 | 环节 | 服务器入口与产物 |
 |---|---|
-| 冻结准备 | 已完成的 `prepare` 生成 `plan.json`。本次 `register-repair --await-release` 用独立的 `confirm-repair` 核验断连后的进程，将原配置与修复后的执行器绑定在 `execution_repair.json`。`verify` 检查两份依据。 |
-| 开发题和候选标签 | 确认执行后，`pilot` 在固定6道开发题验收四组。`review` 先执行6个标签控制，再独立复核候选。真实检查须使用冻结的120B分词器与服务环境，两者均运行在服务器上。 |
+| 冻结准备 | `plan.json` 绑定原准备配置，`execution_repair.json` 绑定在线执行配置。11月20日追加的 `replay_repair.json` 单独绑定离线材料字段恢复。`verify` 校验三者，已发请求继续按原签名核验。 |
+| 开发题和候选标签 | node14 固定6题已完成。节点入口 `scripts.run_node14_final_pilot` 的 `run/confirm` 托管本地服务和开发题，`audit/confirm-audit` 仅用已存原件检验检索、实际输入、断点复用及预算，均显式指定 `--attempt`。获准后，独立的 `review` 先执行6个标签控制，再复核候选。 |
 | 发布与旧输出复算 | `freeze --await-release` 从处置完的702题中按原序选正误各300，绑定全部处置以及选中题的输入和标签。`rescore-archive --await-release` 校验同一处置表后，按两版标签对同一旧输出子集复算。 |
 | 正式检查与计分 | `run` 验收开发题回执后执行600题四组。共享 PREPARE 的耗时计入每一组，CHECK 受本组剩余时限和单请求上限约束。断点复用及离线 `score --await-release` 同样复核原始记录。 |
 
-上述入口统一使用 `--output <final_revision>`。在线和离线批次都在服务器个人 conda 环境后台运行，由新的 SSH 连接确认。实验输入、标签可见性、检索与计分定义见[评测口径](../docs/效果测评.md)。
+`scripts.run_final_answer_revision` 使用 `--output <final_revision>`。在线和离线批次都在服务器个人 conda 环境后台运行，由新的 SSH 连接确认。实验输入、标签可见性、检索与计分定义见[评测口径](../docs/效果测评.md)。
 
 复核数据来历使用 `scripts.audit_verifier_lineage`。在持有授权原始题库的位置运行 `source`，服务器运行 `evidence` 逐份核对原始回答、材料、步骤标注和诊断计分。`repair` 用固定6题的已存查询和原分词器比较修复前后的消息、输出上限及全文材料。参数为 `--root <qwen30b_step_verifier> --output <回执目录>`。结果写入独立回执。[复核脚本](audit_verifier_lineage.py)
 

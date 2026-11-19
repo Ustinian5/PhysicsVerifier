@@ -271,8 +271,60 @@ def audit_results(plan, tokenizer, folder):
         accepted = vr.read(receipt)
         require(accepted['passed'] and accepted['configuration_sha256'] == CONFIG
                 and all(vr.sha(Path(p)) == h for p, h in accepted['files'].items()), 'Native acceptance drift')
-    vr.atomic(folder / 'audit.json', dict(questions=[r['id'] for r in rows], groups=groups, requests=requests,
-              accepted=receipt.exists(), configuration_sha256=CONFIG, offline_model_calls=0))
+    final.immutable(folder / 'audit.json', dict(questions=[r['id'] for r in rows], groups=groups, requests=requests,
+                    accepted=receipt.exists(), configuration_sha256=CONFIG, offline_model_calls=0))
+
+
+def offline_replay(folder, confirm):
+    from scripts import final_answer_replay_binding as repair
+    control = folder / 'replay_validation'
+    control.mkdir(exist_ok=True)
+    acceptance = OUT / 'pilot_acceptance.json'
+    signature = vr.digest([vr.sha(acceptance), vr.sha(OUT / 'execution_repair.json'),
+                           vr.sha(final.a.ROOT / final.RUNNER), vr.sha(Path(repair.__file__)), vr.sha(Path(__file__))])
+    if confirm:
+        final.confirm(control, signature)
+        return
+    with final.base.r.run_lock(OUT / 'active.lock'):
+        code = 1
+        try:
+            final.base.runtime.wait_detached(control, signature)
+            frozen = vr.read(acceptance)
+            require(frozen['configuration_sha256'] == CONFIG and frozen['passed'], 'Missing frozen native acceptance')
+            require(all(vr.sha(Path(k)) == v for k, v in frozen['files'].items()), 'Original pilot evidence drift')
+            repair.register(OUT)
+            plan = final.verify(OUT)
+            require(plan['configuration_sha256'] == CONFIG, 'Archived configuration changed')
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(plan['configuration']['model'], local_files_only=True,
+                                                       trust_remote_code=False)
+            audit_results(plan, tokenizer, folder)
+            def no_request(_):
+                raise AssertionError('Offline replay attempted a model call')
+            mismatches = {arm: [] for arm in final.ARMS}
+            rows = vr.read(OUT / 'pilot_inputs.json')
+            with httpx.Client(transport=httpx.MockTransport(no_request)) as client:
+                for row in rows:
+                    key = vr.digest(row['id'])[:24]
+                    prefix = vr.read(OUT / 'pilot/queries' / key / 'result.json')
+                    for arm in final.ARMS:
+                        packet = vr.read(OUT / 'pilot' / arm / key / 'reference_packet.json')
+                        legacy = final.p.continuation_messages(row, prefix['value'], packet['references'], arm=arm)
+                        if legacy != packet['messages']:
+                            mismatches[arm].append(row['id'])
+                    final.run_question(OUT, final.p.public(row), 'pilot', plan, tokenizer, client, {})
+            require(all(vr.sha(Path(k)) == v for k, v in frozen['files'].items()), 'Pilot changed during offline replay')
+            final.immutable(control / 'validation.json', dict(passed=True, archived_evidence_files=len(frozen['files']),
+                            native_acceptance_sha256=vr.sha(acceptance), replay_binding_sha256=vr.sha(OUT / 'replay_repair.json'),
+                            results_sha256=vr.sha(folder / 'audit.json'), legacy_material_order_mismatches=mismatches,
+                            resumed_arm_results=len(rows)*len(final.ARMS), new_model_calls=0))
+            vr.atomic(control / 'execution_status.json', dict(state='passed', unix=time.time()))
+            code = 0
+        except BaseException as exc:
+            vr.atomic(control / 'execution_status.json', dict(state='stopped', unix=time.time(), error=str(exc)))
+            raise
+        finally:
+            (control / 'validation.exit_code').write_text(str(code))
 
 
 def run(folder, plan, signature, weights_hash):
@@ -354,12 +406,15 @@ def run(folder, plan, signature, weights_hash):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('run', 'confirm'))
+    parser.add_argument('mode', choices=('run', 'confirm', 'audit', 'confirm-audit'))
     parser.add_argument('--attempt', required=True, type=int)
     args = parser.parse_args()
     require(args.attempt > 0 and socket.gethostname().split('.')[0] == 'node14', 'Invalid node14 attempt')
     set_environment()
     folder = CONTROL / 'attempts' / str(args.attempt)
+    if args.mode in ('audit', 'confirm-audit'):
+        offline_replay(folder, confirm=args.mode == 'confirm-audit')
+        return
     plan = final.verify(OUT)
     require(plan['configuration_sha256'] == CONFIG and plan['configuration']['pilot_sha256'] == PILOT,
             'Wrong frozen configuration or pilot')
