@@ -90,3 +90,44 @@ def test_hot_storage_preserves_served_id_and_rechecks_weight_bytes(tmp_path):
         pilot.os.utime(shard, ns=(stat.st_atime_ns, stat.st_mtime_ns))
         with pytest.raises(ValueError, match='Bound evidence changed'):
             pilot.weight_location(config, folder, pilot.vr.sha(receipt))
+
+
+def test_batch_requires_reference_controls_and_all_reviews_before_freeze(tmp_path):
+    review = tmp_path / 'assistant_review.json'
+    pilot.vr.atomic(review, {})
+    inputs = {'adjudications': pilot.vr.sha(review)}
+    with patch.object(pilot.final, 'freeze_bench') as freeze, patch.object(pilot.final, 'dispositions') as dispositions:
+        assert pilot.batch_stage(tmp_path, inputs) == 'review'
+        dispositions.assert_not_called()
+        pilot.vr.atomic(tmp_path / 'review_controls_passed.json', {'passed': True})
+        dispositions.return_value = {'a': {'state': 'pending_review'}, 'b': {'state': 'pending_adjudication'}}
+        assert pilot.batch_stage(tmp_path, inputs) == 'review'
+        dispositions.return_value = {'b': {'state': 'pending_adjudication'}}
+        assert pilot.batch_stage(tmp_path, inputs) == 'awaiting_adjudication'
+        assert pilot.vr.read(tmp_path / 'execution_status.json')['pending'] == ['b']
+        freeze.assert_not_called()
+        pilot.vr.atomic(review, {'changed': True})
+        with pytest.raises(ValueError, match='adjudications changed'):
+            pilot.batch_stage(tmp_path, inputs)
+
+
+def test_batch_rescores_only_after_the_original_freeze_succeeds(tmp_path):
+    review = tmp_path / 'assistant_review.json'
+    pilot.vr.atomic(review, {})
+    inputs = {'adjudications': pilot.vr.sha(review)}
+    pilot.vr.atomic(tmp_path / 'review_controls_passed.json', {'passed': True})
+    decisions = {'a': {'state': 'eligible', 'verdict': 'correct'}}
+    with patch.object(pilot.final, 'dispositions', return_value=decisions), \
+         patch.object(pilot.final, 'freeze_bench') as freeze, patch.object(pilot.final, 'rescore_archive') as rescore, \
+         patch.object(pilot.final, 'score') as score:
+        freeze.side_effect = ValueError('quota')
+        with pytest.raises(ValueError, match='quota'):
+            pilot.batch_stage(tmp_path, inputs)
+        rescore.assert_not_called()
+        freeze.side_effect = None
+        assert pilot.batch_stage(tmp_path, inputs) == 'formal'
+        rescore.assert_called_once_with(tmp_path)
+        score.assert_not_called()
+        pilot.vr.atomic(tmp_path / 'metrics.json', {})
+        assert pilot.batch_stage(tmp_path, inputs) == 'completed'
+        score.assert_called_once_with(tmp_path)

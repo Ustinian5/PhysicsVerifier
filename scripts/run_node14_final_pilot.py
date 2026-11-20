@@ -1,5 +1,6 @@
-"""Run the frozen six-question pilot on node14 with a private service and locks."""
+"""Host the frozen final-answer pilot or formal batch on node14 with a private service."""
 import argparse
+from collections import Counter
 import importlib.metadata
 import os
 from pathlib import Path
@@ -327,24 +328,79 @@ def offline_replay(folder, confirm):
             (control / 'validation.exit_code').write_text(str(code))
 
 
-def run(folder, plan, signature, weights_hash):
+def batch_inputs(out, config, weights_hash):
+    """Bind the accepted pilot, its replay and the labels authorized for this attempt."""
+    attempt = out / 'node14_pilot/attempts/2'
+    acceptance = out / 'pilot_acceptance.json'
+    replay = attempt / 'replay_validation/validation.json'
+    accepted, validation = vr.read(acceptance), vr.read(replay)
+    require(accepted['passed'] and accepted['configuration_sha256'] == config
+            and all(vr.sha(Path(p)) == h for p, h in accepted['files'].items()), 'Frozen pilot evidence changed')
+    require(validation['passed'] and validation['resumed_arm_results'] == 24
+            and validation['archived_evidence_files'] == len(accepted['files'])
+            and validation['native_acceptance_sha256'] == vr.sha(acceptance)
+            and validation['replay_binding_sha256'] == vr.sha(out / 'replay_repair.json')
+            and validation['results_sha256'] == vr.sha(attempt / 'audit.json'), 'Pilot replay evidence changed')
+    deployment = vr.read(attempt / 'deployment.json')
+    require(deployment['configuration_sha256'] == config and weights_hash
+            and deployment['weights_receipt_sha256'] == weights_hash
+            and deployment['environment_sha256'] == vr.sha(out / 'node14_pilot/environment.json'),
+            'Formal weights or environment differ from the accepted pilot')
+    require(not vr.read(out / 'isolation_candidates.json')['candidates'], 'Unresolved source overlap')
+    decisions = out / 'assistant_review.json'
+    final.read_overrides(out, vr.read(out / 'candidates.json'))
+    return dict(pilot=vr.sha(acceptance), replay=vr.sha(replay), adjudications=vr.sha(decisions))
+
+
+def batch_stage(out, inputs):
+    require(vr.sha(out / 'assistant_review.json') == inputs['adjudications'],
+            'Assistant adjudications changed during this attempt')
+    if not (out / 'review_controls_passed.json').is_file():
+        return 'review'
+    decisions = final.dispositions(out)
+    counts = Counter(d['state'] for d in decisions.values())
+    if counts['pending_review']:
+        return 'review'
+    if counts['pending_adjudication']:
+        final.base.old.emit(out, 'awaiting_adjudication', counts=dict(counts),
+                            pending=[sid for sid, d in decisions.items() if d['state'] == 'pending_adjudication'])
+        return 'awaiting_adjudication'
+    eligible = Counter(d['verdict'] for d in decisions.values() if d['state'] == 'eligible')
+    final.base.old.emit(out, 'freezing_benchmark', counts=dict(counts), eligible_by_label=dict(eligible))
+    final.freeze_bench(out)
+    final.rescore_archive(out)
+    if (out / 'metrics.json').is_file():
+        final.score(out)
+        return 'completed'
+    return 'formal'
+
+
+def run(folder, plan, signature, weights_hash, *, batch=None):
     from transformers import AutoTokenizer
 
     cfg = plan['configuration']
     require(socket.gethostname().split('.')[0] == 'node14' and Path(sys.prefix) == ENV, 'Wrong host or conda prefix')
     require(final.a.ROOT == ROOT and cfg['api_base'] == f'http://127.0.0.1:{PORT}/v1', 'Wrong checkout or endpoint')
-    require(not (OUT / 'pilot_acceptance.json').exists(), 'Fixed pilot already accepted')
+    if batch is None:
+        require(not (OUT / 'pilot_acceptance.json').exists(), 'Fixed pilot already accepted')
     env_receipt = vr.read(CONTROL / 'environment.json')
     packages = vr.read(OUT.parent / 'evaluation/runtime.json')['packages']
     require(env_receipt['verified'] and env_receipt['prefix'] == str(ENV)
             and {k: importlib.metadata.version(k) for k in packages} == packages, 'Runtime differs')
-    tokenizer = AutoTokenizer.from_pretrained(cfg['model'], local_files_only=True, trust_remote_code=False)
     final.a.historical_transport()
     script, paths = service_script(cfg)
-    redirect = weight_location(cfg, folder, weights_hash)
     url = cfg['api_base'].removesuffix('/v1')
     with final.base.r.run_lock(OUT / 'active.lock'), final.base.r.run_lock(LOCK):
         final.base.runtime.wait_detached(folder, signature)
+        require(not (OUT / 'STOP').exists(), 'STOP requested')
+        phase = 'pilot'
+        if batch is not None:
+            phase = batch_stage(OUT, batch)
+            if phase in ('awaiting_adjudication', 'completed'):
+                return phase
+        vr.atomic(folder / 'execution_status.json', dict(state='verifying_weights', stage=phase, unix=time.time()))
+        redirect = weight_location(cfg, folder, weights_hash)
+        tokenizer = AutoTokenizer.from_pretrained(cfg['model'], local_files_only=True, trust_remote_code=False)
         while True:
             require(not (OUT / 'STOP').exists(), 'STOP requested')
             snapshot = resources()
@@ -370,6 +426,8 @@ def run(folder, plan, signature, weights_hash):
                       wrapper_sha256=vr.sha(Path(__file__)), infrastructure_paths=paths,
                       configuration_sha256=plan['configuration_sha256'], environment_sha256=vr.sha(CONTROL / 'environment.json'),
                       weights_receipt_sha256=weights_hash, storage_redirect=vr.read(redirect) if redirect else {})
+        if batch is not None:
+            record.update(batch_inputs=batch, result_lock=str(OUT / 'active.lock'), start_stage=phase)
         try:
             vr.atomic(folder / 'deployment.json', record)
             vr.atomic(folder / 'execution_status.json', dict(state='starting_service', unix=time.time(), pid=service.pid))
@@ -395,23 +453,32 @@ def run(folder, plan, signature, weights_hash):
                     time.sleep(3)
                 require(vr.read(folder / 'service/startup.json')['fixed_harmony_date'] == cfg['fixed_harmony_date'],
                         'Service date mismatch')
-                vr.atomic(folder / 'execution_status.json', dict(state='running_fixed_pilot', unix=time.time(), pid=service.pid))
                 with final.a.configured(OUT, tokenizer):
-                    final.run_checks(OUT, plan, tokenizer, client, pilot=True)
+                    vr.atomic(folder / 'execution_status.json', dict(state='running_' + phase, unix=time.time(), pid=service.pid))
+                    if phase == 'review':
+                        final.run_reviews(OUT, plan, tokenizer, client)
+                        phase = batch_stage(OUT, batch)
+                        if phase == 'awaiting_adjudication':
+                            return phase
+                        require(phase == 'formal', 'Candidate review did not release a formal cohort')
+                        vr.atomic(folder / 'execution_status.json', dict(state='running_formal', unix=time.time(), pid=service.pid))
+                    final.run_checks(OUT, plan, tokenizer, client, pilot=phase == 'pilot')
+                    return 'passed' if phase == 'pilot' else 'completed'
         finally:
             release(service, record, folder, ready, url)
-            if all(len(list((OUT / 'pilot' / arm).glob('*/result.json'))) == 6 for arm in final.ARMS):
+            if batch is None and all(len(list((OUT / 'pilot' / arm).glob('*/result.json'))) == 6 for arm in final.ARMS):
                 audit_results(plan, tokenizer, folder)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('run', 'confirm', 'audit', 'confirm-audit'))
+    parser.add_argument('mode', choices=('run', 'confirm', 'audit', 'confirm-audit', 'batch', 'confirm-batch'))
     parser.add_argument('--attempt', required=True, type=int)
     args = parser.parse_args()
     require(args.attempt > 0 and socket.gethostname().split('.')[0] == 'node14', 'Invalid node14 attempt')
     set_environment()
-    folder = CONTROL / 'attempts' / str(args.attempt)
+    is_batch = args.mode in ('batch', 'confirm-batch')
+    folder = (OUT / 'node14_formal' if is_batch else CONTROL) / 'attempts' / str(args.attempt)
     if args.mode in ('audit', 'confirm-audit'):
         offline_replay(folder, confirm=args.mode == 'confirm-audit')
         return
@@ -420,8 +487,12 @@ def main():
             'Wrong frozen configuration or pilot')
     weights = CONTROL / 'weights.json'
     weights_hash = vr.sha(weights) if weights.is_file() else None
-    signature = vr.digest([CONFIG, PILOT, str(LOCK), vr.sha(Path(__file__)), vr.sha(CONTROL / 'environment.json'), weights_hash])
-    if args.mode == 'confirm':
+    binding = [CONFIG, PILOT, str(LOCK), vr.sha(Path(__file__)), vr.sha(CONTROL / 'environment.json'), weights_hash]
+    batch = batch_inputs(OUT, plan['configuration_sha256'], weights_hash) if is_batch else None
+    if is_batch:
+        binding.extend(['batch', batch, str(folder)])
+    signature = vr.digest(binding)
+    if args.mode in ('confirm', 'confirm-batch'):
         final.confirm(folder, signature)
         return
     folder.mkdir(parents=True, exist_ok=False)
@@ -430,8 +501,8 @@ def main():
         raise InterruptedError('Supervisor received SIGTERM')
     signal.signal(signal.SIGTERM, stop)
     try:
-        run(folder, plan, signature, weights_hash)
-        vr.atomic(folder / 'execution_status.json', dict(state='passed', unix=time.time()))
+        state = run(folder, plan, signature, weights_hash, batch=batch)
+        vr.atomic(folder / 'execution_status.json', dict(state=state, unix=time.time()))
         code = 0
     except BaseException as exc:
         vr.atomic(folder / 'execution_status.json', dict(state='stopped', unix=time.time(), error=str(exc)))
