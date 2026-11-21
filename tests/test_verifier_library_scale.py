@@ -1,5 +1,6 @@
 import pytest
 
+from scripts import audit_verifier_library_scale as replay
 from scripts import run_node14_library_scale as node
 from scripts import run_verifier_library_scale as library
 
@@ -40,3 +41,20 @@ def test_idle_card_is_restricted_to_the_requested_gpu():
     assert node.available_card(snapshot,5)==('5','uuid5')
     with pytest.raises(ValueError, match='outside'):
         node.available_card(snapshot,1)
+
+
+def test_replay_refuses_a_response_to_a_different_material_prompt(tmp_path):
+    key, stage, config = 'job', 'tree_route_topics', {'model':'120b'}
+    body = dict(model='120b', messages=[{'role':'user','content':'one candidate'}])
+    digest = library.construction.c.corpus.p.digest
+    relative = f'raw/{stage}/{digest(key)[:24]}/request_001.json'
+    path = tmp_path/relative
+    response = dict(model='120b')
+    library.vr.atomic(path, dict(status='received',http_status=200,request=body,response=response,
+                                 fingerprint=digest([key,body,config])))
+    evidence = dict(file=relative,sha256=library.vr.sha(path))
+    library.vr.atomic(tmp_path/'decoded'/stage/(library.vr.digest(key)+'.json'),dict(evidence=evidence))
+    reader = replay.RecordedResponses(tmp_path,{relative:evidence['sha256']},config)
+    assert reader.call(stage,key,body)==(response,evidence)
+    with pytest.raises(ValueError,match='request differs'):
+        reader.call(stage,key,dict(body,messages=[]))
