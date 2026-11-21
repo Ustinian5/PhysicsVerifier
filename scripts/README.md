@@ -24,7 +24,7 @@
 
 最终验收入口：[audit_aligned_step_revision.py](audit_aligned_step_revision.py)：400项完成、复核已freeze、本人服务释放后，在服务器个人conda后台执行`python -m scripts.audit_aligned_step_revision --root <evaluation_revision> --await-release`；退出启动SSH，再以新连接核验acceptance_ready.json的PID、实际命令和根目录，创建ALLOW_ACCEPT。该入口复用原请求/解码审计器，计分并核对138次新请求的完整上下文、模型/date、实际token和预算、原quote-only修补、279项复用及12项前置失败，写acceptance.json；网络模型请求被阻止。旧输出、标签与分数均不覆盖，工程验收不等于独立物理认证。
 
-题目级复算入口：[audit_final_answer_metrics.py](audit_final_answer_metrics.py)：服务器后台`--root <旧600题目录> --output <同目录/final_metric_audit.json> --await-release`，新SSH核验同名.ready.json中的进程，再创建同名.ALLOW文件。核对2400份冻结结果哈希、混淆矩阵和原P/R/F1，另报覆盖、全题检出、平衡准确率/Macro-F1/MCC及恒定预测对照；原600题标签、输出与正式metrics不改。不把步骤级非空诊断当作最终答案错误，也不因指标高而修改公式。
+旧600题复算在服务器后台运行 `python -m scripts.audit_final_answer_metrics --root <旧600题目录> --output <个人临时目录>/recomputed.json --await-release`。重连后核验 `recomputed.ready.json` 中的进程，创建同目录 `recomputed.ALLOW`。程序逐份核对2400份冻结结果、混淆矩阵和三项分数。与旧结果目录的 `final_metric_audit.json` 比较复算产物。正式报告只取 `groups.<组别>.original_binary_view`，覆盖、弃权及失败单列。[复算入口](audit_final_answer_metrics.py) · [题目级三项定义](../docs/效果测评.md#最终答案)
 
 11月14日的材料恢复入口为[run_aligned_organization.py](run_aligned_organization.py)：`prepare --output <独立恢复目录> --legacy <已完成旧99目录> --current <已完成更正批次>`只绑定输入和离线核验396份原始请求；`verify`不调用模型。服务器后台`pilot`运行12来源的原case_note/skills和36份工程/开发检查，退出启动SSH后用`confirm-detached`从新连接放行；通过后`build`可按原协议补齐材料，成功项不重跑。该材料入口不执行formal；正式入口见下方run_aligned_step_evaluation，旧协调器不恢复。旧树算法、全文注入、共享PREPARE、同上下文CHECK及每题预算直接复用旧实现；旧解码器从哈希核验的Git版本载入内存，不另存源码副本。服务使用固定日期入口，PV_HARMONY_DATE=2026-11-03；此流程无原生search/read工具消息，不需要工具适配服务。
 
