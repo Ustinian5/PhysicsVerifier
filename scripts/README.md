@@ -28,6 +28,8 @@
 
 开发集的检索重排原型可通过 `python -m scripts.probe_verifier_rerank --root <final_revision绝对路径> --id cl_202_125689 --arm case_rag` 生成候选与120B重排提示。支持 `flat_skills`。加 `--selection <含ordered_ids的JSON>` 可重建同会话的全文CHECK。该工具只读取固定开发题和本地分词器，模型调用为0。[适用条件重排](probe_verifier_rerank.py) · [按来源题数及全文预算盘点](audit_verifier_library_capacity.py)
 
+250题独立建库使用 `python -m scripts.run_verifier_library_scale --root <node14题目级结果根> --seed <种子>`。按预定题族抽样核对原题和30B回答，从选中来源的逐题120B结果重建案例、skills和规则候选。每个种子在 `library_scale/n250_seed<种子>` 保存来源处置和独立产物。服务器后台运行 `python -m scripts.run_node14_library_scale run --seed <种子> --gpu <卡号> --attempt <序号>`，退出SSH后重新连接，同一入口用 `confirm` 放行。规则树从空状态组织，原始请求、断点、材料和验收分别保存在本组目录中。查看 `construction_acceptance.json` 与该次 `attempts/<序号>/release.json` 核实建库和显卡释放。[独立建库](run_verifier_library_scale.py) · [节点执行器](run_node14_library_scale.py)
+
 需复验旧600题时，在服务器后台运行 `python -m scripts.audit_final_answer_metrics --root <旧600题目录> --output <个人临时目录>/recomputed.json --await-release`。重连核验 `recomputed.ready.json` 中的进程后创建同目录 `recomputed.ALLOW`。程序逐份核对2400份冻结结果，与原结果目录的 `final_metric_audit.json` 比较。[归档复算入口](audit_final_answer_metrics.py)
 
 11月14日的材料恢复入口为[run_aligned_organization.py](run_aligned_organization.py)：`prepare --output <独立恢复目录> --legacy <已完成旧99目录> --current <已完成更正批次>`只绑定输入和离线核验396份原始请求；`verify`不调用模型。服务器后台`pilot`运行12来源的原case_note/skills和36份工程/开发检查，退出启动SSH后用`confirm-detached`从新连接放行；通过后`build`可按原协议补齐材料，成功项不重跑。该材料入口不执行formal；正式入口见下方run_aligned_step_evaluation，旧协调器不恢复。旧树算法、全文注入、共享PREPARE、同上下文CHECK及每题预算直接复用旧实现；旧解码器从哈希核验的Git版本载入内存，不另存源码副本。服务使用固定日期入口，PV_HARMONY_DATE=2026-11-03；此流程无原生search/read工具消息，不需要工具适配服务。
