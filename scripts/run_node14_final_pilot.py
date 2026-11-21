@@ -349,12 +349,19 @@ def batch_inputs(out, config, weights_hash):
     require(not vr.read(out / 'isolation_candidates.json')['candidates'], 'Unresolved source overlap')
     decisions = out / 'assistant_review.json'
     final.read_overrides(out, vr.read(out / 'candidates.json'))
-    return dict(pilot=vr.sha(acceptance), replay=vr.sha(replay), adjudications=vr.sha(decisions))
+    inputs = dict(pilot=vr.sha(acceptance), replay=vr.sha(replay), adjudications=vr.sha(decisions))
+    amendment = out / final.cohort.AMENDMENT
+    if amendment.is_file():
+        inputs['cohort_amendment'] = vr.sha(amendment)
+    return inputs
 
 
 def batch_stage(out, inputs):
     require(vr.sha(out / 'assistant_review.json') == inputs['adjudications'],
             'Assistant adjudications changed during this attempt')
+    amendment = out / final.cohort.AMENDMENT
+    require((vr.sha(amendment) if amendment.is_file() else None) == inputs.get('cohort_amendment'),
+            'Cohort amendment changed during this attempt')
     if not (out / 'review_controls_passed.json').is_file():
         return 'review'
     decisions = final.dispositions(out)
@@ -502,6 +509,9 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     try:
         state = run(folder, plan, signature, weights_hash, batch=batch)
+        if state == 'completed' and is_batch and batch.get('cohort_amendment'):
+            from scripts.analyze_final_answer_sample_size import run as measure_stability
+            measure_stability(OUT)
         vr.atomic(folder / 'execution_status.json', dict(state=state, unix=time.time()))
         code = 0
     except BaseException as exc:

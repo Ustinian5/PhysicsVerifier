@@ -367,6 +367,52 @@ def test_absolute_deadline_interrupts_a_blocking_call():
     assert r.signal.getitimer(r.signal.ITIMER_REAL) == (0.0,0.0)
 
 
+def test_amended_cohort_uses_only_pending_reviews_and_largest_balanced_prefix(tmp_path, monkeypatch):
+    from scripts import run_final_answer_revision as r
+
+    rows = [dict(ROW, id=str(i), old_verdict='correct', question_sha256='q', answer_sha256='a',
+                 reference_sha256='ref') for i in range(6)]
+    failed = dict(status='content_failure', value=None, reason='invalid')
+    reviews = [review('uncertain'), review(), review(), review(), failed, review()]
+    before = {row['id']: p.decision(row, raw) for row, raw in zip(rows, reviews)}
+    decision = dict(id='0', question_sha256='q', answer_sha256='a', reference_sha256='ref',
+                    action='set_label', verdict='incorrect', human_gold=False, basis='Checked against original.')
+    decisions = [decision]
+    r.vr.atomic(tmp_path/'assistant_review.json', dict(reviewer='Codex assistant', human_gold=False, decisions=[]))
+    r.vr.atomic(tmp_path/'candidates.json', rows)
+    r.vr.atomic(tmp_path/'review_status.json', dict(pending=[before['0']]))
+    r.vr.atomic(tmp_path/'review/0/result.json', reviews[0])
+    assert r.read_overrides(tmp_path, rows) == {}
+    assert r.cohort.release_quota(tmp_path, before, 3) == (3, {})
+    data = dict(policy=r.cohort.POLICY, reviewer='Codex assistant', human_gold=False, requested_per_class=3,
+                effective_per_class=1, eligible_counts=dict(correct=4, incorrect=1),
+                decisions=decisions, code_sha256=r.vr.sha(r.cohort.__file__))
+    for name in ('candidates', 'assistant_review', 'review_status'):
+        data[name+'_sha256'] = r.vr.sha(tmp_path/(name+'.json'))
+    path = tmp_path/r.cohort.AMENDMENT
+    r.vr.atomic(path, data)
+    overrides = r.read_overrides(tmp_path, rows)
+    after = {row['id']: p.decision(row, raw, overrides.get(row['id'])) for row, raw in zip(rows, reviews)}
+    quota, binding = r.cohort.release_quota(tmp_path, after, 3)
+    assert [row['id'] for row in p.select_balanced(rows, after, quota)] == ['0','1']
+    assert binding['quota_amendment']['sha256'] == r.vr.sha(path)
+    assert after['4']['state'] == 'review_failure'
+    parent_hash = r.vr.sha(tmp_path/'review_status.json')
+    monkeypatch.setattr(r, 'dispositions', lambda out: after)
+    r.run_reviews(tmp_path, dict(configuration=dict(quota_per_class=3)), None, None)
+    assert r.vr.sha(tmp_path/'review_status.json') == parent_hash
+    r.vr.atomic(path, dict(data, effective_per_class=2))
+    with pytest.raises(ValueError, match='largest balanced'):
+        r.cohort.release_quota(tmp_path, after, 3)
+    r.vr.atomic(path, dict(data, decisions=[dict(decision, id='4')]))
+    with pytest.raises(ValueError, match='exactly the pending'):
+        r.read_overrides(tmp_path, rows)
+    r.vr.atomic(path, data)
+    r.vr.atomic(tmp_path/'review/0/result.json', reviews[1])
+    with pytest.raises(ValueError, match='original independent review'):
+        r.read_overrides(tmp_path, rows)
+
+
 def test_freeze_and_archive_rescore_bind_the_unselected_candidate(tmp_path,monkeypatch):
     from scripts import run_final_answer_revision as r
     rows = [dict(ROW,id=str(i)) for i in range(3)]

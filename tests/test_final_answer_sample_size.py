@@ -44,6 +44,17 @@ def test_unpublished_benchmark_produces_no_result(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+def test_reduced_cohort_ends_at_actual_size(monkeypatch):
+    monkeypatch.setattr(curve, 'SUBSET_DRAWS', 3)
+    monkeypatch.setattr(curve, 'BOOTSTRAP_DRAWS', 12)
+    labels = {str(i): curve.CLASSES[i % 2] for i in range(478)}
+    predictions = {k: dict(status='complete', value=dict(verdict=label)) for k, label in labels.items()}
+    report = curve.analyze(labels, {arm: predictions for arm in curve.binary.ARMS})
+    assert [level['n'] for level in report['sizes']] == [100, 200, 400, 478]
+    assert all(group['n'] == 478 and group['labeled_incorrect'] == 239 and group['valid_binary'] == 478
+               for group in report['sizes'][-1]['groups'].values())
+
+
 def test_changed_published_prediction_blocks_analysis(tmp_path, monkeypatch):
     vr = curve.final.vr
     plan = dict(configuration_sha256='test-config', configuration=dict(quota_per_class=1))

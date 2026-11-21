@@ -19,6 +19,7 @@ import time
 import httpx
 
 from rule_framework import final_answer_revision as p
+from scripts import final_answer_cohort as cohort
 from scripts import run_aligned_step_revision as step
 from scripts import run_final_answer_labels as old_labels
 from scripts.audit_final_answer_metrics import measure
@@ -172,6 +173,7 @@ def execution_plan(out, *, register=False, prepared=None):
     live = source_hashes()
     if (out/'replay_repair.json').is_file():
         from scripts.final_answer_replay_binding import bound_generation_sources
+        live = cohort.replay_sources(live)
         live = bound_generation_sources(out, plan, live)
     receipt = out/'execution_repair.json'
     if c['source_hashes'] == live:
@@ -208,11 +210,13 @@ def verify(out, *, register=False):
 
 def read_overrides(out, candidates):
     path = out/'assistant_review.json'
-    if not path.exists(): return {}
+    if not path.exists():
+        require(not (out/cohort.AMENDMENT).exists(), 'Missing initial adjudications')
+        return {}
     review = vr.read(path)
     require(review['human_gold'] is False and review['reviewer'] == 'Codex assistant', 'Misidentified review authority')
     byid = {r['id']:r for r in candidates}; values = {}
-    for d in review['decisions']:
+    for d in review['decisions'] + cohort.additional_decisions(out, byid):
         require(d['id'] in byid and d['id'] not in values, 'Unknown/duplicate adjudication')
         row = byid[d['id']]
         require(all(d[k] == row[k] for k in ('question_sha256','answer_sha256','reference_sha256')),
@@ -401,6 +405,10 @@ def request_once(out, folder, messages, max_tokens, validator, plan, tokenizer, 
 
 def run_reviews(out, plan, tokenizer, client):
     rows = vr.read(out/'candidates.json'); overrides = read_overrides(out,rows)
+    if (out/cohort.AMENDMENT).is_file():
+        # This status file is the amendment's original independent-review evidence.
+        cohort.release_quota(out,dispositions(out),plan['configuration']['quota_per_class'])
+        return
     limit = plan['configuration']['limits']['max_tokens_per_response']
     for row in plan['configuration']['controls']:
         got = request_once(out,out/'review_controls'/row['id'],p.review_messages(row,row['reference']),limit,
@@ -425,11 +433,13 @@ def freeze_bench(out):
     plan=verify(out); rows=vr.read(out/'candidates.json'); choices=dispositions(out)
     isolation=vr.read(out/'isolation_candidates.json')
     require(not isolation['candidates'], 'New source-family candidates require review before publishing')
-    selected=p.select_balanced(rows,choices,plan['configuration']['quota_per_class'])
+    quota, amendment = cohort.release_quota(out,choices,plan['configuration']['quota_per_class'])
+    selected=p.select_balanced(rows,choices,quota)
     labels={r['id']:choices[r['id']] for r in selected}
     records=[out/'plan.json',out/'candidates.json',out/'isolation_candidates.json']
     if (out/'execution_repair.json').exists():records.append(out/'execution_repair.json')
     if (out/'assistant_review.json').exists():records.append(out/'assistant_review.json')
+    if amendment: records.extend([out/cohort.AMENDMENT,out/'review_status.json'])
     for path in (out/'review').glob('*/result.json'):
         records.append(path); records.extend(Path(f) for f in vr.read(path)['files'])
     require((out/'review_controls_passed.json').exists(),'Reference audit controls not passed')
@@ -452,7 +462,7 @@ def freeze_bench(out):
         inputs_sha256=vr.sha(out/'inputs.json'),labels_sha256=vr.sha(out/'labels_private.json'),
         dispositions_sha256=vr.sha(out/'dispositions.json'),
         files={str(f):vr.sha(f) for f in records},all_physics_certified=False,
-        selection='Original candidate order within corrected label classes; no verifier predictions used.'))
+        selection='Original candidate order within corrected label classes; no verifier predictions used.', **amendment))
     base.old.emit(out,'bench_released',samples=len(selected),counts=dict(Counter(x['verdict'] for x in labels.values())))
 
 
@@ -468,7 +478,9 @@ def released(out, plan):
     require(hashlib.sha256(raw).hexdigest() == release['dispositions_sha256'], 'Released dispositions changed')
     revised = json.loads(raw)
     rows = vr.read(out/'candidates.json')
-    selected = p.select_balanced(rows, revised, plan['configuration']['quota_per_class'])
+    quota, amendment = cohort.release_quota(out,revised,plan['configuration']['quota_per_class'])
+    require(release.get('quota_amendment') == amendment.get('quota_amendment'), 'Released quota amendment changed')
+    selected = p.select_balanced(rows, revised, quota)
     require(selected == vr.read(out/'inputs.json') and {r['id']: revised[r['id']] for r in selected}
             == vr.read(out/'labels_private.json'), 'Released cohort differs from its dispositions')
     return revised

@@ -1,4 +1,4 @@
-"""Measure sample-size stability using the released 600-question final-answer outputs."""
+"""Measure sample-size stability on the complete, released balanced final-answer cohort."""
 import argparse
 from collections import Counter
 import hashlib
@@ -19,8 +19,9 @@ CLASSES = ('correct', 'incorrect')
 
 
 def cohort_order(labels):
-    if Counter(labels.values()) != {'correct': 300, 'incorrect': 300}:
-        raise ValueError('Expected the released 300 correct and 300 incorrect answers')
+    counts = Counter(labels.values())
+    if set(counts) != set(CLASSES) or counts['correct'] != counts['incorrect'] or len(labels) > SIZES[-1]:
+        raise ValueError('Expected a balanced released cohort of at most 600 answers')
 
     def order_key(sid):
         return hashlib.sha256(f'{SEED}:{sid}'.encode('utf-8')).digest(), sid
@@ -38,9 +39,10 @@ def f1_differences(sums):
 def analyze(labels, predictions):
     order = cohort_order(labels)
     if set(predictions) != set(binary.ARMS) or any(set(arm) != set(labels) for arm in predictions.values()):
-        raise ValueError('Every arm must contain the same 600 questions, including failures')
+        raise ValueError('Every arm must contain all released questions, including failures')
     # Store the additive numerator and denominator of the published binary F1 per question.
-    terms = np.empty((2, 300, len(binary.ARMS), 2), dtype=np.int64)
+    per_class = len(order['correct'])
+    terms = np.empty((2, per_class, len(binary.ARMS), 2), dtype=np.int64)
     for row, label in enumerate(CLASSES):
         for i, sid in enumerate(order[label]):
             for col, arm in enumerate(binary.ARMS):
@@ -49,9 +51,10 @@ def analyze(labels, predictions):
                 terms[row, i, col] = numerator, numerator + counts['FP'] + counts['FN']
 
     rng = np.random.default_rng(SEED)
-    permutations = np.array([[rng.permutation(300) for _ in range(SUBSET_DRAWS)] for _ in CLASSES])
+    permutations = np.array([[rng.permutation(per_class) for _ in range(SUBSET_DRAWS)] for _ in CLASSES])
     levels = []
-    for size in SIZES:
+    sizes = [n for n in SIZES if n < len(labels)] + [len(labels)]
+    for size in sizes:
         half = size // 2
         ids = order['correct'][:half] + order['incorrect'][:half]
         gold = {sid: labels[sid] for sid in ids}
@@ -104,7 +107,7 @@ def run(root):
                           and value['configuration_sha256'] == plan['configuration_sha256'], 'Wrong result binding')
             predictions[arm][sid] = value
     report = analyze(labels, predictions)
-    final.require(report['sizes'][-1]['groups'] == official['groups'], '600-question endpoint differs from release')
+    final.require(report['sizes'][-1]['groups'] == official['groups'], 'Full-cohort endpoint differs from release')
     report.update(bench_release_sha256=release_hash, official_metrics_sha256=final.vr.sha(metrics_path),
                   analysis_sha256=final.vr.sha(__file__))
     final.immutable(root / 'sample_size_stability.json', report)

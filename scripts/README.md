@@ -1,13 +1,13 @@
 # 脚本入口
 
-当前600题最终答案评测使用 `scripts.run_final_answer_revision`。原题、30B回答、参考、三库及实验参数均由准备配置绑定。node14 的正式入口复用已通过固定6题验收的服务与个人互斥锁。[题目级执行器](run_final_answer_revision.py) · [项目进展](../docs/项目进展.md)
+当前478题最终答案评测使用 `scripts.run_final_answer_revision`。原题、30B回答、参考、三库及实验参数均由准备配置绑定。node14 的正式入口复用已通过固定6题验收的服务与个人互斥锁。[题目级执行器](run_final_answer_revision.py) · [项目进展](../docs/项目进展.md)
 
 | 环节 | 服务器入口与产物 |
 |---|---|
 | 冻结准备 | `plan.json` 绑定原准备配置，`execution_repair.json` 绑定在线执行配置。11月20日追加的 `replay_repair.json` 单独绑定离线材料字段恢复。`verify` 校验三者，已发请求继续按原签名核验。 |
 | 开发题和候选标签 | 固定6题验收用 `run/confirm`，离线复验用 `audit/confirm-audit`。node14 上用个人 conda 在后台运行 `python -m scripts.run_node14_final_pilot batch --attempt <序号>`，再从新 SSH 连接运行同模块的 `confirm-batch --attempt <同一序号>`。启动及释放回执位于结果根的 `node14_formal/attempts/<序号>/`。正式批次先做6道标签控制题，再独立复核候选。 |
-| 发布与旧输出复算 | 有标签分歧时，node14 入口记录 `awaiting_adjudication` 并释放 GPU。裁决写入后，使用新启动序号恢复已有原件。处置完成后，原 `freeze` 按702题原序选正误各300，任一类不足即停止。`rescore-archive` 用两版标签对同一旧输出子集计分。 |
-| 正式检查与计分 | `run` 验收开发题回执后执行600题四组。共享 PREPARE 的耗时计入每一组，CHECK 受本组剩余时限和单请求上限约束。断点复用及离线 `score --await-release` 同样复核原始记录。 |
+| 发布与旧输出复算 | 有标签分歧时，node14 入口记录 `awaiting_adjudication` 并释放 GPU。原独立复核、首轮9项裁决及34份失败留档。授权文件 `cohort_amendment.json` 绑定92项新增裁决、702候选、原复核与有效配额。`freeze` 验算最大平衡集并按原候选顺序发布正确、错误各239题。`rescore-archive` 用两版标签对同一旧输出子集计分。 |
+| 正式检查与计分 | `run` 验收开发题回执后执行478题四组。共享 PREPARE 的耗时计入每一组，CHECK 受本组剩余时限和单请求上限约束。断点复用及离线 `score --await-release` 同样复核原始记录。node14 监督进程在正式计分、释放服务后离线计算规模曲线。 |
 
 `scripts.run_final_answer_revision` 使用 `--output <final_revision>`。在线和离线批次都在服务器个人 conda 环境后台运行，由新的 SSH 连接确认。实验输入、标签可见性、检索与计分定义见[评测口径](../docs/效果测评.md)。
 
