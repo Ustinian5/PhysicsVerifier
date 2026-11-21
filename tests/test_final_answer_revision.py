@@ -306,6 +306,37 @@ def test_shared_prepare_charged_once_per_arm_and_verified_on_resume(tmp_path,mon
     assert len(calls) == 5 and not (tmp_path/'metrics.json').exists()
 
 
+def test_corrected_release_reuses_linked_prefix_and_three_arms(tmp_path, monkeypatch):
+    from scripts import run_final_answer_revision as r
+
+    old = tmp_path/'final_revision'
+    out = tmp_path/'final_revision_balanced'
+    r, plan, tokenizer, calls = fake_runtime(monkeypatch)
+    stores = dict(pure=None, case_rag=p.memory.FlatMemory([]), flat_skills=p.memory.FlatMemory([]),
+                  rule_tree=p.memory.TreeMemory({'domains':[]}))
+    r.run_question(old, ROW, 'formal', plan, tokenizer, None, stores)
+    key = r.vr.digest(ROW['id'])[:24]
+    (old/'formal/case_rag'/key).rename(tmp_path/'absent_in_parent')
+    (old/'STOP').touch()
+    receipt = old/'node14_formal/attempts/2'
+    r.vr.atomic(receipt/'release.json', dict(owned_gpu_pids=[], gauges={'running':0, 'waiting':0}))
+    (receipt/'runner.exit_code').write_text('1')
+    r.vr.atomic(out/'inputs.json', [ROW])
+    r.vr.atomic(out/'bench_release.json', {})
+    monkeypatch.setattr(r.cohort, 'read_amendment', lambda root: dict(supersedes=r.cohort.WITHDRAWN_RELEASE))
+    reused = r.cohort.reuse_prior_requests(out)
+    assert reused['reused_completed_results'] == dict(queries=1, pure=1, case_rag=0, flat_skills=1, rule_tree=1)
+    r.run_question(out, ROW, 'formal', plan, tokenizer, None, stores)
+    r.run_question(out, ROW, 'formal', plan, tokenizer, None, stores)
+    assert len(calls) == 6
+    assert all((out/'formal'/arm/key/'result.json').is_file() for arm in r.ARMS)
+    monkeypatch.setattr(r, 'verify', lambda root: plan)
+    monkeypatch.setattr(r, 'released', lambda root, plan: {})
+    r.vr.atomic(out/'labels_private.json', {ROW['id']: {'verdict': 'correct'}})
+    r.score(out)
+    assert all(group['counts']['TN'] == 1 for group in r.vr.read(out/'metrics.json')['groups'].values())
+
+
 def test_nonempty_material_survives_resume_and_scoring_without_new_calls(tmp_path, monkeypatch):
     r, plan, tokenizer, calls = fake_runtime(monkeypatch)
     monkeypatch.setattr(r, 'ARMS', ('case_rag',))

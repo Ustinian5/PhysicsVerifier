@@ -115,5 +115,5 @@ def run(root):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--root', required=True, type=Path, help='Current aligned_old99/final_revision result root')
+    parser.add_argument('--root', required=True, type=Path, help='Result directory containing the current published cohort')
     run(parser.parse_args().root.resolve())

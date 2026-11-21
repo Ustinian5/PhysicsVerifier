@@ -289,6 +289,9 @@ def saved_request(folder, messages, max_tokens, validator, plan, *, available=No
     evidence = ['request.json','raw.json','response.json']
     if available is not None:
         evidence.append('request_budget.json')
+    if set(value['files']) != {str(folder/n) for n in evidence}:
+        # A later release may read the same request through a link to its immutable directory.
+        folder = folder.resolve()
     require(set(value['files']) == {str(folder/n) for n in evidence},
             'Incomplete request evidence set')
     for fn, sha in value['files'].items(): require(vr.sha(Path(fn)) == sha, 'Completed request evidence drift')
@@ -573,6 +576,8 @@ def run_checks(out, plan, tokenizer, client, pilot):
 
 
 def verify_arm(row, arm, path, value, prefix, plan):
+    if path.parent.is_symlink():
+        path = path.resolve()
     limits = plan['configuration']['limits']
     require(value['id'] == row['id'] and value['arm'] == arm and
             value['configuration_sha256'] == plan['configuration_sha256'] and

@@ -376,6 +376,8 @@ def batch_stage(out, inputs):
     final.base.old.emit(out, 'freezing_benchmark', counts=dict(counts), eligible_by_label=dict(eligible))
     final.freeze_bench(out)
     final.rescore_archive(out)
+    if out.name == 'final_revision_balanced':
+        final.immutable(out / 'prior_request_reuse.json', final.cohort.reuse_prior_requests(out))
     if (out / 'metrics.json').is_file():
         final.score(out)
         return 'completed'
@@ -478,13 +480,20 @@ def run(folder, plan, signature, weights_hash, *, batch=None):
 
 
 def main():
+    global OUT
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode', choices=('run', 'confirm', 'audit', 'confirm-audit', 'batch', 'confirm-batch'))
     parser.add_argument('--attempt', required=True, type=int)
+    parser.add_argument('--output', type=Path, help='Server result root for the separately adjudicated release')
     args = parser.parse_args()
     require(args.attempt > 0 and socket.gethostname().split('.')[0] == 'node14', 'Invalid node14 attempt')
     set_environment()
     is_batch = args.mode in ('batch', 'confirm-batch')
+    if args.output is not None:
+        expected = HOT / 'results/qwen30b_step_verifier/aligned_old99/final_revision_balanced'
+        require(is_batch and args.output.resolve() == expected and final.cohort.read_amendment(expected).get('supersedes'),
+                'Unknown amended batch result root')
+        OUT = expected
     folder = (OUT / 'node14_formal' if is_batch else CONTROL) / 'attempts' / str(args.attempt)
     if args.mode in ('audit', 'confirm-audit'):
         offline_replay(folder, confirm=args.mode == 'confirm-audit')
