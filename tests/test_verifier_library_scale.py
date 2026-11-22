@@ -1,6 +1,7 @@
 import pytest
 
 from scripts import audit_verifier_library_scale as replay
+from scripts import report_verifier_library_yields as yields
 from scripts import run_node14_library_scale as node
 from scripts import run_verifier_library_scale as library
 
@@ -72,6 +73,16 @@ def test_random_seed_registration_was_frozen_before_membership():
     assert set(reg['seeds']).isdisjoint(library.ORIGINAL_SEEDS)
     assert [(r['seed'],r['source_questions']) for r in rows] == [
         (seed,n) for seed in reg['seeds'] for n in library.BUILD_SIZES]
+
+
+def test_yields_require_all_distinct_repetitions_before_reporting_a_mean():
+    rows = [dict(seed=s, source_questions=250, cases=s, skills=2*s, leaves=s+5) for s in (1,2,3)]
+    full = yields.summarize(rows, (250,500), 3)
+    assert full['250']['cases'] == dict(min=1,max=3,mean=2)
+    assert full['500'] == dict(completed=0, planned=3)
+    assert yields.summarize(rows[:2], (250,), 3)['250'] == dict(completed=2, planned=3)
+    with pytest.raises(ValueError,match='Duplicate draw'):
+        yields.summarize([rows[0],rows[0]],(250,),3)
 
 
 def test_idle_card_is_restricted_to_the_requested_gpu():
