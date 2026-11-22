@@ -34,7 +34,10 @@ def available_card(snapshot, gpu):
 
 
 def service_port(size, seed):
-    return 18100 + 10 * scale.BUILD_SIZES.index(size) + seed % 100
+    size_index = scale.BUILD_SIZES.index(size)
+    if seed in scale.RANDOM_SEEDS:
+        return 18160 + 10 * size_index + scale.RANDOM_SEEDS.index(seed)
+    return 18100 + 10 * size_index + seed % 100
 
 
 def run(out, folder, gpu, plan):

@@ -15,5 +15,53 @@
   "outcome": "Source dispositions, RAG case count, flat skill count, tree candidates, placed leaves, unplaced rules and scenario clusters.",
   "split_sha256": "899d29698618bf87f228673a6bcd2444007f7ed49fbb5deb09ecd21f748f9f58",
   "families_sha256": "57d4296ea30bcfef3d37e4ca176e50a7d1b69fd1b7876298efb43890fe04feff",
-  "sampling_code_sha256": "ede73bb686ef1ba10acd8850a339d61888104669fb6d73ccee6d1face8554de3"
+  "sampling_code_sha256": "ede73bb686ef1ba10acd8850a339d61888104669fb6d73ccee6d1face8554de3",
+  "seed_registration_sha256": "edc2606699e9b761038041b8e2d5945837de125a51219803e793df91b0141c72",
+  "draws": [
+    {
+      "seed": 1247261125,
+      "source_questions": 250,
+      "source_ids_sha256": "6f75c734cda7625fc9441e11625c1c1011b05900888af988fca2f7318c794f43"
+    },
+    {
+      "seed": 1247261125,
+      "source_questions": 500,
+      "source_ids_sha256": "066fdd0aa55d7750a52de6e57785d585c3f529441335cbfae93033849b120dc1"
+    },
+    {
+      "seed": 1247261125,
+      "source_questions": 1000,
+      "source_ids_sha256": "a81a8e4355f9ec9547495b346ad1eb9fdaffbcdfeb97c257b6d5d7ae105a13ec"
+    },
+    {
+      "seed": 1451143462,
+      "source_questions": 250,
+      "source_ids_sha256": "447472ebea1aa22e8efc5cdd03f2f95e1344dde2dc2a5d501059cab19ed0b478"
+    },
+    {
+      "seed": 1451143462,
+      "source_questions": 500,
+      "source_ids_sha256": "60cd8c62f407427022b9e33b784c0e7958172b3b5f6df77117b866d2fc64d999"
+    },
+    {
+      "seed": 1451143462,
+      "source_questions": 1000,
+      "source_ids_sha256": "b990e946effe76529bd746ab3a95be939b0e1674d11b0ce91f1422187b51bce3"
+    },
+    {
+      "seed": 2106935235,
+      "source_questions": 250,
+      "source_ids_sha256": "791c7e56013c056a686d0e39695d20797c02a31ca1e12374c30ca34a3f1f4c42"
+    },
+    {
+      "seed": 2106935235,
+      "source_questions": 500,
+      "source_ids_sha256": "13a5b7fe1524c97456f0642f00a00c5ab5d9e7ac859a0c52477dc439a3e2a43a"
+    },
+    {
+      "seed": 2106935235,
+      "source_questions": 1000,
+      "source_ids_sha256": "06fc656e8f1d711474c868e401e31dd62dbb2496bc8b3704e22a42b149df8552"
+    }
+  ]
 }

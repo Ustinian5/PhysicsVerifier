@@ -23,15 +23,16 @@ def test_dedup_and_rule_support_use_only_this_draw():
 
 
 def test_source_hold_retains_the_original_draw_and_never_substitutes(monkeypatch):
-    held, = library.SOURCE_HOLD
-    chosen = {str(i) for i in range(249)} | {held}
-    split = dict(build=[dict(id=i) for i in sorted(chosen | {str(i) for i in range(249,1999)})],
+    held = library.SOURCE_HOLD
+    count = 250-len(held)
+    chosen = {str(i) for i in range(count)} | held
+    split = dict(build=[dict(id=i) for i in sorted(chosen | {str(i) for i in range(count,2000-len(held))})],
                  reserve=[dict(id='reserve'+str(i)) for i in range(702)])
     monkeypatch.setattr(library, 'family_levels', lambda *args: iter([(250, chosen)]))
     with pytest.raises(ValueError, match='disposition'):
         library.source_draw(split, [], library.SEEDS[0], False)
     rows, removed = library.source_draw(split, [], library.SEEDS[0], True)
-    assert {r['id'] for r in rows}==chosen and removed=={held}
+    assert {r['id'] for r in rows}==chosen and removed==held
 
 
 def test_larger_sizes_extend_the_smaller_draw_without_splitting_a_family():
@@ -57,6 +58,20 @@ def test_ports_are_distinct_across_concurrent_sizes_and_seeds():
     ports = {node.service_port(n,s) for n in library.BUILD_SIZES for s in library.SEEDS}
     assert len(ports) == len(library.BUILD_SIZES) * len(library.SEEDS)
     assert node.service_port(250, 20261122) == 18122
+
+
+def test_random_seed_registration_was_frozen_before_membership():
+    import hashlib
+    import json
+    reg = dict(library.RANDOM_REGISTRATION)
+    rows = reg.pop('draws')
+    seed_only = reg.pop('seed_registration_sha256')
+    encoded = (json.dumps(reg,ensure_ascii=False,indent=2)+'\n').encode()
+    assert hashlib.sha256(encoded).hexdigest() == seed_only
+    assert len(set(reg['seeds'])) == len(reg['seeds']) == 3
+    assert set(reg['seeds']).isdisjoint(library.ORIGINAL_SEEDS)
+    assert [(r['seed'],r['source_questions']) for r in rows] == [
+        (seed,n) for seed in reg['seeds'] for n in library.BUILD_SIZES]
 
 
 def test_idle_card_is_restricted_to_the_requested_gpu():

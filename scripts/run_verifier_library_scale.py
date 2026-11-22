@@ -11,16 +11,29 @@ from rule_framework import verified_resume as vr
 from scripts import audit_verifier_lineage as lineage
 from scripts import run_corrected_pipeline as construction
 from scripts import run_final_answer_revision as final
-from scripts.audit_verifier_library_capacity import family_levels, SEEDS, SIZES
+from scripts.audit_verifier_library_capacity import family_levels, SEEDS as ORIGINAL_SEEDS, SIZES
 from scripts.analyze_verifier_knowledge_groups import checked_json
 
 
 BUILD_SIZES = SIZES[:-1]  # The full 2000-source release is already frozen.
 CAPACITY_HASH = '08973fc205ad87e943d98f12f646e5caa7170104ca27477d004c2b2448e79a5c'
-FIRST_ACCEPTANCE = '837ad123a44a6ece8bc272a82dda79427c7829d019d580a843a3b54c2fe7b311'
-FIRST_BUILD_COMMIT = '5c2ccfa599fbd2be7abe66fd4646e7870989f7a4'
-SOURCE_HOLD = {'4659f0d1c30facf22ee86b66b6edf9835b2c9eedab4d2cbb04c1de685ad7711c'}
+ARCHIVED_BUILDS = {
+    '837ad123a44a6ece8bc272a82dda79427c7829d019d580a843a3b54c2fe7b311': '5c2ccfa599fbd2be7abe66fd4646e7870989f7a4',
+    '1e1c41ab344be9ba63663c8da1adf9895d7508c0dd11837dd8e5bc9787d65e73': 'f13f9ea0ab172f20285f24a119b2625d8c9e398b',
+    '31d1cfaaab75be9ebc87628c6988a1c7732704b6e52132f0270818640e793bd0': 'f13f9ea0ab172f20285f24a119b2625d8c9e398b',
+}
+SOURCE_HOLD = {
+    '4659f0d1c30facf22ee86b66b6edf9835b2c9eedab4d2cbb04c1de685ad7711c',
+    'cbbfe15ffced7df58b85d2b6cbc27409df63baf4721cd4b039766a1ed9308e80',
+    'cfb5fc2b61b5c1374817bdec9b662fde48d2af32fd9bcfbdcb670a12c19b93c5',
+}
 require, immutable = final.require, final.immutable
+SEED_MANIFEST = final.a.ROOT/'experiments/library_scale_random_seeds.json'
+SEED_MANIFEST_HASH = 'baa11425db66fc66413f2f7dac2f9114aefdeadafc588624f6bbf3d3136cc1c8'
+require(vr.sha(SEED_MANIFEST) == SEED_MANIFEST_HASH, 'Random-seed registration changed')
+RANDOM_REGISTRATION = vr.read(SEED_MANIFEST)
+RANDOM_SEEDS = tuple(RANDOM_REGISTRATION['seeds'])
+SEEDS = ORIGINAL_SEEDS + RANDOM_SEEDS
 BUILD_FILES = ('scripts/run_verifier_library_scale.py', 'scripts/run_node14_library_scale.py',
                'scripts/audit_verifier_library_capacity.py', 'scripts/run_corrected_pipeline.py',
                'rule_framework/bounded_tree.py', 'scripts/generate_experience_rules.py',
@@ -98,7 +111,14 @@ def prepare(root, out, seed, apply_hold, size=250):
     families = checked_json(corrected / 'source_screen/family_components.json', deps)['components']
     rows, held = source_draw(split, families, seed, apply_hold, size)
     ids = {r['id'] for r in rows}
-    level, = (v for v in inventory['levels'] if v['seed'] == seed and v['source_questions'] == size)
+    levels = inventory['levels']
+    if seed in RANDOM_SEEDS:
+        require(tuple(RANDOM_REGISTRATION['sizes']) == BUILD_SIZES and
+                all(RANDOM_REGISTRATION[k] == inventory[k] for k in ('families_sha256','split_sha256')) and
+                vr.sha(final.a.ROOT/'scripts/audit_verifier_library_capacity.py') == RANDOM_REGISTRATION['sampling_code_sha256'],
+                'Random draw does not use the frozen families, population or sampler')
+        levels = RANDOM_REGISTRATION['draws']
+    level, = (v for v in levels if v['seed'] == seed and v['source_questions'] == size)
     require(vr.digest(sorted(ids)) == level['source_ids_sha256'], 'Draw differs from the frozen inventory')
     excluded = set(checked_json(aligned/'evaluation/isolation.json', deps)['excluded_source_ids'])
     excluded.update(checked_json(aligned/'evaluation_revision/source_quarantine.json', deps)['excluded'])
@@ -201,6 +221,8 @@ def prepare(root, out, seed, apply_hold, size=250):
                   source_release_sha256=inventory['plan_sha256'], transport=cc['transport'], tree_policy=cc['tree_policy'],
                   build_files=build_files, files={n:vr.sha(out/n) for n in names}, source_counts=dict(Counter(disposition.values())),
                   flat_counts=expectations, skill_outcomes=skill_counts, candidates=len(rules), fresh_tree=True)
+    if seed in RANDOM_SEEDS:
+        config['seed_manifest_sha256'] = SEED_MANIFEST_HASH
     immutable(out/'plan.json', dict(configuration=config, configuration_sha256=vr.digest(config)))
     return config
 
@@ -208,6 +230,9 @@ def prepare(root, out, seed, apply_hold, size=250):
 def verify(out):
     plan = vr.read(out/'plan.json')
     c = plan['configuration']
+    if c['seed'] in RANDOM_SEEDS:
+        require(c.get('seed_manifest_sha256') == vr.sha(SEED_MANIFEST) == SEED_MANIFEST_HASH,
+                'Random-seed registration differs from the plan')
     require(vr.digest(c) == plan['configuration_sha256'] and all(vr.sha(out/n) == h for n,h in c['files'].items())
             and set(c['build_files']) == set(BUILD_FILES), 'Local library binding changed')
     receipt = out/'construction_acceptance.json'
@@ -220,13 +245,13 @@ def verify(out):
                 'Published library changed')
     changed = {n: h for n, h in c['build_files'].items() if vr.sha(final.a.ROOT/n) != h}
     if changed:
-        # The first completed draw predates --size. Its original executables
-        # remain in Git; archived code is never accepted for a new build.
-        require(receipt.is_file() and vr.sha(receipt) == FIRST_ACCEPTANCE
+        # Only an already published, byte-identical library may bind archived code.
+        commit = ARCHIVED_BUILDS.get(vr.sha(receipt)) if receipt.is_file() else None
+        require(commit
                 and set(changed) <= {'scripts/run_verifier_library_scale.py', 'scripts/run_node14_library_scale.py'},
                 'Local library binding changed')
         for name, expected in changed.items():
-            archived = subprocess.check_output(['git', 'show', f'{FIRST_BUILD_COMMIT}:{name}'], cwd=final.a.ROOT)
+            archived = subprocess.check_output(['git', 'show', f'{commit}:{name}'], cwd=final.a.ROOT)
             require(hashlib.sha256(archived).hexdigest() == expected, 'Archived build source changed')
     return plan
 
