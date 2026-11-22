@@ -2,6 +2,7 @@
 import argparse
 import ast
 from collections import Counter, defaultdict
+import hashlib
 from pathlib import Path
 import subprocess
 import threading
@@ -10,12 +11,14 @@ from rule_framework import verified_resume as vr
 from scripts import audit_verifier_lineage as lineage
 from scripts import run_corrected_pipeline as construction
 from scripts import run_final_answer_revision as final
-from scripts.audit_verifier_library_capacity import family_levels, SEEDS
+from scripts.audit_verifier_library_capacity import family_levels, SEEDS, SIZES
 from scripts.analyze_verifier_knowledge_groups import checked_json
 
 
-SIZE = 250
+BUILD_SIZES = SIZES[:-1]  # The full 2000-source release is already frozen.
 CAPACITY_HASH = '08973fc205ad87e943d98f12f646e5caa7170104ca27477d004c2b2448e79a5c'
+FIRST_ACCEPTANCE = '837ad123a44a6ece8bc272a82dda79427c7829d019d580a843a3b54c2fe7b311'
+FIRST_BUILD_COMMIT = '5c2ccfa599fbd2be7abe66fd4646e7870989f7a4'
 SOURCE_HOLD = {'4659f0d1c30facf22ee86b66b6edf9835b2c9eedab4d2cbb04c1de685ad7711c'}
 require, immutable = final.require, final.immutable
 BUILD_FILES = ('scripts/run_verifier_library_scale.py', 'scripts/run_node14_library_scale.py',
@@ -25,12 +28,13 @@ BUILD_FILES = ('scripts/run_verifier_library_scale.py', 'scripts/run_node14_libr
                'scripts/rebuild_qwen30b_corpus.py', 'scripts/run_node14_final_pilot.py')
 
 
-def source_draw(split, families, seed, apply_hold):
+def source_draw(split, families, seed, apply_hold, size=250):
     build = {r['id'] for r in split['build']}
     reserve = {r['id'] for r in split['reserve']}
-    require(seed in SEEDS and len(build) == 2000 and len(reserve) == 702 and not build & reserve,
-            'Unexpected seed or frozen population')
-    _, chosen = next(family_levels(build, reserve, families, (SIZE,), seed))
+    require(seed in SEEDS and size in BUILD_SIZES and len(build) == 2000 and len(reserve) == 702
+            and not build & reserve, 'Unexpected seed, size or frozen population')
+    levels = (level for level in BUILD_SIZES if level <= size)
+    chosen = next(ids for n, ids in family_levels(build, reserve, families, levels, seed) if n == size)
     held = SOURCE_HOLD & chosen
     require(not held or apply_hold, 'The selected draw requires a source disposition before preparation')
     return [r for r in split['build'] if r['id'] in chosen], held
@@ -73,7 +77,11 @@ def local_flat(aligned, parent, manifest, source_rows):
     return sorted(cases, key=lambda case: case['source_ids'][0]), skills, counts
 
 
-def prepare(root, out, seed, apply_hold):
+def prepare(root, out, seed, apply_hold, size=250):
+    if (out/'construction_acceptance.json').is_file():
+        config = verify(out)['configuration']
+        require((config['source_count'], config['seed']) == (size, seed), 'Wrong published library')
+        return config
     inventory_path = root / 'knowledge_library_capacity.json'
     require(vr.sha(inventory_path) == CAPACITY_HASH, 'Frozen sampling receipt changed')
     inventory = vr.read(inventory_path)
@@ -88,9 +96,9 @@ def prepare(root, out, seed, apply_hold):
     deps = cfg['dependencies']
     split = checked_json(corrected / 'source_screen/split.json', deps)
     families = checked_json(corrected / 'source_screen/family_components.json', deps)['components']
-    rows, held = source_draw(split, families, seed, apply_hold)
+    rows, held = source_draw(split, families, seed, apply_hold, size)
     ids = {r['id'] for r in rows}
-    level, = (v for v in inventory['levels'] if v['seed'] == seed and v['source_questions'] == SIZE)
+    level, = (v for v in inventory['levels'] if v['seed'] == seed and v['source_questions'] == size)
     require(vr.digest(sorted(ids)) == level['source_ids_sha256'], 'Draw differs from the frozen inventory')
     excluded = set(checked_json(aligned/'evaluation/isolation.json', deps)['excluded_source_ids'])
     excluded.update(checked_json(aligned/'evaluation_revision/source_quarantine.json', deps)['excluded'])
@@ -182,7 +190,6 @@ def prepare(root, out, seed, apply_hold):
             'Frozen tree implementation changed')
     name = 'scripts/run_corrected_pipeline.py'
     snapshot = subprocess.check_output(['git','show','3fad274:'+name], cwd=final.a.ROOT)
-    import hashlib
     require(hashlib.sha256(snapshot).hexdigest() == cc['code'][name], 'Wrong original construction revision')
     def tree_functions(code):
         return {n.name:ast.dump(n) for n in ast.parse(code).body if isinstance(n,ast.FunctionDef)
@@ -190,7 +197,7 @@ def prepare(root, out, seed, apply_hold):
     require(tree_functions(snapshot)==tree_functions((final.a.ROOT/name).read_bytes()), 'Tree call semantics changed')
     names = ('sources.json','tree_bundle.json','original_evidence.json','heldout_questions.json',
              'materials/cases.json','materials/skills.json')
-    config = dict(seed=seed, source_count=SIZE, source_ids_sha256=level['source_ids_sha256'], protocol=pc['configuration_sha256'],
+    config = dict(seed=seed, source_count=size, source_ids_sha256=level['source_ids_sha256'], protocol=pc['configuration_sha256'],
                   source_release_sha256=inventory['plan_sha256'], transport=cc['transport'], tree_policy=cc['tree_policy'],
                   build_files=build_files, files={n:vr.sha(out/n) for n in names}, source_counts=dict(Counter(disposition.values())),
                   flat_counts=expectations, skill_outcomes=skill_counts, candidates=len(rules), fresh_tree=True)
@@ -202,7 +209,25 @@ def verify(out):
     plan = vr.read(out/'plan.json')
     c = plan['configuration']
     require(vr.digest(c) == plan['configuration_sha256'] and all(vr.sha(out/n) == h for n,h in c['files'].items())
-            and all(vr.sha(final.a.ROOT/n) == h for n,h in c['build_files'].items()), 'Local library binding changed')
+            and set(c['build_files']) == set(BUILD_FILES), 'Local library binding changed')
+    receipt = out/'construction_acceptance.json'
+    if receipt.exists():
+        accepted = vr.read(receipt)
+        require(accepted['passed'] and accepted['configuration_sha256'] == plan['configuration_sha256']
+                and set(accepted['materials']) == {'cases.json', 'skills.json', 'catalog.json', 'tree_report.json'}
+                and all(vr.sha(out/'materials'/n) == h for n, h in accepted['materials'].items())
+                and vr.sha(out/'material_isolation.json') == accepted['material_isolation_sha256'],
+                'Published library changed')
+    changed = {n: h for n, h in c['build_files'].items() if vr.sha(final.a.ROOT/n) != h}
+    if changed:
+        # The first completed draw predates --size. Its original executables
+        # remain in Git; archived code is never accepted for a new build.
+        require(receipt.is_file() and vr.sha(receipt) == FIRST_ACCEPTANCE
+                and set(changed) <= {'scripts/run_verifier_library_scale.py', 'scripts/run_node14_library_scale.py'},
+                'Local library binding changed')
+        for name, expected in changed.items():
+            archived = subprocess.check_output(['git', 'show', f'{FIRST_BUILD_COMMIT}:{name}'], cwd=final.a.ROOT)
+            require(hashlib.sha256(archived).hexdigest() == expected, 'Archived build source changed')
     return plan
 
 
@@ -269,10 +294,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', required=True, type=Path, help='node14 qwen30b_step_verifier results')
     parser.add_argument('--seed', required=True, type=int, choices=SEEDS)
+    parser.add_argument('--size', type=int, choices=BUILD_SIZES, default=250)
     parser.add_argument('--apply-source-hold', action='store_true', help='Apply the confirmed disposition to affected draws')
     args = parser.parse_args()
     root = args.root.resolve()
-    directory = root/'library_scale'/f'n{SIZE}_seed{args.seed}'
+    directory = root/'library_scale'/f'n{args.size}_seed{args.seed}'
     directory.mkdir(exist_ok=True, parents=True)
     with final.base.r.run_lock(directory/'active.lock'):
-        prepare(root, directory, args.seed, args.apply_source_hold)
+        prepare(root, directory, args.seed, args.apply_source_hold, args.size)

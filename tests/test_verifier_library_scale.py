@@ -34,6 +34,31 @@ def test_source_hold_retains_the_original_draw_and_never_substitutes(monkeypatch
     assert {r['id'] for r in rows}==chosen and removed=={held}
 
 
+def test_larger_sizes_extend_the_smaller_draw_without_splitting_a_family():
+    import hashlib
+    seed = library.SEEDS[1]
+    ordered = sorted(map(str, range(6)), key=lambda k: hashlib.sha256(f'{seed}:{k}'.encode()).digest())
+    ids = [f'q{i}' for i in range(2000)]
+    sizes = (249, 251, 1, 250, 249, 1000)
+    families = [dict(id=key, members=ids[sum(sizes[:i]):sum(sizes[:i+1])])
+                for i, key in enumerate(ordered)]
+    split = dict(build=[dict(id=s) for s in ids], reserve=[dict(id=f'r{i}') for i in range(702)])
+    draws = []
+    for n in library.BUILD_SIZES:
+        rows, held = library.source_draw(split, families, seed, False, n)
+        assert len(rows) == n and not held
+        draws.append({r['id'] for r in rows})
+    assert draws[0] < draws[1] < draws[2]
+    assert set(families[1]['members']).isdisjoint(draws[1])
+    assert set(families[1]['members']) <= draws[2]
+
+
+def test_ports_are_distinct_across_concurrent_sizes_and_seeds():
+    ports = {node.service_port(n,s) for n in library.BUILD_SIZES for s in library.SEEDS}
+    assert len(ports) == len(library.BUILD_SIZES) * len(library.SEEDS)
+    assert node.service_port(250, 20261122) == 18122
+
+
 def test_idle_card_is_restricted_to_the_requested_gpu():
     idle = lambda i: [str(i), 'uuid'+str(i), 'A800', '81920','3','0']
     snapshot = dict(gpus=[idle(1),idle(4),idle(5)],compute_processes=[('uuid4','987')])

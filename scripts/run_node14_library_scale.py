@@ -33,6 +33,10 @@ def available_card(snapshot, gpu):
     return host.idle_card(dict(snapshot, gpus=[g for g in snapshot['gpus'] if int(g[0])==gpu]))
 
 
+def service_port(size, seed):
+    return 18100 + 10 * scale.BUILD_SIZES.index(size) + seed % 100
+
+
 def run(out, folder, gpu, plan):
     from transformers import AutoTokenizer
 
@@ -42,7 +46,7 @@ def run(out, folder, gpu, plan):
         return
     host.set_environment()
     c = plan['configuration']
-    port = 18100 + c['seed'] % 100
+    port = service_port(c['source_count'], c['seed'])
     # Each detached supervisor process owns exactly one port; reuse the audited
     # PID, process-group, in-flight-request and release checks for that port.
     host.PORT = port
@@ -127,14 +131,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode', choices=('run','confirm'))
     parser.add_argument('--seed', type=int, required=True, choices=scale.SEEDS)
+    parser.add_argument('--size', type=int, choices=scale.BUILD_SIZES, default=250)
     parser.add_argument('--gpu', type=int, required=True, choices=range(4,8))
     parser.add_argument('--attempt', type=int, required=True)
     args = parser.parse_args()
     require(socket.gethostname().split('.')[0]=='node14' and Path(sys.prefix)==host.ENV and args.attempt>0,
             'Unexpected host, conda environment or attempt')
-    out = RESULTS/'library_scale'/f'n{scale.SIZE}_seed{args.seed}'
+    out = RESULTS/'library_scale'/f'n{args.size}_seed{args.seed}'
     folder = out/'attempts'/str(args.attempt)
     plan = scale.verify(out)
+    require((plan['configuration']['source_count'], plan['configuration']['seed']) == (args.size, args.seed),
+            'Library size or seed differs from the published plan')
     if args.mode=='confirm':
         ready = vr.read(folder/'disconnect_ready.json')
         require(ready['configuration_sha256']==plan['configuration_sha256'] and time.time()-ready['unix']>=5
