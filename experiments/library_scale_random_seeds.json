@@ -1,0 +1,19 @@
+{
+  "registered_at_utc": "2026-11-22T12:45:56+00:00",
+  "seeds": [
+    1247261125,
+    1451143462,
+    2106935235
+  ],
+  "selection": "SystemRandom.sample(range(2**30, 2**31), 3) without replacement, before inspecting memberships; retain every seed.",
+  "sizes": [
+    250,
+    500,
+    1000
+  ],
+  "unit": "whole frozen question families nested within seed",
+  "outcome": "Source dispositions, RAG case count, flat skill count, tree candidates, placed leaves, unplaced rules and scenario clusters.",
+  "split_sha256": "899d29698618bf87f228673a6bcd2444007f7ed49fbb5deb09ecd21f748f9f58",
+  "families_sha256": "57d4296ea30bcfef3d37e4ca176e50a7d1b69fd1b7876298efb43890fe04feff",
+  "sampling_code_sha256": "ede73bb686ef1ba10acd8850a339d61888104669fb6d73ccee6d1face8554de3"
+}
