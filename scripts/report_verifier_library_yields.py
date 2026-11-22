@@ -1,6 +1,7 @@
 """Verify and plot construction yields for the three preregistered random seeds."""
 import argparse
 from collections import Counter
+from itertools import combinations
 from pathlib import Path
 from statistics import mean
 
@@ -70,6 +71,7 @@ def summarize(rows, sizes, repetitions):
 
 def collect(root, allow_partial):
     rows, missing = [], []
+    draws_by_size = {n: {} for n in scale.BUILD_SIZES}
     for seed in scale.RANDOM_SEEDS:
         previous_ids, previous_flat, previous_rules = set(), {}, {}
         for draw in (r for r in scale.RANDOM_REGISTRATION['draws'] if r['seed'] == seed):
@@ -83,11 +85,14 @@ def collect(root, allow_partial):
                     for key, values in flat.items()) and all(support <= rules.get(rid, set())
                     for rid, support in previous_rules.items()), 'Nested material or rule support changed')
             previous_ids, previous_flat, previous_rules = ids, flat, rules
+            draws_by_size[n][seed] = ids
             rows.append(row)
     require(rows and (allow_partial or not missing), 'Some registered draws lack construction and replay receipts')
+    overlap = {str(n): [dict(seeds=[a,b], shared_questions=len(sets[a] & sets[b])) for a,b in combinations(sets,2)]
+               for n, sets in draws_by_size.items()}
     return dict(seed_manifest_sha256=scale.SEED_MANIFEST_HASH, sizes=list(scale.BUILD_SIZES), seeds=list(scale.RANDOM_SEEDS),
                 scope='Construction yields per original source draw', complete=not missing, points=rows, pending=missing,
-                by_size=summarize(rows, scale.BUILD_SIZES, len(scale.RANDOM_SEEDS)))
+                between_seed_overlap=overlap, by_size=summarize(rows, scale.BUILD_SIZES, len(scale.RANDOM_SEEDS)))
 
 
 def plot(report, target):
