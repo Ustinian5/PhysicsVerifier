@@ -26,6 +26,8 @@
 
 题目级成绩统一运行 `python -m scripts.report_final_answer_metrics <已发布的结果 JSON>`。新版474题传 `metrics.json`，旧600题传 `final_metric_audit.json`，538题同题复算传 `archived_rescore.json`，评测题数曲线传 `sample_size_stability.json`。对当前成绩或538题复算加 `--paired`，可在保存原件的服务器核对各组相对纯组新检出和漏掉的错答。每张表以30B最终答案错误为正类，覆盖、弃权、内容失败及全体标错题检出率单列。[报告入口](report_final_answer_metrics.py) · [三项定义](../docs/效果测评.md#最终答案)
 
+在线选材的操作样例在 node14 的个人 conda 运行 `python -m scripts.replay_skill_lookup --root /data0/zengzheni/PhysicsVerifier-huhengyuan/results/qwen30b_step_verifier/aligned_old99/final_revision`。默认回放冻结光纤开发题和种子1247261125的1000题skills库。传 `--actions` 可替换手拟搜索和选择动作。程序输出候选、实际送达ID、token和CHECK输入哈希，模型调用为0。[动作格式与回放](replay_skill_lookup.py)
+
 开发集的检索重排原型可通过 `python -m scripts.probe_verifier_rerank --root <final_revision绝对路径> --id cl_202_125689 --arm case_rag` 生成候选与120B重排提示。支持 `flat_skills`。加 `--selection <含ordered_ids的JSON>` 可重建同会话的全文CHECK。该工具只读取固定开发题和本地分词器，模型调用为0。[适用条件重排](probe_verifier_rerank.py) · [按来源题数及全文预算盘点](audit_verifier_library_capacity.py)
 
 250、500、1000题独立建库使用 `python -m scripts.run_verifier_library_scale --root <node14题目级结果根> --size <题数> --seed <种子>`。同一种子的较大档保留较小档的全部题族，逐档核对预登记题号哈希。从入选来源的逐题30B回答及120B结果重建案例、skills和规则候选，每档重新去重、从空树组织。在服务器后台运行 `python -m scripts.run_node14_library_scale run --size <题数> --seed <种子> --gpu <卡号> --attempt <序号>`，退出SSH后重新连接，用相同参数执行 `confirm`。各档在 `library_scale/n<题数>_seed<种子>/` 单独保存原件、断点及三库，服务端口按题数和种子区分。查看 `construction_acceptance.json` 与该次 `attempts/<序号>/release.json` 核实建库和显卡释放。发布后在服务器CPU运行 `python -m scripts.audit_verifier_library_scale --output <单组结果目录>`，从空树重放全部原始请求，核对实际输入和完整目录。[独立建库](run_verifier_library_scale.py) · [节点执行器](run_node14_library_scale.py) · [原始请求回放](audit_verifier_library_scale.py)
