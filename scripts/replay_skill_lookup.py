@@ -131,16 +131,22 @@ def main():
     config = plan['configuration']
     protocol.require(vr.digest(config) == plan['configuration_sha256'], 'Configuration changed')
     protocol.require(vr.sha(root/'pilot_inputs.json') == config['pilot_sha256'], 'Frozen pilot inputs changed')
+    results_root = root.parent.parent
     library = (args.library.resolve() if args.library else
-               shared_experience.library_path(root.parent.parent, 'n1000_seed1247261125'))
-    publication = vr.read(library/'construction_acceptance.json')
+               shared_experience.reviewed_flat_library(results_root, 'n1000_seed1247261125'))
+    receipt = library / 'flat_acceptance.json'
+    if receipt.is_file():
+        protocol.require(shared_experience.reviewed_flat_library(results_root, library.name) == library,
+                         'Library outside the reviewed flat release')
+    else:
+        receipt = library / 'construction_acceptance.json'
+    publication = vr.read(receipt)
     skill_file = library/'materials/skills.json'
     skill_hash = vr.sha(skill_file)
-    if publication.get('protocol') == shared_experience.PROTOCOL:
-        if args.library:
-            protocol.require(shared_experience.library_path(library.parent.parent, library.name) == library,
-                             'Library outside the shared release')
-    else:
+    if receipt.name == 'construction_acceptance.json' and publication.get('protocol') == shared_experience.PROTOCOL:
+        protocol.require(shared_experience.library_path(results_root, library.name) == library,
+                         'Library outside the shared release')
+    elif receipt.name == 'construction_acceptance.json':
         library_plan = vr.read(library/'plan.json')
         protocol.require(args.library and publication['passed'] and vr.digest(library_plan['configuration']) ==
                          library_plan['configuration_sha256'] == publication['configuration_sha256'] and
@@ -156,21 +162,24 @@ def main():
     queries = json.loads(prefix[2]['content'])
     protocol.require(protocol.continuation_messages(row, queries, [], arm='flat_skills')[:3] == prefix,
                      'Frozen PREPARE prefix differs')
+    skills = vr.read(skill_file)
     if args.actions:
         actions = vr.read(args.actions)
     else:
-        # These two procedures come from the same source problem in the two frozen libraries.
-        demo_item = {'634efb38bf73fe745e4731d2d408701e2bb55bdef6bd03d9ebefd55e69f8ce83': 'S604',
-                     '6e11ffe22058f74ee317e7342f84e01d31ffa30595c024a6eb37c1d81efee6d2': 'S118'}
-        protocol.require(args.id == DEMO_ID and skill_hash in demo_item, 'Supply actions for this question or library')
-        actions = [*DEMO[:2], {'select': [demo_item[skill_hash]]}]
+        # Reuse the same procedure; extra sources shift its display number in the demo.
+        demo_items = {'procedure_dd10747c96dd78616fa02a4a', 'procedure_232c0076398882933a98fece'}
+        display = [f'S{i}' for i, skill in enumerate(sorted(skills, key=lambda s: s['id']), 1)
+                   if skill['id'] in demo_items]
+        protocol.require(args.id == DEMO_ID and library.name == 'n1000_seed1247261125' and len(display) == 1,
+                         'Supply actions for this question or library')
+        actions = [*DEMO[:2], {'select': display}]
     tokenizer = AutoTokenizer.from_pretrained(config['model'], local_files_only=True, trust_remote_code=False)
     def count(messages):
         return len(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
                                                  reasoning_effort='medium'))
-    result = replay(row, queries, vr.read(skill_file), actions, count, config)
+    result = replay(row, queries, skills, actions, count, config)
     result.update(script_sha256=vr.sha(__file__), skills_sha256=skill_hash, pilot_packet_sha256=vr.sha(packet),
-                  library_acceptance_sha256=vr.sha(library/'construction_acceptance.json'))
+                  library_acceptance_sha256=vr.sha(receipt))
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

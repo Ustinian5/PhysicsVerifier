@@ -45,9 +45,9 @@ def probe(root, sid, arm, selection=None, *, library='n2000'):
         file = root / (name + '.json')
         material_hash = c['material_hashes'][name]
     else:
-        directory = shared.library_path(root.parent.parent, library)
+        directory = shared.reviewed_flat_library(root.parent.parent, library)
         file = directory / 'materials' / (name + '.json')
-        material_hash = final.vr.read(directory / 'construction_acceptance.json')['materials'][file.name]
+        material_hash = final.vr.read(directory / 'flat_acceptance.json')['files']['materials/' + file.name]
     store = final.base.p.FlatMemory(checked_json(file, {str(file): material_hash}))
     tokenizer = AutoTokenizer.from_pretrained(c['model'], local_files_only=True, trust_remote_code=False)
 

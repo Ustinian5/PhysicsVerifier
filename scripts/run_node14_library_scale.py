@@ -34,9 +34,8 @@ def main():
     args = parser.parse_args()
     require(socket.gethostname().split('.')[0]=='node14' and Path(sys.prefix)==host.ENV and args.attempt>0,
             'Unexpected host, conda environment or attempt')
-    from rule_framework.shared_experience import library_path
-    # The registered draws are already organized. Resolve their current materials on CPU.
-    print(library_path(RESULTS, f'n{args.size}_seed{args.seed}') / 'materials')
+    from rule_framework.shared_experience import reviewed_flat_library
+    print(reviewed_flat_library(RESULTS, f'n{args.size}_seed{args.seed}') / 'materials')
 
 
 if __name__=='__main__':

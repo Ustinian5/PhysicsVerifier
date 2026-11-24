@@ -1,4 +1,4 @@
-"""Resolve a shared-review scale library and verify its original independent tree receipts."""
+"""Locate a rebuilt flat library for a registered draw and verify historical tree receipts."""
 import argparse
 from collections import defaultdict
 import hashlib
@@ -104,7 +104,5 @@ if __name__ == '__main__':
     parser.add_argument('--apply-source-hold', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
     root = args.root.resolve()
-    from scripts.release_shared_experience import ensure_publication
-    from rule_framework.shared_experience import library_path
-    ensure_publication(root)
-    print(library_path(root, f'n{args.size}_seed{args.seed}') / 'materials')
+    from rule_framework.shared_experience import reviewed_flat_library
+    print(reviewed_flat_library(root, f'n{args.size}_seed{args.seed}') / 'materials')

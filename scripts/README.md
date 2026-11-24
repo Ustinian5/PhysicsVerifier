@@ -26,22 +26,23 @@
 
 题目级成绩统一运行 `python -m scripts.report_final_answer_metrics <已发布的结果 JSON>`。新版474题传 `metrics.json`，旧600题传 `final_metric_audit.json`，538题同题复算传 `archived_rescore.json`，评测题数曲线传 `sample_size_stability.json`。对当前成绩或538题复算加 `--paired`，可在保存原件的服务器核对各组相对纯组新检出和漏掉的错答。每张表以30B最终答案错误为正类，覆盖、弃权、内容失败及全体标错题检出率单列。[报告入口](report_final_answer_metrics.py) · [三项定义](../docs/效果测评.md#最终答案)
 
-当前三库使用11月7日同批120B首次核查。以下命令在 node14 项目根目录运行，使用个人 conda 的 CPU 环境。`publish` 从冻结原件发布全库与12个规模档，重复执行会核验已有发布。`verify` 复验全部材料及来源哈希，`locate` 输出指定档的材料目录。[发布入口](release_shared_experience.py)
+11月24日复核来源后，RAG 和 skills 在2000题全库及12个规模档按相同的首次核查记录重建。在 node14 项目根目录使用个人 conda，CPU 可从冻结的11月7日原始请求、响应和分词器回放。[重建与验收入口](rerun_reviewed_libraries.py)
 
 ```bash
 PV_BASE=/data0/zengzheni/PhysicsVerifier-huhengyuan
 PV_R="$PV_BASE/results/qwen30b_step_verifier"
 PV_PY="$PV_BASE/envs/physicsverifier/bin/python"
 export PYTHONPATH="$PWD:$PV_BASE/envs/physicsverifier/runtime/site-packages" PYTHONNOUSERSITE=1 CUDA_VISIBLE_DEVICES=""
-"$PV_PY" -m scripts.release_shared_experience verify --root "$PV_R"
-"$PV_PY" -m scripts.release_shared_experience locate --root "$PV_R" --library n2000
-"$PV_PY" -m scripts.run_verifier_library_scale --root "$PV_R" --size 1000 --seed 1247261125
-"$PV_PY" -m scripts.report_verifier_library_yields --root "$PV_R/shared_experience" --plot
+"$PV_PY" -m scripts.rerun_reviewed_libraries replay --root "$PV_R"
+"$PV_PY" -m scripts.rerun_reviewed_libraries groups --root "$PV_R" --source-mode reviewed
+"$PV_PY" -m scripts.rerun_reviewed_libraries verify --root "$PV_R"
+"$PV_PY" -m scripts.rerun_reviewed_libraries compare-tree-inputs --root "$PV_R"
+"$PV_PY" -m scripts.report_verifier_library_yields --root "$PV_R" --plot
 ```
 
-每档的 `materials/{cases,skills,catalog}.json` 为实际材料，`construction_acceptance.json` 绑定三库和 `sources.json`。总目录的 `source_reviews.json` 逐来源绑定30B原答、首次核查、skills请求和规则所据错误。`library_scale/` 保留原独立建树请求及旧批验收记录。产量报告读取预登记的三个随机种子，输出 `random_seed_yields.json` 和同名 PNG。[规模入口](run_verifier_library_scale.py) · [产量汇总](report_verifier_library_yields.py)
+当前材料在 `library_source_rerun_20261124/flat_reviewed/<档名>/materials/{cases,skills}.json`。`flat_release.json` 绑定13套材料，`group_sources.json` 有原抽样号和核查哈希，`tree_bundle.json` 保存待组织的规则候选。`shared_experience`、`library_scale` 及其树产量图供复现先前的三库。
 
-固定光纤开发题可在上述环境执行 `"$PV_PY" -m scripts.replay_skill_lookup --root "$PV_R/aligned_old99/final_revision"`。默认使用同批1000题库（种子1247261125，710条 skills），输出实际送达的材料、token 和 CHECK 输入哈希。检索重排开发工具 `scripts.probe_verifier_rerank` 使用同一开发题根目录，另传 `--id cl_202_125689 --arm case_rag` 或 `--arm flat_skills`，默认读取当前2000题全库，可用 `--library` 指定已验收规模档。两种回放均为 CPU 计算。[查库回放](replay_skill_lookup.py) · [候选与重排提示](probe_verifier_rerank.py)
+固定光纤开发题可运行 `"$PV_PY" -m scripts.replay_skill_lookup --root "$PV_R/aligned_old99/final_revision"`。默认使用1000题、种子1247261125的716条 skills。`scripts.probe_verifier_rerank` 使用同一开发题根目录，另传 `--id cl_202_125689 --arm case_rag` 或 `--arm flat_skills`，默认读取当前2000题全库，可用 `--library` 指定已验收规模档。两种回放均在 CPU 上进行。[查库回放](replay_skill_lookup.py) · [候选与重排提示](probe_verifier_rerank.py)
 
 需复验旧600题时，在服务器后台运行 `python -m scripts.audit_final_answer_metrics --root <旧600题目录> --output <个人临时目录>/recomputed.json --await-release`。重连核验 `recomputed.ready.json` 中的进程后创建同目录 `recomputed.ALLOW`。程序逐份核对2400份冻结结果，与原结果目录的 `final_metric_audit.json` 比较。[归档复算入口](audit_final_answer_metrics.py)
 

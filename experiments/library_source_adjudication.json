@@ -1,0 +1,87 @@
+{
+  "families_sha256": "57d4296ea30bcfef3d37e4ca176e50a7d1b69fd1b7876298efb43890fe04feff",
+  "human_gold": false,
+  "initial_isolation_sha256": "82a819a90d53932ad8941ce0122e780ec541f72e77db20ea5c76381f7e19611c",
+  "later_source_quarantine_sha256": "8c899e6d02a204a0bfd44fb82321c3662bde7fce9ae4bd325d68868a4996dbbe",
+  "new_scope_hold": {
+    "19ca0c4a6238c9bd0a9766214dc3054f88299d5097a5b50e12e4bc72c18f00f8": "weapon_use_calculation_outside_scope",
+    "4659f0d1c30facf22ee86b66b6edf9835b2c9eedab4d2cbb04c1de685ad7711c": "weapon_use_calculation_outside_scope",
+    "4ed1ff9c906aec51d77376697c7db8c598c1633bb24af3220f131ff09842f121": "weapon_use_calculation_outside_scope",
+    "785e6ff9413cd6cd11794fafb316cf40894a27c2dc43c6a5d47df3c3c007d6b0": "weapon_use_calculation_outside_scope",
+    "8457173ce1cf0bc777f93161c8cdc76c631d1050e707a693afedf12ffca9c14c": "designated_ground_trajectory_scope_unresolved",
+    "cbbfe15ffced7df58b85d2b6cbc27409df63baf4721cd4b039766a1ed9308e80": "weapon_use_calculation_outside_scope",
+    "cfb5fc2b61b5c1374817bdec9b662fde48d2af32fd9bcfbdcb670a12c19b93c5": "weapon_use_calculation_outside_scope",
+    "e6c4156a588f05d56cebca94b4569c48ad49041fe67559378da1e3510028c836": "weapon_use_calculation_outside_scope",
+    "ebe02fb4ba8c76e698549b3f538d342c3dc512cb3d07c1b4cd97c05ca23d96b0": "weapon_use_calculation_outside_scope",
+    "ff1f1ff84264936ad45c4faf3f3b51ee89245a9ebd49061c491afc4f11a616aa": "weapon_use_calculation_outside_scope"
+  },
+  "parent_phrase_review": {
+    "02ab6200bf096e7e2c0233c056d4bb6b608806eb1c457e208a92066eb67b863a": {
+      "question_sha256": "eb21e291452f63f28dfcdda4d4ecbeac08e80427494848473e264806ee687501",
+      "reason": "回指只用于题内自由落体的量纲举例。后面的霍金辐射问题给黑洞质量及所求量，并已说明量纲估算忽略无量纲系数。",
+      "status": "eligible"
+    },
+    "160258829515a8ba1fe0a2d15b7557fac3f843d0b65b7e4c06c5bf38c70e6812": {
+      "question_sha256": "078cade7249723561ff8d4056bc7f7e7ab1f528231317d26ae98e07cb4f601eb",
+      "reason": "前问只说明太空电梯的材料需求。本问给出管周键数、键距、莫尔斯势和断裂条件，可按整管截面估算抗拉强度。",
+      "status": "eligible"
+    },
+    "1f538d4720bb3af1dc08b0b33e819bdcfe2d9e599e981d82900288ed80403275": {
+      "question_sha256": "6605920d36462345683eb4da7eb3aa2a9031620a87bd74aa35f263eb9a0a121d",
+      "reason": "数值无需给出，但方程所需的 X₁、平移和电荷的基准态来自前问，当前题干没有定义。",
+      "status": "missing_input"
+    },
+    "487cbb4c411d1637abe51f3e5f79c1d527ea71cc2489fbabd18168e75c141561": {
+      "question_sha256": "5091912cb3fd5ad78d57d07a119737b55bd3aa54d770565662bc75e47d06192f",
+      "reason": "所求为产生给定流量的符号压差。当前题干已给均匀渗透率、流体性质、圆柱形油层和边界压力。",
+      "status": "eligible"
+    },
+    "67039c296ed163c06ac35f23fb4960c224d14fd1525d02be2de2d58b04cbbf29": {
+      "question_sha256": "eeec435689424c42067d783dfa9075548b44c5a3559875c34c2a16878cf1c3cb",
+      "reason": "前问只解释材料选择。本问给出管周键数、键距、轴向几何、莫尔斯势及谐振近似，可按整管截面求有效杨氏模量。",
+      "status": "eligible"
+    },
+    "9a907cd1b3eb7030fd4195deeea0d3a6e0a3f77fb39db2d8c2062b526adffe8f": {
+      "question_sha256": "e84455b3c0840311af461405ebf66fe9df7a0e3b28be0a8f044e3bece84771ba",
+      "reason": "数值弛豫时间和周期数依赖最终气体平衡态。题内缺少确定该状态的初始活塞速度或等价终态数据。",
+      "status": "missing_input"
+    },
+    "9a9b8761acdc17a279c1c3a328ed246c74866a39a45747f9fdb20f041c4c23cd": {
+      "question_sha256": "9eb6991e51ab98bdfec25a20303636d84a8f9cf7a20e953d8fb739dac0a4aaab",
+      "reason": "氩气活塞的近似、初态和初速度均在本题给出，可以求终态位置和温度。",
+      "status": "eligible"
+    },
+    "9ffe01ef14d617dbbd921790968d2f706b042734b82d365807fc07e61020041c": {
+      "question_sha256": "12c0797e2076437e34a58ad78cf789d852a26177b99f8c5c89c857b333336aad",
+      "reason": "井内流速可求，但源题还要求估算数值的地层近井流速，所需地层厚度只有符号，当前题干没有给数值。",
+      "status": "missing_input"
+    },
+    "a90c48152d67bb89917834408d05bc5a5c28cf83f72aa8d64e23718b75a1d479": {
+      "question_sha256": "295ba937a8b910a654ab75d385431fa77073623cecd37af9d09f2e0c9f8b50b8",
+      "reason": "题干指定使用前问得到的表面张力，或改用所附数据表。两者的数值都不在输入中，无法唯一复现所求数值。",
+      "status": "missing_input"
+    },
+    "b5cc73ca90eaf3a96f414d426659c071233a1a348a67fb9ac1422f1353b0c738": {
+      "question_sha256": "904940eb3e503dd246e730def7e58c379e3276bb7d41ea58dcb987067ebd6e43",
+      "reason": "量纲分析中的回指指题内自由落体例题；本问另给宇宙背景温度和热平衡条件。",
+      "status": "eligible"
+    },
+    "b66d63134772d7a1ba4179a3ca66a0ad1112bd1e8131f59b8baaa270aafe2ba7": {
+      "question_sha256": "1e50d7d8504dc178974f5612986c8593dca929996bfa4e1418de2c8fb3ec8054",
+      "reason": "明确要求熵变的数值。当前题干给初始温度和高度，却未给活塞初速度或等价的最终态数据。",
+      "status": "missing_input"
+    },
+    "cd3ab9ed0e8f58f0ad3787f8de58ccb1e830e882be8409487889fb3b4af8e425": {
+      "question_sha256": "0b8a1addc261529aaab96f58a614a636fe1fe01b8397379e84338fec10ec2daa",
+      "reason": "初始小倾角、半圆柱几何、质心位置和转动惯量都已给出，可把初始角记作符号求所需静摩擦系数。",
+      "status": "eligible"
+    },
+    "ddaae54750f2d33082a5a7cda9fea4484e53805f95de882d0a2a4520afdf52d2": {
+      "question_sha256": "1ae940953b1a696ba813c9d24e4a58d1005301b1ba2c84187da208161d24b08f",
+      "reason": "两长圆管的半径、轴线位置和恒定电位都写在本题，可由这些边界条件重建等势面。",
+      "status": "eligible"
+    }
+  },
+  "scope": "Source eligibility for same-review libraries. Decisions use the frozen public question and the requested answer type. No 30B diagnoses, skill quality or benchmark scores select items.",
+  "split_sha256": "899d29698618bf87f228673a6bcd2444007f7ed49fbb5deb09ecd21f748f9f58"
+}
