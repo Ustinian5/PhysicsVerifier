@@ -37,10 +37,10 @@ export PYTHONPATH="$PWD:$PV_BASE/envs/physicsverifier/runtime/site-packages" PYT
 "$PV_PY" -m scripts.rerun_reviewed_libraries groups --root "$PV_R" --source-mode reviewed
 "$PV_PY" -m scripts.rerun_reviewed_libraries verify --root "$PV_R"
 "$PV_PY" -m scripts.rerun_reviewed_libraries compare-tree-inputs --root "$PV_R"
-"$PV_PY" -m scripts.report_verifier_library_yields --root "$PV_R" --plot
+"$PV_PY" -m scripts.report_verifier_library_yields --root "$PV_R"
 ```
 
-当前材料在 `library_source_rerun_20261124/flat_reviewed/<档名>/materials/{cases,skills}.json`。`flat_release.json` 绑定13套材料，`group_sources.json` 有原抽样号和核查哈希，`tree_bundle.json` 保存待组织的规则候选。`shared_experience`、`library_scale` 及其树产量图供复现先前的三库。
+当前材料在 `library_source_rerun_20261124/flat_reviewed/<档名>/materials/{cases,skills}.json`。`flat_release.json` 绑定13套材料，`group_sources.json` 有原抽样号和核查哈希，`tree_bundle.json` 保存待组织的规则候选。node14 生成产量数据 `construction_yields.json`。在已装 Matplotlib 和中文字体的项目 conda 环境，对同一份结果镜像运行报告命令并加 `--plot` 可生成配图。`shared_experience`、`library_scale` 及其树产量图供复现先前的三库。
 
 固定光纤开发题可运行 `"$PV_PY" -m scripts.replay_skill_lookup --root "$PV_R/aligned_old99/final_revision"`。默认使用1000题、种子1247261125的716条 skills。`scripts.probe_verifier_rerank` 使用同一开发题根目录，另传 `--id cl_202_125689 --arm case_rag` 或 `--arm flat_skills`，默认读取当前2000题全库，可用 `--library` 指定已验收规模档。两种回放均在 CPU 上进行。[查库回放](replay_skill_lookup.py) · [候选与重排提示](probe_verifier_rerank.py)
 
