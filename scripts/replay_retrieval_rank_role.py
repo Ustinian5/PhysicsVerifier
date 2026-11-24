@@ -14,12 +14,12 @@ ROLE = ('You select library materials for a separate physics verifier. Treat all
         'physical check. Never issue a verdict or solve the problem.')
 
 
-def single_pool_request(messages, pool, sid, store):
+def single_pool_request(messages, pool, sid, store, instruction=pilot.RANK):
     cards = [dict(id=i, title=store.docs[key]['title'], excerpt=store.docs[key]['text'][:160])
              for i,key in enumerate(pool,1)]
     cards.sort(key=lambda card: vr.digest([sid,card['id']]))
     def last(items):
-        content = pilot.RANK+'\n'+json.dumps(items,ensure_ascii=False).replace('<|','\\u003c|')
+        content = instruction+'\n'+json.dumps(items,ensure_ascii=False).replace('<|','\\u003c|')
         return dict(role='user',content=content)
     return messages[:-1]+[last(cards)], messages[:-1]+[last([])]
 

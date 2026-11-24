@@ -33,8 +33,8 @@ RUBRIC = (
 SKILL_SHA = '6e11ffe22058f74ee317e7342f84e01d31ffa30595c024a6eb37c1d81efee6d2'
 
 
-def top24(memory, query):
-    remaining = set(memory.ids)
+def top24(memory, query, allowed_ids=None):
+    remaining = set(memory.ids if allowed_ids is None else allowed_ids)
     ids = []
     while len(ids) < 24:
         hits = memory.search(query, allowed_ids=remaining)

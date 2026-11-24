@@ -56,7 +56,7 @@ def score(folder):
                 ('design.json','summary.json','blind.json','relevance_rubric.json','relevance.json')}, human_gold=False)
 
 
-def score_confirmation(folder):
+def score_confirmation(folder, cohort=None, design_folder=None):
     from math import comb
     from random import Random
     from statistics import mean
@@ -65,9 +65,11 @@ def score_confirmation(folder):
     rows = vr.read(folder/'summary.json')
     pools = vr.read(folder/'blind.json')
     labels = vr.read(folder/'relevance.json')
-    design = vr.read(folder/'design.json')
-    inputs = vr.read(folder/'inputs.json')
-    assert vr.sha(folder/'inputs.json')==design['input_sha256']
+    cohort = folder if cohort is None else cohort
+    design_folder = folder if design_folder is None else design_folder
+    design = vr.read(design_folder/'design.json')
+    inputs = vr.read(cohort/'inputs.json')
+    assert vr.sha(cohort/'inputs.json')==design['input_sha256']
     assert set(rows)==set(pools)==set(labels)=={r['id'] for r in inputs}
     counts = {m:Counter() for m in METHODS}
     paired = {m:{} for m in METHODS}
@@ -102,7 +104,8 @@ def score_confirmation(folder):
             mean_gain=mean(delta),paired_bootstrap_95=[bootstrap[249],bootstrap[9749]],exact_two_sided_sign_p=p,
             downstream_transitions=dict(changed))
     return dict(groups=counts,comparisons=comparisons,human_gold=False,
-                hashes={n:vr.sha(folder/n) for n in ('inputs.json','design.json','rubric.json','relevance.json','blind.json','summary.json')})
+                hashes={f.name:vr.sha(f) for f in (cohort/'inputs.json',design_folder/'design.json',
+                    cohort/'rubric.json',folder/'relevance.json',folder/'blind.json',folder/'summary.json')})
 
 
 if __name__ == '__main__':
