@@ -25,6 +25,36 @@ def paired_false_positives(base, other):
                 exact_p=p)
 
 
+def compare_final_requests(folder, rows):
+    """Post hoc comparison of the final CHECK bodies for relation and RRF."""
+    same_messages = 0
+    same_body = 0
+    flipped = {}
+    for q, arms in rows.items():
+        methods = ('relation', 'rrf')
+        if any(arms[m]['status'] != 'complete' for m in methods):
+            continue
+        paths = [folder/'rows'/q/m/'check' for m in methods]
+        bodies = [vr.read(p/'request.json')['request'] for p in paths]
+        if bodies[0]['messages'] != bodies[1]['messages']:
+            continue
+        require(arms['relation']['ids'] == arms['rrf']['ids'], 'Identical CHECK messages with different material IDs')
+        same_messages += 1
+        same_body += int(bodies[0] == bodies[1])
+        if arms['relation']['verdict'] == arms['rrf']['verdict']:
+            continue
+        keys = bodies[0].keys() | bodies[1].keys()
+        differing_fields = sorted(k for k in keys if bodies[0].get(k) != bodies[1].get(k))
+        responses = {}
+        for method, path, body in zip(methods, paths, bodies):
+            result = vr.read(path/'result.json')
+            raw = vr.read(path/'raw.json')
+            responses[method] = dict(verdict=result['value']['verdict'], max_tokens=body['max_tokens'],
+                                     generated=result['usage']['completion_tokens'], finish=raw['choices'][0]['finish_reason'])
+        flipped[q] = dict(delivered=len(arms['relation']['ids']), fields=differing_fields, responses=responses)
+    return dict(same_messages=same_messages, same_body=same_body, verdict_flips=flipped)
+
+
 def score(root):
     out=root/trial.RESULT
     cohort=root/trial.PARENT
@@ -69,7 +99,8 @@ def score(root):
             counts.update(operational)
         report['arms'][arm]=dict(retrieval=new,false_positives=false_positives,fp_vs_bm25={m:paired_false_positives(verdicts['bm25'],v)
             for m,v in verdicts.items() if m!='bm25'}, fp_relation_vs_rrf=paired_false_positives(verdicts['relation'],verdicts['rrf']),
-            fp_vs_pure={m:paired_false_positives(pure,v) for m,v in verdicts.items()})
+            fp_vs_pure={m:paired_false_positives(pure,v) for m,v in verdicts.items()},
+            posthoc_relation_rrf_request_comparison=compare_final_requests(folder,rows))
         if is_new:
             for m in ('relation','rrf'):
                 pvalues[arm+'/'+m]=new['comparisons'][m+'_vs_bm25']['exact_two_sided_sign_p']
