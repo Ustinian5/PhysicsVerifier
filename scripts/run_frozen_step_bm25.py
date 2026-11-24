@@ -2,6 +2,7 @@
 import argparse
 from collections import Counter
 from pathlib import Path
+import re
 import time
 from unittest.mock import patch
 
@@ -21,6 +22,57 @@ ACCEPTANCE = '53bc6feaf2593d1c8ecda717e351b5418a2b6fec49a51a8a5d4256e716889005'
 INPUTS = 'ebbbe347e2afe84fa9a8ae148fb1796979461e08363daf8eb5841f7e2926a327'
 LABELS = 'd1b1aff4353c7b9728b06372262b9dbf95b62e9500a35de6f56bdf73ef899f3f'
 PLAN = '94c615022ce87d64722b80011ce91f9d858792b3ea80757739d04e183b606ea4'
+RECIPIENT_ERROR = 'ValueError: Unregistered actual Harmony recipient'
+
+
+def unoffered_tool_output(parsed):
+    """A completed tool yield without a final diagnosis in a tool-free CHECK."""
+    messages = list(parsed.messages)
+    return bool(messages and not parsed.current_content
+                and all(m.channel == 'analysis' and not m.recipient for m in messages[:-1])
+                and messages[-1].channel in ('analysis', 'commentary')
+                and re.fullmatch(r'[a-zA-Z_][\w]*(?:\.[a-zA-Z_][\w]*)*', messages[-1].recipient or ''))
+
+
+def inspect_check_failure(path):
+    value = vr.read(path)
+    if value.get('failure_reason') != RECIPIENT_ERROR:
+        return step.old.a.native.inspect_failure(path)
+    base.runtime.audit_result(value)
+    require(value['status'] == 'failed' and value['diagnostics'] == []
+            and value['configuration_sha256'] == verify()['configuration_sha256'], 'Unexpected failed outcome')
+    state = vr.read(path.with_name('state.json'))
+    turn = path.parent / 'turn_02'
+    paths = [turn / n for n in ('request.json', 'response.sse', 'response.json')]
+    require(state['turn'] == 1 and state['sample_id'] == value['id']
+            and [state['pending'][k] for k in ('request_path', 'raw_path', 'response_path')] == list(map(str, paths)),
+            'Expected the first CHECK immediately after the frozen PREPARE')
+    envelope, raw, response = map(vr.read, paths)
+    request = envelope['request']
+    require(envelope['request_sha256'] == base.r.sha256_value(request) and 'tools' not in request
+            and 'tool_choice' not in request and request['model'] == base.r.EXPECTED_MODEL
+            and request['max_tokens'] == state['pending']['max_tokens']
+            and response.get('http_status') == 200 and response.get('error') == RECIPIENT_ERROR
+            and response.get('model_ids') == [request['model']] and raw['model'] == request['model']
+            and response['raw_sse_sha256'] == vr.sha(paths[1]) and response['usage'] == raw['usage'],
+            'Unverified request, transport, model or usage')
+    try:
+        base.decode_response(raw, model=request['model'], max_tokens=request['max_tokens'], native_tools=None)
+    except ValueError as exc:
+        require('ValueError: ' + str(exc) == RECIPIENT_ERROR, 'Different frozen-decoder error')
+    else:
+        raise ValueError('A valid diagnosis must not be discarded')
+    from vllm.entrypoints.harmony_utils import parse_output_into_messages
+    tokens = raw['choices'][0]['token_ids']
+    require(tokens[-1] == 200012 and unoffered_tool_output(parse_output_into_messages(tokens))
+            and len(raw['prompt_token_ids']) == raw['usage']['prompt_tokens']
+            and raw['usage']['total_tokens'] == raw['usage']['prompt_tokens'] + len(tokens)
+            and str(paths[0]) not in {e['request_path'] for e in value['trace']['response_evidence']},
+            'Not an isolated, uncounted model tool yield')
+    return dict(id=value['id'], result_sha256=vr.sha(path), request_path=str(paths[0]), usage=raw['usage'],
+                files={str(p): vr.sha(p) for p in (path, path.with_name('state.json'), *paths)},
+                status='failed_content_preserved', failure_reason=RECIPIENT_ERROR, new_model_calls=0,
+                content_modified=False)
 
 
 def verify(out=ROOT):
@@ -113,7 +165,8 @@ def collect(phase, tasks, rows, plan, tokenizer, memories, client):
         value, _ = step.prefix_at(parent, row)
         return dict(value, configuration_sha256=current['configuration_sha256'])
     controls, counts = {}, Counter()
-    with step.revised(ROOT, plan, tokenizer), patch.object(base, 'query', frozen_query):
+    with step.revised(ROOT, plan, tokenizer), patch.object(base, 'query', frozen_query), \
+            patch.object(step.old.a.bench.recovery, 'inspect_failure', inspect_check_failure):
         for i, t in enumerate(tasks, 1):
             require(not (sources.OUTPUT / 'STOP').exists(), 'STOP requested')
             sid, arm = t['id'], t['arm']
