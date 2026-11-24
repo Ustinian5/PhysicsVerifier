@@ -3,6 +3,7 @@ import argparse
 import json
 from pathlib import Path
 
+from rule_framework import shared_experience as shared
 from scripts import run_final_answer_revision as final
 from scripts.analyze_verifier_knowledge_groups import checked_json
 
@@ -23,7 +24,7 @@ def selected_ids(response, allowed, limit):
     return ids
 
 
-def probe(root, sid, arm, selection=None):
+def probe(root, sid, arm, selection=None, *, library='n2000'):
     from transformers import AutoTokenizer
 
     plan = final.vr.read(root / 'plan.json')
@@ -40,14 +41,26 @@ def probe(root, sid, arm, selection=None):
     packet = checked_json(root / 'pilot' / arm / final.vr.digest(sid)[:24] / 'reference_packet.json', accepted['files'])
     queries = json.loads(packet['messages'][2]['content'])
     name = {'case_rag': 'cases', 'flat_skills': 'skills'}[arm]
-    file = root / (name + '.json')
-    store = final.base.p.FlatMemory(checked_json(file, {str(file): c['material_hashes'][name]}))
+    if library is None:
+        file = root / (name + '.json')
+        material_hash = c['material_hashes'][name]
+    else:
+        directory = shared.library_path(root.parent.parent, library)
+        file = directory / 'materials' / (name + '.json')
+        material_hash = final.vr.read(directory / 'construction_acceptance.json')['materials'][file.name]
+    store = final.base.p.FlatMemory(checked_json(file, {str(file): material_hash}))
     tokenizer = AutoTokenizer.from_pretrained(c['model'], local_files_only=True, trust_remote_code=False)
 
-    def size(refs):
-        messages = final.p.continuation_messages(row, queries, refs, arm=arm)
+    def count(messages):
         return len(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, reasoning_effort='medium'))
 
+    def size(refs):
+        return count(final.p.continuation_messages(row, queries, refs, arm=arm))
+
+    baseline = final.p.reference_packet(row, arm, queries, store, count)
+    final.require(baseline['messages'][:3] == packet['messages'][:3], 'Frozen PREPARE changed')
+    if library is None:
+        final.require(baseline == packet, 'Archived baseline replay changed')
     base = size([])
     cap = min(base + c['contract']['reference_token_cap'], c['limits']['context_window'] - c['limits']['output_tokens_per_sample'])
     limit = c['contract']['max_items']
@@ -64,7 +77,8 @@ def probe(root, sid, arm, selection=None):
             if size([doc]) > cap:
                 continue
             if name == 'cases':
-                _, marker, note = doc['text'].partition('120B解题/纠错说明\n')
+                heading = '120B原始核查说明\n' if library is not None else '120B解题/纠错说明\n'
+                _, marker, note = doc['text'].rpartition(heading)
                 final.require(marker, 'Case has no original audit note')
                 excerpt = note.partition('\n未决事项')[0]
             else:
@@ -87,11 +101,10 @@ def probe(root, sid, arm, selection=None):
     payload = dict(question=row['question'], queries=queries['queries'], candidates=cards)
     ranker_messages = [dict(role='system', content=PROMPT),
                        dict(role='user', content=json.dumps(payload, ensure_ascii=False).replace('<|', '\\u003c|'))]
-    ranker_tokens = len(tokenizer.apply_chat_template(ranker_messages, tokenize=True, add_generation_prompt=True,
-                                                      reasoning_effort='medium'))
+    ranker_tokens = count(ranker_messages)
     report = dict(development_id=sid, arm=arm, model_calls=0, candidate_ids=ids,
-                  baseline_ids=packet['retrieval']['provided_complete_ids'],
-                  lexical_control_ids=[d['id'] for d in pack(ids)], material_sha256=c['material_hashes'][name],
+                  library=library or 'archived_pilot', baseline_ids=baseline['retrieval']['provided_complete_ids'],
+                  lexical_control_ids=[d['id'] for d in pack(ids)], material_sha256=material_hash,
                   ranker_input_tokens=ranker_tokens, ranker_messages=ranker_messages)
     if selection is not None:
         refs = pack(selected_ids(selection, set(ids), limit))
@@ -105,7 +118,11 @@ if __name__ == '__main__':
     parser.add_argument('--root', type=Path, required=True, help='Frozen final_revision pilot directory')
     parser.add_argument('--id', required=True)
     parser.add_argument('--arm', required=True, choices=('case_rag', 'flat_skills'))
+    libraries = parser.add_mutually_exclusive_group()
+    libraries.add_argument('--library', default='n2000', help='Registered shared-review library')
+    libraries.add_argument('--archived-pilot-materials', action='store_true', help='Reproduce the original pilot')
     parser.add_argument('--selection', type=Path, help='Optional ordered_ids JSON to render a development CHECK')
     args = parser.parse_args()
     value = final.vr.read(args.selection) if args.selection else None
-    print(json.dumps(probe(args.root.resolve(), args.id, args.arm, value), ensure_ascii=False))
+    library = None if args.archived_pilot_materials else args.library
+    print(json.dumps(probe(args.root.resolve(), args.id, args.arm, value, library=library), ensure_ascii=False))

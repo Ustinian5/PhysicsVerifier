@@ -5,6 +5,7 @@ import unicodedata
 from pathlib import Path
 
 from rule_framework import final_answer_revision as protocol
+from rule_framework import shared_experience
 from rule_framework import verified_resume as vr
 
 PROMPT = (
@@ -122,7 +123,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', required=True, type=Path, help='Frozen final_revision development root on node14')
     parser.add_argument('--id', default=DEMO_ID)
-    parser.add_argument('--library', type=Path, help='Accepted library scale directory; default n1000_seed1247261125')
+    parser.add_argument('--library', type=Path, help='Explicit library directory; defaults to the shared-review 1000-question library')
     parser.add_argument('--actions', type=Path, help='JSON array; default is the hand-written optical-fiber example')
     args = parser.parse_args()
     root = args.root.resolve()
@@ -130,15 +131,21 @@ def main():
     config = plan['configuration']
     protocol.require(vr.digest(config) == plan['configuration_sha256'], 'Configuration changed')
     protocol.require(vr.sha(root/'pilot_inputs.json') == config['pilot_sha256'], 'Frozen pilot inputs changed')
-    library = (args.library or root.parent.parent/'library_scale/n1000_seed1247261125').resolve()
+    library = (args.library.resolve() if args.library else
+               shared_experience.library_path(root.parent.parent, 'n1000_seed1247261125'))
     publication = vr.read(library/'construction_acceptance.json')
-    library_plan = vr.read(library/'plan.json')
     skill_file = library/'materials/skills.json'
     skill_hash = vr.sha(skill_file)
-    protocol.require(publication['passed'] and vr.digest(library_plan['configuration']) ==
-                     library_plan['configuration_sha256'] == publication['configuration_sha256'] and
-                     vr.sha(library/'material_isolation.json') == publication['material_isolation_sha256'] and
-                     skill_hash == publication['materials']['skills.json'], 'Wrong library release')
+    if publication.get('protocol') == shared_experience.PROTOCOL:
+        if args.library:
+            protocol.require(shared_experience.library_path(library.parent.parent, library.name) == library,
+                             'Library outside the shared release')
+    else:
+        library_plan = vr.read(library/'plan.json')
+        protocol.require(args.library and publication['passed'] and vr.digest(library_plan['configuration']) ==
+                         library_plan['configuration_sha256'] == publication['configuration_sha256'] and
+                         vr.sha(library/'material_isolation.json') == publication['material_isolation_sha256'] and
+                         skill_hash == publication['materials']['skills.json'], 'Wrong historical library release')
     row, = (r for r in vr.read(root/'pilot_inputs.json') if r['id'] == args.id)
     acceptance = vr.read(root/'pilot_acceptance.json')
     packet = root/'pilot/flat_skills'/vr.digest(args.id)[:24]/'reference_packet.json'
@@ -149,15 +156,19 @@ def main():
     queries = json.loads(prefix[2]['content'])
     protocol.require(protocol.continuation_messages(row, queries, [], arm='flat_skills')[:3] == prefix,
                      'Frozen PREPARE prefix differs')
-    protocol.require(args.actions or (args.id == DEMO_ID and skill_hash ==
-                     '634efb38bf73fe745e4731d2d408701e2bb55bdef6bd03d9ebefd55e69f8ce83'),
-                     'Supply actions for a different question or library')
+    if args.actions:
+        actions = vr.read(args.actions)
+    else:
+        # These two procedures come from the same source problem in the two frozen libraries.
+        demo_item = {'634efb38bf73fe745e4731d2d408701e2bb55bdef6bd03d9ebefd55e69f8ce83': 'S604',
+                     '6e11ffe22058f74ee317e7342f84e01d31ffa30595c024a6eb37c1d81efee6d2': 'S118'}
+        protocol.require(args.id == DEMO_ID and skill_hash in demo_item, 'Supply actions for this question or library')
+        actions = [*DEMO[:2], {'select': [demo_item[skill_hash]]}]
     tokenizer = AutoTokenizer.from_pretrained(config['model'], local_files_only=True, trust_remote_code=False)
     def count(messages):
         return len(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
                                                  reasoning_effort='medium'))
-    result = replay(row, queries, vr.read(skill_file), vr.read(args.actions) if args.actions else DEMO,
-                    count, config)
+    result = replay(row, queries, vr.read(skill_file), actions, count, config)
     result.update(script_sha256=vr.sha(__file__), skills_sha256=skill_hash, pilot_packet_sha256=vr.sha(packet),
                   library_acceptance_sha256=vr.sha(library/'construction_acceptance.json'))
     print(json.dumps(result, ensure_ascii=False, indent=2))

@@ -1,6 +1,6 @@
 # 脚本入口
 
-当前474题最终答案评测使用 `scripts.run_final_answer_revision`。原题、30B回答、参考、三库及实验参数均由准备配置绑定。node14 的正式入口复用已通过固定6题验收的服务与个人互斥锁。[题目级执行器](run_final_answer_revision.py) · [项目进展](../docs/项目进展.md)
+已完成的11月21日474题最终答案评测使用 `scripts.run_final_answer_revision`。原题、30B回答、参考、三库及实验参数均由准备配置绑定。node14 的正式入口复用已通过固定6题验收的服务与个人互斥锁。[题目级执行器](run_final_answer_revision.py) · [项目进展](../docs/项目进展.md)
 
 | 环节 | 服务器入口与产物 |
 |---|---|
@@ -26,17 +26,26 @@
 
 题目级成绩统一运行 `python -m scripts.report_final_answer_metrics <已发布的结果 JSON>`。新版474题传 `metrics.json`，旧600题传 `final_metric_audit.json`，538题同题复算传 `archived_rescore.json`，评测题数曲线传 `sample_size_stability.json`。对当前成绩或538题复算加 `--paired`，可在保存原件的服务器核对各组相对纯组新检出和漏掉的错答。每张表以30B最终答案错误为正类，覆盖、弃权、内容失败及全体标错题检出率单列。[报告入口](report_final_answer_metrics.py) · [三项定义](../docs/效果测评.md#最终答案)
 
-在线选材的操作样例在 node14 的个人 conda 运行 `python -m scripts.replay_skill_lookup --root /data0/zengzheni/PhysicsVerifier-huhengyuan/results/qwen30b_step_verifier/aligned_old99/final_revision`。默认回放冻结光纤开发题和种子1247261125的1000题skills库。传 `--actions` 可替换手拟搜索和选择动作。程序输出候选、实际送达ID、token和CHECK输入哈希，模型调用为0。[动作格式与回放](replay_skill_lookup.py)
+当前三库使用11月7日同批120B首次核查。以下命令在 node14 项目根目录运行，使用个人 conda 的 CPU 环境。`publish` 从冻结原件发布全库与12个规模档，重复执行会核验已有发布。`verify` 复验全部材料及来源哈希，`locate` 输出指定档的材料目录。[发布入口](release_shared_experience.py)
 
-开发集的检索重排原型可通过 `python -m scripts.probe_verifier_rerank --root <final_revision绝对路径> --id cl_202_125689 --arm case_rag` 生成候选与120B重排提示。支持 `flat_skills`。加 `--selection <含ordered_ids的JSON>` 可重建同会话的全文CHECK。该工具只读取固定开发题和本地分词器，模型调用为0。[适用条件重排](probe_verifier_rerank.py) · [按来源题数及全文预算盘点](audit_verifier_library_capacity.py)
+```bash
+PV_BASE=/data0/zengzheni/PhysicsVerifier-huhengyuan
+PV_R="$PV_BASE/results/qwen30b_step_verifier"
+PV_PY="$PV_BASE/envs/physicsverifier/bin/python"
+export PYTHONPATH="$PWD:$PV_BASE/envs/physicsverifier/runtime/site-packages" PYTHONNOUSERSITE=1 CUDA_VISIBLE_DEVICES=""
+"$PV_PY" -m scripts.release_shared_experience verify --root "$PV_R"
+"$PV_PY" -m scripts.release_shared_experience locate --root "$PV_R" --library n2000
+"$PV_PY" -m scripts.run_verifier_library_scale --root "$PV_R" --size 1000 --seed 1247261125
+"$PV_PY" -m scripts.report_verifier_library_yields --root "$PV_R/shared_experience" --plot
+```
 
-250、500、1000题独立建库使用 `python -m scripts.run_verifier_library_scale --root <node14题目级结果根> --size <题数> --seed <种子>`。同一种子的较大档保留较小档的全部题族，逐档核对预登记题号哈希。从入选来源的逐题30B回答及120B结果重建案例、skills和规则候选，每档重新去重、从空树组织。在服务器后台运行 `python -m scripts.run_node14_library_scale run --size <题数> --seed <种子> --gpu <卡号> --attempt <序号>`，退出SSH后重新连接，用相同参数执行 `confirm`。各档在 `library_scale/n<题数>_seed<种子>/` 单独保存原件、断点及三库，服务端口按题数和种子区分。查看 `construction_acceptance.json` 与该次 `attempts/<序号>/release.json` 核实建库和显卡释放。发布后在服务器CPU运行 `python -m scripts.audit_verifier_library_scale --output <单组结果目录>`，从空树重放全部原始请求，核对实际输入和完整目录。[独立建库](run_verifier_library_scale.py) · [节点执行器](run_node14_library_scale.py) · [原始请求回放](audit_verifier_library_scale.py)
+每档的 `materials/{cases,skills,catalog}.json` 为实际材料，`construction_acceptance.json` 绑定三库和 `sources.json`。总目录的 `source_reviews.json` 逐来源绑定30B原答、首次核查、skills请求和规则所据错误。`library_scale/` 保留原独立建树请求及旧批验收记录。产量报告读取预登记的三个随机种子，输出 `random_seed_yields.json` 和同名 PNG。[规模入口](run_verifier_library_scale.py) · [产量汇总](report_verifier_library_yields.py)
 
-三组新增随机种子由系统随机源一次抽取，先登记种子，再登记九档题号的哈希。抽中隔离题时保留原题号，剔除它和它的派生材料，按实记数。九档全部回放后，运行 `python -m scripts.report_verifier_library_yields --root <library_scale目录> --plot`，核对嵌套来源和材料，生成 `random_seed_yields.json` 及 `random_seed_yields.png`。报告逐档保留隔离、失败和未入树项，并给出同一规模下三个随机种子的产量范围。[随机种子及抽样登记](../experiments/library_scale_random_seeds.json) · [三库产量汇总](report_verifier_library_yields.py)
+固定光纤开发题可在上述环境执行 `"$PV_PY" -m scripts.replay_skill_lookup --root "$PV_R/aligned_old99/final_revision"`。默认使用同批1000题库（种子1247261125，710条 skills），输出实际送达的材料、token 和 CHECK 输入哈希。检索重排开发工具 `scripts.probe_verifier_rerank` 使用同一开发题根目录，另传 `--id cl_202_125689 --arm case_rag` 或 `--arm flat_skills`，默认读取当前2000题全库，可用 `--library` 指定已验收规模档。两种回放均为 CPU 计算。[查库回放](replay_skill_lookup.py) · [候选与重排提示](probe_verifier_rerank.py)
 
 需复验旧600题时，在服务器后台运行 `python -m scripts.audit_final_answer_metrics --root <旧600题目录> --output <个人临时目录>/recomputed.json --await-release`。重连核验 `recomputed.ready.json` 中的进程后创建同目录 `recomputed.ALLOW`。程序逐份核对2400份冻结结果，与原结果目录的 `final_metric_audit.json` 比较。[归档复算入口](audit_final_answer_metrics.py)
 
-11月14日的材料恢复入口为[run_aligned_organization.py](run_aligned_organization.py)：`prepare --output <独立恢复目录> --legacy <已完成旧99目录> --current <已完成更正批次>`只绑定输入和离线核验396份原始请求；`verify`不调用模型。服务器后台`pilot`运行12来源的原case_note/skills和36份工程/开发检查，退出启动SSH后用`confirm-detached`从新连接放行；通过后`build`可按原协议补齐材料，成功项不重跑。该材料入口不执行formal；正式入口见下方run_aligned_step_evaluation，旧协调器不恢复。旧树算法、全文注入、共享PREPARE、同上下文CHECK及每题预算直接复用旧实现；旧解码器从哈希核验的Git版本载入内存，不另存源码副本。服务使用固定日期入口，PV_HARMONY_DATE=2026-11-03；此流程无原生search/read工具消息，不需要工具适配服务。
+11月14日按旧99题流程单独生成 case_note 的材料用于复现11月21日及此前已发布的测评。归档代码 `run_aligned_organization.py` 的 `verify` 可离线核验旧材料，模型系统日期为2026-11-03。[旧材料原件入口](run_aligned_organization.py)
 
 11月15日材料补齐核验入口：[audit_aligned_organization.py](audit_aligned_organization.py)。在服务器个人conda后台执行`python -m scripts.audit_aligned_organization --output <恢复目录>`，核对全部原始材料请求、渲染、来源、试跑原件及完整库输入边界，禁止模型POST请求，不修改冻结材料。只更新readiness_audit.json及进度；正文明确区分材料验证与正式评测放行。修正前报告formal_ready=false记录了来源筛查、标签收尾和正式入口三项缺口；该原报告不改写，后续修正依据见evaluation/发布证据。不能直接调用硬编码旧99标签的score函数。
 
