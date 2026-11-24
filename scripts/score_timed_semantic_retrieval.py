@@ -67,6 +67,34 @@ def checked_result(folder, q, stamp):
     return r, vr.sha(path)
 
 
+def completed_index(rows, arm):
+    if arm == 'rule_tree':
+        return dict(routed_to_a_final_selection=sum('selection' in r['files'] for r in rows.values()))
+    size = {'case_rag':729, 'flat_skills':1452}[arm]
+    sizes = [timing.semantic.FIRST_PAGE_SIZE]
+    remaining = size-sizes[0]
+    while remaining:
+        page = min(remaining, timing.semantic.PAGE_SIZE)
+        sizes.append(page)
+        remaining -= page
+    exposure = {}
+    for q, row in rows.items():
+        stages = row['stage_times']
+        seen = sum(n for i,n in enumerate(sizes,1) if f'semantic_page_{i}' in stages)
+        valid = sum(n for i,n in enumerate(sizes,1)
+                    if stages.get(f'semantic_page_{i}',{}).get('status') == 'complete')
+        exposure[q] = dict(seen=seen, successfully_ranked=valid)
+    return dict(size=size, fully_seen=sum(v['seen']==size for v in exposure.values()),
+                fully_ranked=sum(v['successfully_ranked']==size for v in exposure.values()), by_question=exposure)
+
+
+def matched_times(outputs):
+    common = set.intersection(*(set(q for q,r in group.items() if 'check' in r['files']) for group in outputs.values()))
+    return dict(n=len(common), ids=sorted(common), means={arm:{
+        key:mean(group[q][key] for q in sorted(common)) for key in ('lookup_seconds','pipeline_seconds')
+        } for arm,group in outputs.items()} if common else {})
+
+
 def score(prefix):
     root = b.RESULTS
     out = root/cohort.RESULT
@@ -79,7 +107,7 @@ def score(prefix):
     labels = vr.read(b.FORMAL/'labels_private.json')
     truth = {q: labels[q]['verdict'] for q in ids}
     controls, baseline = baseline_scores(out, ids, truth)
-    groups, checkpoints = {}, {}
+    groups, checkpoints, outputs = {}, {}, {}
     for arm in cohort.ARMS:
         folder = out/timing.NAME/arm
         rows, hashes = {}, {}
@@ -88,16 +116,19 @@ def score(prefix):
         checkpoint = vr.read(folder/f'timing_{prefix}.json')
         require(checkpoint == timing.timing_prefix(list(rows.values())), 'Timing checkpoint mismatch')
         checkpoints[arm] = checkpoint
+        outputs[arm] = rows
         scores = b.final.measure(truth, rows)
         groups[arm] = dict(scores=scores, same_question_changes=paired(truth, controls[arm], rows),
                            delta_f1=scores['original_binary_view']['f1']-baseline[arm]['original_binary_view']['f1'],
                            whole_material_coverage=sum(bool(r['provided']) for r in rows.values()),
                            mean_preview_tokens=mean(r['preview_tokens'] for r in rows.values()),
-                           mean_delivered_tokens=mean(r['full_tokens'] for r in rows.values()), results_sha256=hashes)
+                           mean_delivered_tokens=mean(r['full_tokens'] for r in rows.values()),
+                           reached_check=sum('check' in r['files'] for r in rows.values()),
+                           index_completion=completed_index(rows,arm), results_sha256=hashes)
     denominator = 468
     report = dict(n=prefix, ids=ids, positive_class='incorrect', human_gold=False, design_sha256=vr.sha(design_path),
                   cohort_sha256=vr.sha(out/'cohort.json'), aligned_control_sha256=vr.sha(out/'bm25_aligned/metrics.json'),
-                  groups=groups, bm25=baseline, timing=checkpoints,
+                  groups=groups, bm25=baseline, timing=checkpoints, common_reached_check=matched_times(outputs),
                   estimate_questions=denominator,
                   three_dedicated_gpus_after_frozen_prepare_seconds=denominator*max(
                       c['means']['after_prepare_seconds'] for c in checkpoints.values()),
