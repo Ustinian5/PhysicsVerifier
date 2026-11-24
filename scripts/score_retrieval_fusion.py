@@ -13,6 +13,8 @@ def score(folder):
     if len(rows) != 6 or set(blind) != set(reviews) or set(blind) != {r['id'] for r in rows}:
         raise ValueError('Incomplete pilot or blind review')
     methods = ('bm25', 'relation_only', 'alternating', 'rrf', 'rrf_rerank')
+    if all('pool_runs' in r for r in rows):
+        methods += ('original_pool_rerank', 'relation_pool_rerank')
     report = {}
     for control in (False, True):
         group = {}
@@ -41,6 +43,8 @@ def score(folder):
                     reciprocal += 1 / positions[0]
                 if method != 'bm25':
                     elapsed += row['rewrite_seconds']
+                if method in row.get('pool_runs', {}):
+                    elapsed += row['pool_runs'][method]['seconds']
                 if method == 'rrf_rerank':
                     elapsed += row.get('rank_seconds', 0)
             n = counts['questions']
