@@ -2,12 +2,26 @@ import json
 import unittest
 from fractions import Fraction
 from itertools import product
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from scripts import run_final_exam_reference as trial
 from scripts import score_final_exam_reference as score
 
 
 class FinalReferenceTest(unittest.TestCase):
+    def test_archive_link_still_requires_the_original_file_hash(self):
+        with TemporaryDirectory() as tmp:
+            original = Path(tmp)/'original'
+            original.write_text('frozen',encoding='utf-8')
+            alias = Path(tmp)/'balanced'
+            alias.symlink_to(original)
+            receipt = {str(original.resolve()):trial.vr.sha(original)}
+            trial.bound_file(alias,receipt)
+            original.write_text('changed',encoding='utf-8')
+            with self.assertRaises(ValueError):
+                trial.bound_file(alias,receipt)
+
     def test_neutral_pair_contains_only_current_answer_as_difference(self):
         row = dict(id='pendulum',question='Find its period.',prediction='The period is two seconds.',context='')
         original = trial.final.p.continuation_messages(row,{'queries':['周期 period']},[],arm='pure')

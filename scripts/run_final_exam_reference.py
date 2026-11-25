@@ -25,6 +25,8 @@ OUT = base.RESULTS / 'final_exam_reference'
 REGISTERED = '7f8c945a840e6714aed1a9a81700c51b71cec78cc995a320524ffe8e83ba29aa'
 CANDIDATES = '116367f1f6fa191dc038b7e5ca1882840b04a8bdd59d1d1ea48c79a2b45279ef'
 HOLD = '17eeba3a44d555e6ca4dc53464776d5b43b4418d62513b065136b92acc42a3fc'
+INITIAL_RUNNER = 'fc3aad72cbf8bd400212927ed4f74c83045df05774f8c5c95fa4bca5a007b03c'
+INITIAL_DESIGN = '0716c070397b257cf895918915bfcd81c3d9f42dbc6f72be16c0dfc439213b2d'
 PORTS = {4:18249, 5:18250, 6:18251, 7:18252}
 STREAMS = 4
 ARMS = ('pure','with_exam_answer')
@@ -107,6 +109,15 @@ def design(root):
                          'binary or nonbinary outcome of the held pair.',
                bootstrap_draws=scoring.DRAWS,seed=scoring.SEED,human_gold=False,
                runner_sha256=vr.sha(__file__),scorer_sha256=vr.sha(scoring.__file__))
+    existing = dest/'design.json'
+    if existing.is_file() and vr.read(existing)['configuration_sha256']==INITIAL_DESIGN:
+        live = cfg['runner_sha256']
+        cfg['runner_sha256'] = INITIAL_RUNNER
+        require(vr.digest(cfg)==INITIAL_DESIGN, 'Protocol drift beyond the archived path lookup')
+        if live!=INITIAL_RUNNER:
+            final.immutable(dest/'path_binding_repair.json',dict(design=INITIAL_DESIGN,
+                registered_runner=INITIAL_RUNNER,executing_runner=live,
+                change='Accept the resolved path only when the same file and bytes are bound by the original receipt.'))
     obj = dict(configuration=cfg,configuration_sha256=vr.digest(cfg))
     final.immutable(dest/'design.json',obj)
     return obj
@@ -117,6 +128,12 @@ def messages(original, answer):
     require(old['role']=='system' and old['content'].count(BLIND)==1, 'Expected frozen blind verifier instruction')
     neutral = [dict(old,content=old['content'].replace(BLIND,NEUTRAL)),*original[1:]]
     return neutral, step.add_answer(neutral,answer)
+
+
+def bound_file(path, files):
+    """The first balanced row links to its original formal archive."""
+    digest = files.get(str(path), files.get(str(path.resolve())))
+    require(digest is not None and vr.sha(path)==digest, 'Unbound or changed file: '+str(path))
 
 
 @lru_cache(maxsize=1)
@@ -141,7 +158,7 @@ def pair(gpu, stamp, index, row, reference):
     parent = base.FORMAL/'formal/pure'/vr.digest(q)[:24]
     require(vr.sha(parent/'result.json')==archive[str(parent/'result.json')], 'Archived pure row changed')
     prior = vr.read(parent/'result.json')
-    require(vr.sha(folder/'result.json')==prior['files'][str(folder/'result.json')], 'Unbound shared query')
+    bound_file(folder/'result.json',prior['files'])
     target = OUT/'rows'/q
     arms = {}
     if prep['status']!='complete':
@@ -151,7 +168,7 @@ def pair(gpu, stamp, index, row, reference):
     else:
         original = final.p.continuation_messages(row,prep['value'],[],arm='pure')
         body_file = parent/'check/request.json'
-        require(vr.sha(body_file)==prior['files'][str(body_file)], 'Archived model input changed')
+        bound_file(body_file,prior['files'])
         original_body = vr.read(body_file)['request']
         maximum = min(limits['max_tokens_per_response'],limits['output_tokens_per_sample']-prep['usage']['completion_tokens'])
         require(base.eligible_for_reuse(dict(messages=original),original_body,plan['configuration']['model'],maximum),
@@ -258,12 +275,16 @@ def score(stamp):
                     design_sha256=vr.sha(OUT/'design.json'),details_sha256=vr.sha(OUT/'details.json'),**result))
 
 
-def run(folder, stamp):
+def jobs_by_gpu():
     refs=vr.read(OUT/'source_answers.json')['rows']
     rows=registered(base.RESULTS)
     jobs=[(i,r,refs[r['id']]) for i,r in enumerate(rows) if r['id']!=HOLD]
+    return {g:jobs[i::len(PORTS)] for i,g in enumerate(PORTS)}
+
+
+def run(folder, stamp):
     with ProcessPoolExecutor(max_workers=len(PORTS),mp_context=multiprocessing.get_context('spawn')) as cards:
-        tasks=[cards.submit(run_card,g,folder,stamp,jobs[i::len(PORTS)]) for i,g in enumerate(PORTS)]
+        tasks=[cards.submit(run_card,g,folder,stamp,jobs) for g,jobs in jobs_by_gpu().items()]
         for task in tasks:
             task.result()
     score(stamp)
@@ -273,6 +294,7 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action',choices=('prepare','run','confirm','score'))
     parser.add_argument('--attempt',type=int,default=1)
+    parser.add_argument('--released-gpu',type=int,choices=PORTS,help='Resume a released shard while sibling shards continue.')
     args=parser.parse_args()
     base.node.node()
     if args.action=='prepare':
@@ -281,4 +303,13 @@ if __name__=='__main__':
     if args.action=='score':
         score(stamp)
     elif args.action in ('run','confirm'):
-        runtime.detached(OUT,args.attempt,stamp,lambda folder:run(folder,stamp),args.action=='confirm')
+        target=OUT
+        action=lambda folder:run(folder,stamp)
+        if args.released_gpu is not None:
+            gpu=args.released_gpu
+            release=vr.read(OUT/'attempts'/str(args.attempt)/f'gpu{gpu}'/'release.json')
+            require(not release['owned_gpu_pids'] and not release['port_listeners'] and
+                    release['gauges']=={'running':0,'waiting':0}, 'Original shard still owns a service')
+            target=OUT/f'resume_gpu{gpu}'
+            action=lambda folder:run_card(gpu,folder,stamp,jobs_by_gpu()[gpu])
+        runtime.detached(target,args.attempt,stamp,action,args.action=='confirm')
