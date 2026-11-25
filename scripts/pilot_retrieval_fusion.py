@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import httpx
 from rule_framework import flat_skill_rag as flat
+from rule_framework import verifier_english as en
 from scripts import gpt_oss_harmony_transport as transport
 from scripts import serve_frozen_bm25 as node
 from scripts.run_qwen30b_step_checks import validate_effective_input
@@ -31,6 +32,13 @@ RUBRIC = (
     'Report controls separately. Candidate for replication if superior on >=3/4 real questions by primary '
     'endpoint with no decrease on remaining questions, compared with frozen BM25. Do not infer population gain.')
 SKILL_SHA = '6e11ffe22058f74ee317e7342f84e01d31ffa30595c024a6eb37c1d81efee6d2'
+
+
+def rewrite_messages(row, prefix, *, english=False):
+    require(len(prefix) == 3 and prefix[:2] == host.final.p.query_messages(row, english=english)
+            and prefix[2]['role'] == 'assistant', 'Incompatible shared PREPARE for query rewrite')
+    flat.validate_queries(json.loads(prefix[2]['content']), english=english)
+    return [*prefix, dict(role='user', content=en.REWRITE if english else REWRITE)]
 
 
 def top24(memory, query, allowed_ids=None):
@@ -82,10 +90,13 @@ def run_row(row, folder, store, tokenizer, client, url, cfg, acceptance):
     require(vr.sha(pkt) in {v for k,v in acceptance['files'].items() if k.endswith(str(pkt.relative_to(host.OUT)))},
             'Wrong pilot packet')
     prefix = vr.read(pkt)['messages'][:3]
+    english = en.active(cfg)
+    rewrite = rewrite_messages(row, prefix, english=english)
     queries = json.loads(prefix[2]['content'])
     count = lambda ms: len(tokenizer.apply_chat_template(ms, tokenize=True, add_generation_prompt=True, reasoning_effort='medium'))
     def size(keys):
-        return count(host.final.p.continuation_messages(row, queries, [store.view(k) for k in keys], arm='flat_skills'))
+        return count(host.final.p.continuation_messages(row, queries, [store.view(k) for k in keys],
+                                                        arm='flat_skills', english=english))
     base = size([])
     def pack(keys, preview=0):
         chosen = []
@@ -95,9 +106,13 @@ def run_row(row, folder, store, tokenizer, client, url, cfg, acceptance):
         return chosen
     first = top24(store, '\n'.join(queries['queries']))
     methods = dict(bm25=pack(first))
-    rewrite = prefix + [dict(role='user', content=REWRITE)]
     value, secs = call(folder/'relation', client, url, cfg, rewrite, tokenizer)
     valid = isinstance(value,dict) and isinstance(value.get('query'),str) and bool(value['query'].strip())
+    if english and valid:
+        try:
+            en.require_english_query(value['query'])
+        except ValueError:
+            valid = False
     record = dict(id=sid, methods=methods, first=first, relation_valid=valid, rewrite_seconds=secs)
     if valid:
         second = top24(store,value['query'])

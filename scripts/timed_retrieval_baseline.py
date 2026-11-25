@@ -28,9 +28,9 @@ def count_messages(tokenizer, messages):
     return len(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, reasoning_effort='medium'))
 
 
-def pack(row, arm, queries, ids, index, count, limits):
+def pack(row, arm, queries, ids, index, count, limits, *, english=False):
     def messages(chosen):
-        return b.final.p.continuation_messages(row, queries, [index.store.view(i) for i in chosen], arm=arm)
+        return b.final.p.continuation_messages(row, queries, [index.store.view(i) for i in chosen], arm=arm, english=english)
     base = count(messages([]))
     cap = limits['context_window'] - limits['output_tokens_per_sample']
     require(base <= cap and len(ids) <= 6 and len(ids) == len(set(ids)), 'Unpackable or duplicated candidates')
@@ -44,7 +44,9 @@ def pack(row, arm, queries, ids, index, count, limits):
     return result, chosen, count(result)-base
 
 
-def bm25_lookup(row, arm, queries, index, count, limits):
+def bm25_lookup(row, arm, queries, index, count, limits, *, english=False):
+    if english:
+        b.final.base.p.validate_queries(queries, english=True)
     query = '\n'.join(queries['queries'])
     if index.tree is None:
         ranked = index.store.search(query)
@@ -53,7 +55,7 @@ def bm25_lookup(row, arm, queries, index, count, limits):
         if any(hit['id'] not in index.cards for hit in ranked):
             eligible = {i for route in trace['routes'] for i in route.get('leaf_ids', []) if i in index.cards}
             ranked = index.store.search(query, allowed_ids=eligible)
-    return pack(row,arm,queries,[x['id'] for x in ranked],index,count,limits)
+    return pack(row,arm,queries,[x['id'] for x in ranked],index,count,limits, english=english)
 
 
 def archived_check(arm, q, control, root):

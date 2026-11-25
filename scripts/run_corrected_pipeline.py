@@ -18,6 +18,7 @@ from rule_framework import corrected_verifier as protocol
 from rule_framework import organization_followup as skills
 from rule_framework import verified_resume as vr
 from rule_framework.flat_skill_rag import FlatMemory, TreeMemory
+from rule_framework import verifier_english as en
 from scripts import audit_hipho_overlap as isolation
 from scripts import run_corrected_annotations as annotations
 from scripts import run_corrected_extraction as extraction
@@ -66,9 +67,8 @@ def prepare(out, root):
     require(Path('/proc').exists(),'Prepare against server originals')
     require(not(out/'plan.json').exists(),'Already prepared; use verify/run, never overwrite')
     source=root/'construction'
-    extraction.verify(source)
+    english = en.active(extraction.verify(source)['configuration'])
     require(vr.read(source/'execution_status.json')['state']=='extraction_complete','Extraction not complete')
-    annotations.verify(root/'annotations');final_labels.verify(root/'final_labels')
     files={}
     def bind(path):
         files[str(path.resolve())]=vr.sha(path)
@@ -90,9 +90,10 @@ def prepare(out, root):
     for exp in valid:
         sid=exp['sample_id'];row=rows[sid];audit=exp['semantic_audit']
         if audit['status']=='error_found':
+            text = en.case_text(row['question'],row['prediction'],audit) if english else (
+                en.OLD_QUESTION + row['question'] + en.OLD_ANSWER + row['prediction'] + en.OLD_REVIEW + json.dumps(audit, ensure_ascii=False))
             cases.append(dict(id='case_'+sid,kind='case',title=' '.join(row['question'].split())[:160],
-                text='历史题目\n'+row['question']+'\n\n原30B回答（可能有错，不是正确范例）\n'+row['prediction']+
-                '\n\n120B原始核查说明\n'+json.dumps(audit,ensure_ascii=False),source_ids=[sid]))
+                text=text,source_ids=[sid]))
         errors={e['id']:e for e in audit['key_errors']}
         for rule in exp['experience_rules']:
             rid='exp_'+extraction.old.extraction._fingerprint_rule(rule,exp['topic_guess']['domain'],exp['topic_guess']['topic'])
@@ -103,7 +104,22 @@ def prepare(out, root):
                 set(rule['sample_ids'])<=error_ids,'Rule source mismatch')
     bundle=dict(taxonomy=vr.read(source/'taxonomy.json'),rules=distilled['rules'],provenance=dict(support),
                 human_gold=False,source_counts=vr.read(source/'execution_status.json')['counts'])
+    split=bind(root/'source_screen/split.json')
+    bind(root/'source_screen/family_components.json')
+    hipho=bind(root.parent/'hipho_overlap_audit.json')
+    require(hipho['status']=='screening_and_assistant_review_complete_no_confirmed_overlap','HiPhO source audit unresolved')
+    require(vr.sha(Path(hipho['benchmark_path']))==hipho['benchmark_sha256'],'External benchmark changed')
+    files[hipho['benchmark_path']]=hipho['benchmark_sha256']
+    require(set(rows) <= {x['id'] for x in split['build']}, 'Construction sources escaped frozen split')
     step_rows=bind(root/'bench_generation/inputs.json')
+    pilot_source=bind(root.parent/'inputs.json')
+    if english:
+        outputs = dict(tree_bundle=bundle, cases=cases, heldout_questions=list(map(public, step_rows)) +
+                       list(map(public, split['reserve'])) + list(map(public, pilot_source)))
+        freeze_plan(out, root, outputs, files, english=True)
+        emit(out, 'prepared_materials', sources=len(rows), cases=len(cases), rules=len(distilled['rules']))
+        return
+    annotations.verify(root/'annotations');final_labels.verify(root/'final_labels')
     labeled=bind(root/'annotations/annotation_inputs.json')
     require(list(map(public,step_rows))==list(map(public,labeled)) and len(step_rows)==100,'Step answer cohort drift')
     bind(root/'annotations/binding.json');bind(root/'annotations/manifest.json')
@@ -143,23 +159,20 @@ def prepare(out, root):
         files[str(root/'final_labels'/label['evidence']['file'])]=label['evidence']['sha256']
         final_rows.append(public(row));gold[q['id']]=dict(verdict=label['judgment']['verdict'],human_gold=False,
             original_label_sha256=vr.sha(root/'final_labels/labels'/(q['id']+'.json')))
-    pilot_source=bind(root.parent/'inputs.json')
     pilot=[public(x) for x in pilot_source if x['id'] in PILOT_IDS]
     require({x['id'] for x in pilot}==set(PILOT_IDS),'Missing original complete-condition pilot')
     controls=[public(x) for x in final_labels.CONTROLS[:2]]
     pilot+=controls
-    split=bind(root/'source_screen/split.json')
-    bind(root/'source_screen/family_components.json')
-    hipho=bind(root.parent/'hipho_overlap_audit.json')
-    require(hipho['status']=='screening_and_assistant_review_complete_no_confirmed_overlap','HiPhO source audit unresolved')
-    require(vr.sha(Path(hipho['benchmark_path']))==hipho['benchmark_sha256'],'External benchmark changed')
-    files[hipho['benchmark_path']]=hipho['benchmark_sha256']
-    require(set(rows)<= {x['id'] for x in split['build']} and
-            {x['id'] for x in final_rows} <= {x['id'] for x in split['reserve']},'Cohort escaped frozen split')
+    require({x['id'] for x in final_rows} <= {x['id'] for x in split['reserve']}, 'Final cohort escaped frozen split')
     outputs={'tree_bundle':bundle,'cases':cases,'step_inputs':step_rows,'step_reference':dataset,
              'step_unresolved':unresolved,'step_label_release':label_release,
              'final_inputs':final_rows,'final_labels_private':gold,'pilot_inputs':pilot,
              'heldout_questions':list(map(public,step_rows))+list(map(public,split['reserve']))+list(map(public,pilot_source))}
+    freeze_plan(out, root, outputs, files, english=False)
+    emit(out,'prepared',cases=len(cases),rules=len(distilled['rules']),step=100,final=600)
+
+
+def freeze_plan(out, root, outputs, files, *, english):
     for name,value in outputs.items():immutable(out/(name+'.json'),value)
     transport=dict(model=c.corpus.r.EXPECTED_MODEL,auditor_api='http://127.0.0.1:18083/v1',
         max_tokens=16384,technical_attempts=3,retry_cooldown_seconds=60,timeout_seconds=1200,
@@ -167,15 +180,18 @@ def prepare(out, root):
     cfg=dict(protocol=protocol.VERSION,root=str(root),transport=transport,
         model_files=extraction.old.b.existing.MODEL_FILES,limits=protocol.LIMITS,
         tree_policy=tree.POLICY,arms=list(protocol.ARMS),human_gold=False,
-        auto_advance='User 2026-11-10: continue through both experiments; automatic engineering-only pilot gate',
-        code={n:vr.sha(c.ROOT/n) for n in SOURCES},
+        code={n:vr.sha(c.ROOT/n) for n in (SOURCES + ('rule_framework/verifier_english.py',) if english else SOURCES)},
         frozen_files={name+'.json':vr.sha(out/(name+'.json')) for name in outputs},
-        evidence_digest=vr.digest(files),planned_step_checks=400,planned_final_checks=2400,
-        pilot_checks_per_task=24,unknown_usage_policy='Per online case, reserve full advertised allowance; never restart its budget')
+        evidence_digest=vr.digest(files),unknown_usage_policy='Per online case, reserve full advertised allowance; never restart its budget')
+    if english:
+        cfg.update(prompt_profile=en.PROFILE, scope='materials_only')
+    else:
+        cfg.update(auto_advance='User 2026-11-10: continue through both experiments; automatic engineering-only pilot gate',
+                   planned_step_checks=400, planned_final_checks=2400, pilot_checks_per_task=24)
     immutable(out/'source_evidence.json',files)
     vr.EvidenceCache(out/'source_verification.json').check(files,full=True)
     immutable(out/'plan.json',dict(configuration=cfg,configuration_sha256=vr.digest(cfg)))
-    emit(out,'prepared',cases=len(cases),rules=len(distilled['rules']),step=100,final=600)
+
 
 
 def verify(out, full=False):
@@ -595,12 +611,13 @@ def native_probe(out,cfg,tokenizer):
 
 
 def build_materials(out,cfg,tokenizer):
+    english = en.active(cfg)
     journal=c.corpus.Journal(out,cfg['transport'],threading.Event())
     bundle=vr.read(out/'tree_bundle.json')
     progress=vr.Progress(out/'tree_progress.json',vr.digest([bundle,cfg]),tree.initial_state())
     def call(stage,key,payload):
-        return model_json(out,journal,tokenizer,'tree_'+stage,key,tree.messages(stage,payload))[0]
-    organizer=tree.Organizer(bundle,progress,call)
+        return model_json(out,journal,tokenizer,'tree_'+stage,key,tree.messages(stage,payload,english=english))[0]
+    organizer=tree.Organizer(bundle,progress,call,english=english)
     while organizer.state['phase']!='done':
         require(not(out/'STOP').exists(),'STOP requested')
         organizer.step()
@@ -617,7 +634,7 @@ def build_materials(out,cfg,tokenizer):
             saved=vr.read(path);require(saved['signature']==signature,'Skill source drift')
             require(vr.sha(out/saved['evidence']['file'])==saved['evidence']['sha256'],'Skill raw drift')
         else:
-            value,ev=model_json(out,journal,tokenizer,'skills',case['id'],skills.skill_messages(case))
+            value,ev=model_json(out,journal,tokenizer,'skills',case['id'],skills.skill_messages(case,english=english))
             try:skills.validate_skills(value);state='collected';reason=None
             except ValueError as exc:state='content_failure';reason=str(exc)
             saved=dict(id=case['id'],signature=signature,status=state,value=value,reason=reason,evidence=ev)
@@ -670,7 +687,7 @@ def accept_materials(out,cfg):
         # Only RAG's verbatim original fields may inherit the source review;
         # its fresh audit prose and all distilled/navigation text are re-screened.
         if doc['kind']=='case':
-            fresh=doc['text'].split('\n\n120B原始核查说明\n',1)[1]
+            fresh=en.review_text(doc['text'])
             fresh_hits=external.matches(dict(row,prediction=fresh))
             new=[h for h in ext if not any((sid,h['heldout_id']) in reviewed for sid in doc['source_ids'])]+fresh_hits
         else:new=ext
@@ -720,6 +737,7 @@ def wait_service(out,cfg):
 def check_condition(out,cfg):
     condition=dict(transport=cfg['transport'],limits=cfg['limits'],protocol=cfg['protocol'],
         material_receipt_sha256=vr.sha(out/'construction_acceptance.json'),code=cfg['code'])
+    if en.active(cfg):condition['prompt_profile']=en.PROFILE
     if cfg.get('check_prompt_revision'):condition['check_prompt_revision']=cfg['check_prompt_revision']
     return condition
 
@@ -804,12 +822,17 @@ def run(out):
             tokenizer=AutoTokenizer.from_pretrained(cfg['transport']['model'],local_files_only=True)
             require(not(out/'STOP').exists(),'STOP requested')
             if not cfg.get('check_prompt_revision'):
-                emit(out,'native_transport_probe');native_probe(out,cfg,tokenizer)
+                if not en.active(cfg):
+                    emit(out,'native_transport_probe');native_probe(out,cfg,tokenizer)
                 build_materials(out,cfg,tokenizer)
             else:
                 require(not(Path(cfg['parent_pipeline'])/'STOP').exists(),'Parent STOP requested')
                 emit(out,'reuse_frozen_materials_and_native_io',construction_model_calls=0)
             emit(out,'accepting_materials');accept_materials(out,cfg)
+            if cfg.get('scope') == 'materials_only':
+                emit(out, 'materials_complete', online_checks=0)
+                code=0
+                return
             memories=memory_set(out)
             for task in ('step','final'):
                 checks(out,cfg,tokenizer,task,'pilot',vr.read(out/'pilot_inputs.json'),memories)

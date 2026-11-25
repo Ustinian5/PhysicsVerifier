@@ -14,6 +14,8 @@ from pathlib import Path
 import time
 from unittest.mock import patch
 
+from rule_framework import verifier_english as en
+
 import httpx
 
 from scripts import run_aligned_organization as a
@@ -25,9 +27,11 @@ VERSION = 'corrected100_oldv15_released_v1'
 KNOWN_SOURCE = '62a07c4b8297c063fcb852b972e21db38f50ed9137326ff13b104f085544bdf0'
 
 
-def code_hashes():
+def code_hashes(*, english=False):
     names = set(a.code_hashes()) | {'scripts/run_aligned_step_evaluation.py',
         'scripts/run_bench_reannotation.py', 'scripts/bench_reannotation_runtime.py'}
+    if english:
+        names.add('rule_framework/verifier_english.py')
     return {n: vr.sha(a.ROOT / n) for n in sorted(names)}
 
 
@@ -221,25 +225,30 @@ def prepare(out, parent):
     release_labels(out, origin / 'annotations', rows, files)
     base.old.emit(out, 'checking_historical_score_parity', new_model_calls=0)
     vr.atomic(out / 'historical_scoring_parity.json', score_parity(Path(pc['legacy'])))
+    english = en.active(pc)
     prefixes = {}
-    for row in pc['controls']:
-        value, _ = a.followup.frozen_prefix(parent, row, plan['configuration_sha256'], files)
-        prefixes[row['id']] = value
+    if not english:
+        for row in pc['controls']:
+            value, _ = a.followup.frozen_prefix(parent, row, plan['configuration_sha256'], files)
+            prefixes[row['id']] = value
     vr.atomic(out / 'control_prefixes.json', prefixes)
     names = ('inputs', 'sources', 'cases', 'skills', 'catalog', 'skill_summary', 'bench_questions',
              'isolation', 'reference', 'unresolved', 'reviewed_annotations', 'label_review',
              'label_release', 'historical_scoring_parity', 'control_prefixes')
     c = copy.deepcopy(pc)
     c.update(protocol=VERSION, parent=str(parent), parent_configuration_sha256=plan['configuration_sha256'],
-        source_hashes=code_hashes(), dependencies=files,
+        source_hashes=code_hashes(english=english), dependencies=files,
         released_files={name: vr.sha(out / (name + '.json')) for name in names},
         formal_blockers=[], formal_released=True, sample_ids=[r['id'] for r in rows],
         source_count=len(vr.read(out / 'sources.json')), planned_checks=400,
         service_lock=str(parent.parent / 'organization_service_18083.lock'),
-        controls_policy='Reuse exact successful PREPARE; 20 fresh CHECKs against released libraries, then formal.',
+        controls_policy=('Generate one English PREPARE per control, shared across its four CHECKs.' if english else
+                         'Reuse exact successful PREPARE; 20 fresh CHECKs against released libraries, then formal.'),
         current_materials_policy='Reuse parent generation; apply original v15 source filter and provenance pruning.',
         label_policy='Four Sol high passes plus assistant quote/ambiguity release; two unresolved remain separate.',
         final_answer_task='Not part of this release; no 600-case generation or rescoring.')
+    if english:
+        c.update(check_prompt=en.STEP_CHECK, prepare_instruction=en.QUERY)
     vr.atomic(out / 'plan.json', dict(configuration=c, configuration_sha256=vr.digest(c)))
     base.old.emit(out, 'released_pending_engineering_acceptance', formal_checks_completed=0,
                   new_model_calls=0, materials=vr.read(out / 'isolation.json')['material_counts'])
@@ -249,7 +258,7 @@ def prepare(out, parent):
 def verify(out):
     plan = vr.read(out / 'plan.json'); c = plan['configuration']
     require(c['protocol'] == VERSION and vr.digest(c) == plan['configuration_sha256'], 'Plan drift')
-    require(c['source_hashes'] == code_hashes(), 'Code drift')
+    require(c['source_hashes'] == code_hashes(english=en.active(c)), 'Code drift')
     a.verify(Path(c['parent']))
     for name, sha in c['released_files'].items():
         require(vr.sha(out / (name + '.json')) == sha, 'Released input drift: ' + name)
@@ -259,6 +268,9 @@ def verify(out):
 
 @contextmanager
 def reused_controls(out, plan):
+    if en.active(plan.get('configuration', {})):
+        yield
+        return
     original = base.query; prefixes = vr.read(out / 'control_prefixes.json')
     def query(root, row, current, tokenizer, client):
         if row['id'] not in prefixes: return original(root, row, current, tokenizer, client)

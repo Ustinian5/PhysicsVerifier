@@ -93,7 +93,8 @@ class Audit:
             require(packet['packet']['retrieval']['status'] == 'not_executed_prepare_failure', 'False empty retrieval')
             return item
         count = lambda messages: len(self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True))
-        packet = base.p.reference_packet(row, arm, prefix['queries'], memory, count)
+        options = {'english': True} if base.en.active(plan['configuration']) else {}
+        packet = base.p.reference_packet(row, arm, prefix['queries'], memory, count, **options)
         actual = e.read(path.with_name('reference_packet.json'))
         require(actual == dict(configuration_sha256=plan['configuration_sha256'], packet=packet,
             query_evidence_sha256=vr.digest(prefix), input_sha256=vr.digest(row)), 'Retrieval or payload drift')
@@ -108,7 +109,7 @@ class Audit:
             if index:
                 require(first is not None and decoded is not None, 'Repair lacks initial diagnosis')
                 messages = messages + [dict(role='assistant', content=decoded['content']), dict(role='user',
-                    content=base.quotes.repair_message(first, base.quotes.invalid_quotes(first, row)))]
+                    content=base.quotes.repair_message(first, base.quotes.invalid_quotes(first, row), **options))]
             usage, decoded = self.response(request_path, messages, 16384 - used_out)
             used_in += usage['prompt_tokens']; used_out += usage['completion_tokens']
             if index == 0 and path.with_name('first_diagnosis.json').exists():
@@ -174,9 +175,10 @@ def audit(out):
         for phase, source in [('controls', config['controls']), ('formal', rows)]:
             for i, row in enumerate(source):
                 prefix = controls.get(row['id']) if phase == 'controls' else None
-                if phase == 'formal':
+                english = base.en.active(config)
+                if phase == 'formal' or english:
                     folder = out / 'queries' / vr.digest(row['id'])[:24]
-                    _, decoded = x.response(folder / 'request.json', base.p.query_messages(row), 2048)
+                    _, decoded = x.response(folder / 'request.json', base.p.query_messages(row, english=english), 2048)
                     require(decoded is not None, 'Unknown PREPARE decoder failure')
                     if (folder / recovery.FAILURE).exists():
                         failed = e.read(folder / recovery.FAILURE)
@@ -185,7 +187,7 @@ def audit(out):
                     else:
                         prefix = e.read(folder / 'result.json')
                         require(prefix['input_sha256'] == vr.digest(row) and
-                                prefix['queries'] == base.p.validate_queries(base.r.parse_json(decoded['content'])),
+                                prefix['queries'] == base.p.validate_queries(base.r.parse_json(decoded['content']), english=english),
                                 'PREPARE output was replaced')
                 else:
                     prefix = copy.deepcopy(prefix); prefix['configuration_sha256'] = plan['configuration_sha256']

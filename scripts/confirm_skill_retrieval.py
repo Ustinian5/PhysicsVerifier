@@ -1,5 +1,7 @@
 """Paired skills confirmation outside the construction, pilot and formal question families."""
 import argparse
+from functools import partial
+from rule_framework import verifier_english as en
 import json
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
@@ -74,7 +76,8 @@ def prepare(root):
     final.immutable(out/'inputs.json',selected)
     final.immutable(out/'design.json',dict(input_sha256=vr.sha(out/'inputs.json'),family_candidates=len(eligible),
         exclusion=exclude,classes={'correct':len(selected)},dispositions_sha256=release['dispositions_sha256'],
-        library=pilot.SKILL_SHA,methods=METHODS,rank_prompt=pilot.RANK,rewrite=pilot.REWRITE,role=roles.ROLE,
+        library=pilot.SKILL_SHA,methods=METHODS,rank_prompt=pilot.RANK,rewrite=en.REWRITE,role=roles.ROLE,
+        prompt_profile=en.PROFILE, prompt_sha256=vr.sha(en.__file__),
         cohort='All eligible reserve families outside current/retired benches and construction; one per family.',
         primary='Useful whole skills in six available slots per question; paired two-sided exact sign test.',
         test_order='Relation vs BM25 first, relation vs RRF only if the first comparison passes at 0.05.',
@@ -85,9 +88,11 @@ def prepare(root):
     print('screened',len(eligible),'isolated',len(selected),flush=True)
 
 
-def query(value):
+def query(value, *, english=False):
     require(isinstance(value,dict) and set(value)=={'query'} and isinstance(value['query'],str)
             and value['query'].strip(),'Invalid relation query')
+    if english:
+        en.require_english_query(value['query'])
     return value
 
 
@@ -101,6 +106,7 @@ def rank(value,n):
 def evaluate(row, out, plan, memory, tokenizer, client):
     folder = out/'rows'/row['id']
     limits = plan['configuration']['limits']
+    english = en.active(plan['configuration'])
     def count(messages):
         return len(tokenizer.apply_chat_template(messages,tokenize=True,add_generation_prompt=True,reasoning_effort='medium'))
     def call(key,messages,maximum,validator,history,started=None):
@@ -112,16 +118,16 @@ def evaluate(row, out, plan, memory, tokenizer, client):
                 'Development budget exhausted')
         return final.request_once(out,folder/key,messages,remaining,validator,plan,tokenizer,client,available=available,started=started)
     results = {}
-    first_messages = final.p.query_messages(row)
-    prep = call('prepare',first_messages,pilot.flat.QUERY_MAX_TOKENS,pilot.flat.validate_queries,[])
+    first_messages = final.p.query_messages(row, english=english)
+    prep = call('prepare',first_messages,pilot.flat.QUERY_MAX_TOKENS,partial(pilot.flat.validate_queries, english=english),[])
     if prep['status']!='complete':
         return {m:dict(status='prepare_failure',ids=[]) for m in METHODS}
     queries = prep['value']
     prefix = first_messages+[dict(role='assistant',content=json.dumps(queries,ensure_ascii=False))]
-    rewrite_messages = prefix+[dict(role='user',content=pilot.REWRITE)]
-    rewrite = call('rewrite',rewrite_messages,4096,query,[prep])
+    rewrite_messages = pilot.rewrite_messages(row, prefix, english=english)
+    rewrite = call('rewrite',rewrite_messages,4096,partial(query, english=english),[prep])
     def msgs(ids):
-        return final.p.continuation_messages(row,queries,[memory.view(i) for i in ids],arm='flat_skills')
+        return final.p.continuation_messages(row,queries,[memory.view(i) for i in ids],arm='flat_skills', english=english)
     empty_size = count(msgs([]))
     for m in METHODS:
         started = time.monotonic()
@@ -188,8 +194,11 @@ def run(out, attempt):
             stamp = signature(out)
             host.final.base.runtime.wait_detached(folder,stamp)
             config = dict(vr.read(host.OUT/'plan.json')['configuration'],api_base=f'http://127.0.0.1:{pilot.PORT}/v1')
-            plan = dict(configuration=config,configuration_sha256=vr.digest([config,stamp]))
             design = vr.read(out/'design.json')
+            if en.active(design):
+                require(design['rewrite'] == en.REWRITE and design['prompt_sha256'] == vr.sha(en.__file__), 'English rewrite drift')
+                config['prompt_profile'] = en.PROFILE
+            plan = dict(configuration=config,configuration_sha256=vr.digest([config,stamp]))
             require(design['input_sha256']==vr.sha(out/'inputs.json'),'Cohort drift')
             rows = vr.read(out/'inputs.json')
             source = pilot.ROOT/'shared_experience'/pilot.GROUP/'materials/skills.json'

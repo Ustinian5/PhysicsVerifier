@@ -2,6 +2,7 @@
 import json
 
 from rule_framework import verified_resume as vr
+from rule_framework import verifier_english as en
 from rule_framework.flat_skill_rag import FlatMemory, TreeMemory
 from rule_framework.rank_output import RankShape
 from scripts import pilot_retrieval_fusion as fusion
@@ -24,10 +25,7 @@ def clipped(text, length):
 
 def item_card(doc, arm):
     if arm == 'case_rag':
-        parts = doc['text'].rsplit('120B原始核查说明', 1)
-        if len(parts) != 2:
-            raise ValueError('Missing bound historical review')
-        detail = json.loads(parts[1])['summary']
+        detail = json.loads(en.review_text(doc['text']))['summary']
     elif arm == 'rule_tree':
         detail = json.loads(doc['text'])['check_logic']
     else:
@@ -108,7 +106,10 @@ class Index:
         leaf_set = set(leaves)
         return self.select([i for i in self.ids if i in leaf_set], query, call, 'semantic_leaves', TOP_K)
 
-    def fused_selection(self, query, call):
+    def fused_selection(self, query, call, *, english=False):
+        if english:
+            for phrase in query:
+                en.require_english_query(phrase)
         lexical, trace = self.lexical('\n'.join(query))
         semantic = self.semantic(query, call)
         _, fused = fusion.merge(lexical, semantic)

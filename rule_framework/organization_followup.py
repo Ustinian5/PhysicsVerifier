@@ -62,7 +62,11 @@ SKILL_PROMPT = previous.SKILL_PROMPT.replace(
     '不要求两道题共同支持。条目之间不建立调用树。')
 
 
-def skill_messages(case):
+def skill_messages(case, *, english=False):
+    if english:
+        from . import verifier_english as en
+        return [dict(role='system', content=en.SKILLS),
+                dict(role='user', content=en.case_view(case)['text'].replace('<|', '\\u003c|'))]
     messages = previous.skill_messages(case)
     messages[0]['content'] = SKILL_PROMPT
     return messages

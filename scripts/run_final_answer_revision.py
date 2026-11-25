@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+from functools import partial
 from pathlib import Path
 import signal
 import time
@@ -19,6 +20,7 @@ import time
 import httpx
 
 from rule_framework import final_answer_revision as p
+from rule_framework import verifier_english as en
 from scripts import final_answer_cohort as cohort
 from scripts import run_aligned_step_revision as step
 from scripts import run_final_answer_labels as old_labels
@@ -46,8 +48,10 @@ def bind(files, path):
     return vr.read(path)
 
 
-def source_hashes():
+def source_hashes(*, english=False):
     values = step.source_files()
+    if english:
+        values['rule_framework/verifier_english.py'] = vr.sha(a.ROOT / 'rule_framework/verifier_english.py')
     for n in ('rule_framework/final_answer_revision.py', 'rule_framework/final_answer_protocol.py',
               'scripts/run_final_answer_revision.py', 'scripts/audit_final_answer_metrics.py',
               'scripts/run_final_answer_labels.py'):
@@ -71,6 +75,7 @@ def prepare(out, root):
     require(not (out / 'plan.json').exists(), 'Revision already prepared')
     current = root / 'aligned_old99/evaluation_revision'
     cp = step.verify(current)['configuration']
+    english = en.active(cp)
     archive = root / 'corrected/pipeline/check_prompt_revision_bilingual'
     src = root / 'corrected'
     files = {}
@@ -149,16 +154,18 @@ def prepare(out, root):
     require(len(pilot) == 6 and not {r['id'] for r in pilot} & set(byid), 'Development/test overlap')
     immutable(out / 'pilot_inputs.json', pilot)
     cfg = dict(protocol=p.VERSION, root=str(root), archive=str(archive), material_parent=str(current),
-        source_hashes=source_hashes(), dependencies=files,
+        source_hashes=source_hashes(english=english), dependencies=files,
         candidates_sha256=vr.sha(out/'candidates.json'), pilot_sha256=vr.sha(out/'pilot_inputs.json'),
         material_hashes={name: vr.sha(out/(name+'.json')) for name in ('cases','skills','catalog')},
-        isolation_sha256=vr.sha(out/'isolation_candidates.json'), contract=p.contract(),
+        isolation_sha256=vr.sha(out/'isolation_candidates.json'), contract=p.contract(english=english),
         limits=cp['limits'], api_base=cp['api_base'], model=base.r.EXPECTED_MODEL,
         fixed_harmony_date=a.DATE, controls=control_rows(), quota_per_class=300,
         service_lock=str(root/'organization_service_18083.lock'), human_gold=False,
         review_policy='All eligible original candidates without an explicit assistant disposition receive one blind 120B reference audit; '
                       'different or uncertain verdicts require explicit assistant adjudication before release.',
         classification_failure_policy='Retain without resampling; report coverage separately.')
+    if english:
+        cfg['prompt_profile'] = en.PROFILE
     immutable(out/'plan.json', dict(configuration=cfg, configuration_sha256=vr.digest(cfg)))
     base.old.emit(out, 'prepared_review_pending', candidates=len(rows),
                   preexcluded=sum(bool(r.get('eligibility_failure')) for r in rows),
@@ -169,8 +176,8 @@ def execution_plan(out, *, register=False, prepared=None):
     plan = vr.read(out/'plan.json') if prepared is None else prepared
     c = plan['configuration']
     require(vr.digest(c) == plan['configuration_sha256'] and c['protocol'] == p.VERSION, 'Revision plan drift')
-    require(c['contract'] == p.contract(), 'Revision protocol drift')
-    live = source_hashes()
+    require(c['contract'] == p.contract(english=en.active(c)), 'Revision protocol drift')
+    live = source_hashes(english=True) if en.active(c) else source_hashes()
     if (out/'replay_repair.json').is_file():
         from scripts.final_answer_replay_binding import bound_generation_sources
         live = cohort.replay_sources(live)
@@ -495,11 +502,21 @@ def stores(out):
                 rule_tree=base.p.TreeMemory(vr.read(out/'catalog.json')))
 
 
+def check_exam_answer(row, config):
+    if 'check_exam_references' not in config:
+        return None
+    require(en.active(config), 'Reference-aware CHECK requires the English profile')
+    item = config['check_exam_references'][row['id']]
+    require(item['input_sha256'] == vr.digest(p.public(row)), 'Exam reference belongs to a different input')
+    return en.exam_answer(item['label'])
+
+
 def run_question(out, row, phase, plan, tokenizer, client, memories):
     started = time.monotonic()
+    english = en.active(plan['configuration'])
     limits=plan['configuration']['limits']; key=vr.digest(row['id'])[:24]
-    prefix=request_once(out,out/phase/'queries'/key,p.query_messages(row),base.p.QUERY_MAX_TOKENS,
-                        base.p.validate_queries,plan,tokenizer,client,
+    prefix=request_once(out,out/phase/'queries'/key,p.query_messages(row, english=english),base.p.QUERY_MAX_TOKENS,
+                        partial(base.p.validate_queries, english=english),plan,tokenizer,client,
                         available=limits['wall_seconds_per_sample'],started=started)
     # Same shared, label-free prefix is replayed and charged to all four arms.
     count=lambda m:len(tokenizer.apply_chat_template(m,tokenize=True,add_generation_prompt=True,reasoning_effort='medium'))
@@ -517,7 +534,8 @@ def run_question(out, row, phase, plan, tokenizer, client, memories):
         if prefix['status']=='complete':
             available = limits['wall_seconds_per_sample'] - charged
             require(available > 0, 'Cumulative wall-time budget exhausted before CHECK')
-            packet=p.reference_packet(row,arm,prefix['value'],memories[arm],count)
+            packet=p.reference_packet(row,arm,prefix['value'],memories[arm],count, english=english,
+                                      official_reference=check_exam_answer(row, plan['configuration']))
             immutable(folder/'reference_packet.json',packet)
             files[str(folder/'reference_packet.json')]=vr.sha(folder/'reference_packet.json')
             retrieval=packet['retrieval']
@@ -598,7 +616,8 @@ def verify_arm(row, arm, path, value, prefix, plan):
         require(isinstance(references, list) and all(isinstance(ref, dict) and set(ref) == set(fields)
                 for ref in references), 'Invalid stored full-material fields')
         sent = [{k: ref[k] for k in fields} for ref in references]
-        expected = p.continuation_messages(row, prefix['value'], sent, arm=arm)
+        expected = p.continuation_messages(row, prefix['value'], sent, arm=arm, english=en.active(plan['configuration']),
+                                            official_reference=check_exam_answer(row, plan['configuration']))
         require(packet['messages'] == expected and packet['retrieval'] == value['retrieval']
                 and (arm != 'pure' or not packet['references']), 'Wrong shared prefix or supplied materials')
         limit = min(limits['max_tokens_per_response'], limits['output_tokens_per_sample'] - usage['completion_tokens'])
@@ -625,6 +644,7 @@ def verify_arm(row, arm, path, value, prefix, plan):
 
 def score(out):
     plan=verify(out);released(out,plan)
+    english = en.active(plan['configuration'])
     rows=vr.read(out/'inputs.json');labels={sid:d['verdict'] for sid,d in vr.read(out/'labels_private.json').items()}
     groups={};files={}
     for arm in ARMS:
@@ -632,8 +652,8 @@ def score(out):
         for row in rows:
             path=out/'formal'/arm/vr.digest(row['id'])[:24]/'result.json'
             value=bind(files,path)
-            prefix=saved_request(out/'formal/queries'/vr.digest(row['id'])[:24],p.query_messages(row),
-                                 base.p.QUERY_MAX_TOKENS,base.p.validate_queries,plan,
+            prefix=saved_request(out/'formal/queries'/vr.digest(row['id'])[:24],p.query_messages(row, english=english),
+                                 base.p.QUERY_MAX_TOKENS,partial(base.p.validate_queries, english=english),plan,
                                  available=plan['configuration']['limits']['wall_seconds_per_sample'])
             verify_arm(row,arm,path,value,prefix,plan)
             files.update(value['files']);predictions[row['id']]=value

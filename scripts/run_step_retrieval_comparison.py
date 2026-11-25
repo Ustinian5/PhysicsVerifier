@@ -68,10 +68,11 @@ def row_pair(row, arm, phase, tasks, index, tok, client, plan):
         value = vr.read(record)
         require(value['signature']==stamp and all(vr.sha(p)==h for p,h in value['results'].items()), 'Pair changed')
         return value
-    prefix, prefix_hash, prepared = packets.prefix_for(parent, row)
+    options = {'english': True} if f.base.en.active(plan['configuration']) else {}
+    prefix, prefix_hash, prepared = packets.prefix_for(parent, row, **options)
     limits = plan['configuration']['limits']
     budget = t.base.previous.Budget(ROOT,plan,tok,client)
-    selection = packets.select(dest, prefix, prepared, arm, index, budget)
+    selection = packets.select(dest, prefix, prepared, arm, index, budget, **options)
     write(dest/'selection.json',selection)
     charges = selection['charges']
     results, caps, seconds, statuses = {}, {}, {}, {}
@@ -86,7 +87,7 @@ def row_pair(row, arm, phase, tasks, index, tok, client, plan):
             results[str(path)] = vr.sha(path)
             statuses[mode] = 'selection_content_failure'
             continue
-        packet = packets.packet(row,arm,prefix,selection[mode],index,budget.count,limits)
+        packet = packets.packet(row,arm,prefix,selection[mode],index,budget.count,limits, **options)
         if mode=='bm25':
             old = vr.read(prior_task(task,phase))
             ids = (old.get('retrieval') or {}).get('provided_complete_ids',old.get('trace',{}).get('read_rule_ids',[]))

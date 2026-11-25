@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -41,8 +42,9 @@ class ExtractionTests(unittest.TestCase):
     def test_prepared_input_tamper_stops(self):
         with tempfile.TemporaryDirectory() as temp:
             out=Path(temp)/'construction';source=Path(temp)/'source'
-            e.write(source/'plan.json',{'frozen':True})
-            with patch.object(e,'build_rows',return_value=([{'id':'a'}],[],{})):
+            e.write(source/'plan.json',{'configuration':{'split_path':'../source_screen/split.json'}})
+            with patch.object(e,'build_rows',return_value=([{'id':'a'}],[],{})), \
+                 patch.object(e,'build_references',return_value=({'a': {'label':['exam answer']}},{})):
                 e.prepare(out,source)
             e.verify(out)
             e.write(out/'inputs.json',[{'id':'tampered'}])
@@ -52,12 +54,13 @@ class ExtractionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / 'source'
             output = Path(temp) / 'construction'
-            e.write(source / 'plan.json', {'frozen': True})
-            with patch.object(e, 'build_rows', return_value=(ROWS[:1], [], {})):
+            e.write(source / 'plan.json', {'configuration': {'split_path':'../source_screen/split.json'}})
+            with patch.object(e, 'build_rows', return_value=(ROWS[:1], [], {})), \
+                 patch.object(e, 'build_references', return_value=({ROWS[0]['id']: {'label':['参考', '']}},{})):
                 e.prepare(output, source)
             config = e.verify(output)['configuration']
 
-        original = dict(sample=ROWS[0], taxonomy=TAXONOMY, max_rules_per_sample=2)
+        original = dict(sample=dict(ROWS[0], official_reference={'label':['参考', '']}), taxonomy=TAXONOMY, max_rules_per_sample=2)
         repair = dict(original=original, draft={'_unparsed_response_text': 'bad JSON'},
                       validation_error='Invalid error ID/type')
         archive = e.old.Journal.__new__(e.old.Journal)
@@ -69,10 +72,18 @@ class ExtractionTests(unittest.TestCase):
             for stage, payload in [('extract_experience', original), ('repair_experience', repair)]:
                 old_messages = archive.messages(stage, payload)
                 self.assertEqual(e.request_messages(stage, payload, {}), old_messages)
-                self.assertEqual(e.request_messages(stage, payload, config),
-                                 [{'role': 'system', 'content': current_system}, *old_messages[1:]])
-            self.assertEqual(e.request_messages('taxonomy', TAXONOMY, config),
-                             archive.messages('taxonomy', TAXONOMY))
+                previous = e.request_messages(stage, payload, {'audit_system_prompt': '上版首审'})
+                self.assertEqual(previous, [{'role':'system', 'content':'上版首审'}, *old_messages[1:]])
+                current = e.request_messages(stage, payload, config)
+                self.assertEqual(current[0]['content'], current_system)
+                fields = json.loads(current[1]['content'])
+                self.assertEqual(fields.pop(e.en.EXAM_REFERENCE), ['参考', ''])
+                self.assertEqual(fields, json.loads(old_messages[1]['content']))
+                if stage == 'repair_experience':
+                    self.assertEqual(current[:2], e.request_messages('extract_experience', original, config))
+                    self.assertEqual(current[2], old_messages[2])
+                    self.assertIn('structural validation', current[-1]['content'])
+            self.assertEqual(e.request_messages('taxonomy', TAXONOMY, config)[0]['content'], e.en.TAXONOMY)
 
     def test_original_prompt_and_received_prefix_replay(self):
         payload={'domains':[{'id':'d','name':'Physics','topics':[]}]}

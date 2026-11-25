@@ -1,31 +1,33 @@
-任务
-通读题目和学生的完整解答，核查推导和最终答案。对每个能在原文定位的独立错误，指出哪一步错了、为什么错，并给出正确关系及其成立条件。接受符合题意的等价解法。结合后文辨认已经纠正的试算，同一根因及其连锁后果合记一次。依据不足时，说明哪个判断缺少什么条件。
+Task
+Compare each requested result with the corresponding part of the official reference, accepting equivalent answers. Check the reasoning in the student's numbered solution independently against the problem statement. For any part the reference leaves blank, use the evidence in the problem and the student's work. If a reference conflicts with the problem or a judgment needs missing information, explain the unresolved point.
 
-从已确认的错误中提炼可用于其他题的检查规则。每条规则写清何时适用、应满足什么关系、怎样据此判错。即使某个错误不适合推广，也保留在核查结果中。从给定目录中选出本题所属的主题。
+For each independent error you can locate, identify the incorrect step, explain why it is wrong, and give the correct relation and its conditions. Accept valid alternative approaches. Read later corrections before judging a tentative step. Count a root error and its consequences once.
 
-输出格式
-只返回一个 JSON 对象，结构见下方示例。没有对应条目时用空数组。
+Derive reusable checks from confirmed errors. For each rule, state when it applies, what relation should hold, and how to detect a violation. Keep a confirmed error in the review even if it yields no transferable rule. Choose the problem's topic from the supplied catalog. Write your explanations and rules in English.
 
-topic_key 取输入目录中的 T 编号。错误按 E1、E2 依次编号，行号取能定位错误的最小连续范围。type 和 error_type 各选 concept、logic、calculation、modeling、units 中的一项。
-status 在有确认错误时填 error_found，只有未决项时填 uncertain，两者都没有时填 no_error_found。
-最多提炼 max_rules_per_sample 条规则。rule_status 用 included、not_generalizable、uncertain、rule_budget 分别表示已提炼、不适合推广、适用性未定、达到条数上限。每条规则引用至少一个来源错误。所有 source_error_ids 合起来恰好覆盖本题标为 included 的错误。symbolic_hint 取示例中的固定值。
+Output format
+Return one JSON object using the structure below. Use an empty array when there are no items.
+
+Copy topic_key from the supplied T IDs. Number errors E1, E2, and so on. Use the shortest contiguous range of source lines that locates each error. For type and error_type choose one of concept, logic, calculation, modeling or units.
+Set status to error_found if any error is confirmed, uncertain if only unresolved issues remain, or no_error_found if neither is present.
+Produce at most max_rules_per_sample rules. For rule_status use included if a rule was derived, not_generalizable if the error does not transfer, uncertain if applicability is unresolved, or rule_budget if the limit was reached. Each rule must cite at least one source error. Together, source_error_ids must cover exactly the errors marked included. Copy the fixed symbolic_hint shown below.
 
 {
   "topic_key": "T1",
   "semantic_audit": {
     "status": "error_found",
-    "summary": "简要核查结论",
+    "summary": "Brief review finding",
     "key_errors": [
-      {"id": "E1", "type": "modeling", "message": "原解答中的具体错误",
-       "correction": "正确关系及其依据", "line_start": 1, "line_end": 1,
-       "rule_status": "included", "reason": "该错误用于或未用于提炼的原因"}
+      {"id": "E1", "type": "modeling", "message": "Specific error in the student's solution",
+       "correction": "Correct relation and justification", "line_start": 1, "line_end": 1,
+       "rule_status": "included", "reason": "Reason for the rule disposition"}
     ],
-    "uncertain": [{"scope": "无法判定的部分", "reason": "所缺条件"}]
+    "uncertain": [{"scope": "Issue that cannot be decided", "reason": "Missing information"}]
   },
   "experience_rules": [
-    {"source_error_ids": ["E1"], "title": "规则名称", "trigger": "适用条件",
-     "check_logic": "应满足的关系、检查方法和判错依据", "error_type": "modeling",
+    {"source_error_ids": ["E1"], "title": "Rule name", "trigger": "Conditions of applicability",
+     "check_logic": "Expected relation, check and criterion for a violation", "error_type": "modeling",
      "symbolic_hint": {"primitive": "none", "canonical": "", "required_symbols": []},
-     "auxiliary": {"node_summary": "场景摘要", "scene_cues": [], "boundary_cues": [], "explore_cues": []}}
+     "auxiliary": {"node_summary": "Scenario summary", "scene_cues": [], "boundary_cues": [], "explore_cues": []}}
   ]
 }

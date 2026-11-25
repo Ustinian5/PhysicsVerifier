@@ -63,10 +63,12 @@ def load_memories(library):
 
 
 def prefix_record(parent, old, phase, row):
+    from functools import partial
+    english = final.en.active(old['configuration'])
     key = vr.digest(row['id'])[:24]
     folder = parent / phase / 'queries' / key
-    prefix = final.saved_request(folder, final.p.query_messages(row), final.base.p.QUERY_MAX_TOKENS,
-                                 final.base.p.validate_queries, old,
+    prefix = final.saved_request(folder, final.p.query_messages(row, english=english), final.base.p.QUERY_MAX_TOKENS,
+                                 partial(final.base.p.validate_queries, english=english), old,
                                  available=old['configuration']['limits']['wall_seconds_per_sample'])
     return folder, prefix
 
@@ -74,6 +76,8 @@ def prefix_record(parent, old, phase, row):
 def evaluate_row(out, parent, old, phase, row, plan, memories, tokenizer, client, source_files):
     key = vr.digest(row['id'])[:24]
     limits = plan['configuration']['limits']
+    english = final.en.active(plan['configuration'])
+    require(english == final.en.active(old['configuration']), 'Incompatible shared PREPARE language')
     folder, prefix = prefix_record(parent, old, phase, row)
     def count(messages):
         return len(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
@@ -102,7 +106,7 @@ def evaluate_row(out, parent, old, phase, row, plan, memories, tokenizer, client
         delivery = dict(provided_complete_ids=[], reference_tokens=0)
         reason, usage, wall = 'Shared PREPARE failed', dict(prefix['usage']), prefix['wall_seconds']
         if prefix['status'] == 'complete':
-            packet = final.p.reference_packet(row, arm, prefix['value'], memories[arm], count)
+            packet = final.p.reference_packet(row, arm, prefix['value'], memories[arm], count, english=english)
             delivery = packet['retrieval']
             require(len(delivery['provided_complete_ids']) <= final.base.p.MAX_ITEMS and
                     delivery['reference_tokens'] <= final.base.p.REFERENCE_TOKEN_CAP, 'Material budget exceeded')

@@ -8,19 +8,21 @@ vr, require = timed.vr, timed.require
 ROOT = timed.b.RESULTS / 'retrieval_fusion_dev/step99_matched'
 
 
-def prefix_for(parent, row):
+def prefix_for(parent, row, *, english=False):
     prefix, path = frozen.step.prefix_at(parent, row)
     require(all(vr.sha(p) == h for p, h in prefix['files'].items()), 'Different frozen PREPARE')
     ev = prefix['evidence']
     request = vr.read(ev['request_path'])['request']
-    require(request['messages'] == frozen.base.p.query_messages(row) and
+    require(request['messages'] == frozen.base.p.query_messages(row, english=english) and
             request['model'] == frozen.base.r.EXPECTED_MODEL and
             request['max_tokens'] == frozen.base.p.QUERY_MAX_TOKENS, 'Different PREPARE request')
+    if english:
+        frozen.base.p.validate_queries(prefix['queries'], english=True)
     prepared = dict(usage=ev['usage'], wall_seconds=vr.read(ev['response_path'])['elapsed_seconds'])
     return prefix, vr.sha(path), prepared
 
 
-def select(folder, prefix, prepared, arm, index, budget):
+def select(folder, prefix, prepared, arm, index, budget, *, english=False):
     queries = prefix['queries']['queries']
     history = [prepared]
     stages = {}
@@ -49,7 +51,7 @@ def select(folder, prefix, prepared, arm, index, budget):
 
     failure = None
     try:
-        chosen, trace = index.fused_selection(queries, rank)
+        chosen, trace = index.fused_selection(queries, rank, english=True) if english else index.fused_selection(queries, rank)
     except timed.SelectionFailure as error:
         failure, chosen, trace = str(error), [], None
     lexical, routes = index.lexical('\n'.join(queries))
@@ -60,10 +62,15 @@ def select(folder, prefix, prepared, arm, index, budget):
     return dict(selection, charges=charges)
 
 
-def packet(row, arm, prefix, ranked, index, count, limits):
+def packet(row, arm, prefix, ranked, index, count, limits, *, english=False):
     messages_for = frozen.step.continuation if arm == 'case_rag' else frozen.step.ORIGINAL_CONTINUATION
+    def references(ids):
+        items = [index.store.view(i) for i in ids]
+        return [frozen.base.en.case_view(item) for item in items] if english and arm == 'case_rag' else items
     def messages(ids):
-        return messages_for(row, prefix['queries'], [index.store.view(i) for i in ids])
+        if english:
+            return frozen.base.p.continuation_messages(row, prefix['queries'], references(ids), arm=arm, english=True)
+        return messages_for(row, prefix['queries'], references(ids))
     base = count(messages([]))
     limit = limits['context_window'] - limits['output_tokens_per_sample']
     require(base <= limit and len(set(ranked)) == len(ranked) <= 6, 'Invalid material packet')
@@ -74,7 +81,7 @@ def packet(row, arm, prefix, ranked, index, count, limits):
         if size <= limit and size - base <= timed.MATERIAL_LIMIT:
             provided.append(i)
     result = messages(provided)
-    return dict(messages=result, references=[index.store.view(i) for i in provided],
+    return dict(messages=result, references=references(provided),
                 retrieval=dict(provided_complete_ids=provided, reference_tokens=count(result)-base,
                                candidate_ids=ranked))
 

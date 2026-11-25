@@ -20,24 +20,25 @@ FAILURE = 'preparation_failure.json'
 POLICY = 'retain_invalid_prepare_as_shared_content_failure_no_retry_v1'
 
 
-def schema_failure(content):
+def schema_failure(content, *, english=False):
     try:
         value = base.r.parse_json(content)
     except json.JSONDecodeError as exc:
         return 'JSONDecodeError: ' + str(exc)
     try:
-        base.p.validate_queries(value)
+        base.p.validate_queries(value, english=english)
     except ValueError as exc:
-        require(str(exc) in {'Preparation is queries only', 'Invalid query phrases'},
+        require(str(exc) in {'Preparation is queries only', 'Invalid query phrases'} or
+                (english and str(exc) == 'Expected an English retrieval phrase'),
                 'Unknown preparation validation error')
         return str(exc)
     raise ValueError('Valid preparation cannot be discarded')
 
 
-def validate_response(row, request_record, raw, response):
+def validate_response(row, request_record, raw, response, *, english=False):
     request = request_record['request']
     require(request_record['request_sha256'] == base.r.sha256_value(request) and
-            request['messages'] == base.p.query_messages(row) and
+            request['messages'] == base.p.query_messages(row, english=english) and
             request['model'] == base.r.EXPECTED_MODEL and request['max_tokens'] == base.p.QUERY_MAX_TOKENS and
             request['temperature'] == 0 and request['top_p'] == 1 and request['reasoning_effort'] == 'medium' and
             not request.get('tools'), 'Preparation request/input/protocol mismatch')
@@ -50,7 +51,7 @@ def validate_response(row, request_record, raw, response):
     require(type(usage['prompt_tokens']) is int and usage['prompt_tokens'] > 0 and
             type(usage['completion_tokens']) is int and 0 <= usage['completion_tokens'] <= base.p.QUERY_MAX_TOKENS and
             usage['total_tokens'] == usage['prompt_tokens'] + usage['completion_tokens'], 'Invalid response usage')
-    return schema_failure(response['content'])
+    return schema_failure(response['content'], english=english)
 
 
 def inspect_preparation(out, row, plan):
@@ -61,7 +62,7 @@ def inspect_preparation(out, row, plan):
             'Incomplete request evidence; do not resample or classify as content failure')
     req, raw, response = [vr.read(p) for p in (request, raw_path, response_path)]
     require(response.get('raw_sse_sha256') == vr.sha(raw_path), 'Raw response hash mismatch')
-    reason = validate_response(row, req, raw, response)
+    reason = validate_response(row, req, raw, response, english=base.en.active(plan.get('configuration', {})))
     # Re-decode with exactly the frozen decoder stack. This is offline and does
     # not repair the invalid query JSON or accept a new native message shape.
     with run.a.base.old.comparison.execution.configured(), \

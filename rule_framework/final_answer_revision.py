@@ -4,10 +4,10 @@ The archived final-answer protocol remains immutable.  This module changes
 the delivery mechanism, not the binary target: incorrect is the positive class.
 """
 import json
-from unittest.mock import patch
 
 from rule_framework import final_answer_protocol as original
 from rule_framework import flat_skill_rag as memory
+from rule_framework import verifier_english as en
 
 VERSION = 'final_answer_review_and_aligned_delivery_v1'
 POSITIVE_CLASS = 'incorrect'
@@ -113,34 +113,50 @@ def validate_review(value):
     return value
 
 
-def query_messages(row):
+def staged_prompt(english):
+    return en.FINAL_CHECK if english else STAGED_PROMPT
+
+
+def query_messages(row, *, english=False):
+    if english:
+        return memory.prepare_messages(public(row), en.FINAL_CHECK, en.FINAL_QUERY)
     result = memory.query_messages(public(row))
     result[0]['content'] = STAGED_PROMPT
     return result
 
 
-def continuation_messages(row, queries, references, *, arm):
+def continuation_messages(row, queries, references, *, arm, english=False, official_reference=None):
     require(arm in memory.ARMS, 'Unknown comparison arm')
     require(arm != 'pure' or not references, 'Pure arm received reference material')
-    memory.validate_queries(queries)
-    result = query_messages(row)
+    memory.validate_queries(queries, english=english)
+    result = query_messages(row, english=english)
+    if english and arm == 'case_rag':
+        references = [en.case_view(item) for item in references]
     result.append(dict(role='assistant', content=json.dumps(queries, ensure_ascii=False)))
-    content = json.dumps({'stage': 'CHECK', 'Reference material': references},
-                         ensure_ascii=False).replace('<|', '\\u003c|')
-    content += '\nJudge the final-answer correctness of the original current answer. Submit final-answer verdict JSON.'
-    if arm == 'case_rag':
-        content += '\n\n' + RAG_BINDING
+    fields = {'stage': 'CHECK', 'Reference material': references}
+    if official_reference is not None:
+        require(english, 'Official references require an explicit reference-aware prompt')
+        fields[en.EXAM_REFERENCE] = en.exam_answer(official_reference)
+    content = json.dumps(fields, ensure_ascii=False).replace('<|', '\\u003c|')
+    if english:
+        content += '\nJudge the committed final answer in the first user message.'
+        if arm == 'case_rag':
+            content += ' ' + en.CASE_BINDING
+    else:
+        content += '\nJudge the final-answer correctness of the original current answer. Submit final-answer verdict JSON.'
+        if arm == 'case_rag':
+            content += '\n\n' + RAG_BINDING
     result.append(dict(role='user', content=content))
     return result
 
 
-def reference_packet(row, arm, queries, store, count_tokens):
+def reference_packet(row, arm, queries, store, count_tokens, *, english=False, official_reference=None):
     # Reuse the exact lexical ranking, Top2 tree routing, no-flat-fallback,
     # complete-item admission and 8192 material-token cap from v15.
     def continue_for_arm(r, q, refs):
-        return continuation_messages(r, q, refs, arm=arm)
-    with patch.object(memory, 'continuation_messages', continue_for_arm):
-        return memory.reference_packet(public(row), arm, queries, store, count_tokens)
+        return continuation_messages(r, q, refs, arm=arm, english=english, official_reference=official_reference)
+    return memory.reference_packet(public(row), arm, queries, store, count_tokens,
+                                   english=english, render=continue_for_arm)
 
 
 def decision(candidate, reviewed, override=None):
@@ -192,12 +208,13 @@ def select_balanced(candidates, decisions, quota=300):
     return selected
 
 
-def contract():
+def contract(*, english=False):
     return dict(protocol=VERSION, task='final_answer_correctness', positive_class=POSITIVE_CLASS,
         confusion=[dict(label=k[0], prediction=k[1], cell=v) for k, v in CONFUSION.items()],
-        review_prompt=REVIEW_PROMPT, staged_prompt=STAGED_PROMPT, rag_binding=RAG_BINDING,
+        review_prompt=REVIEW_PROMPT, staged_prompt=staged_prompt(english), rag_binding=en.CASE_BINDING if english else RAG_BINDING,
         max_items=memory.MAX_ITEMS, reference_token_cap=memory.REFERENCE_TOKEN_CAP,
         query_max_tokens=memory.QUERY_MAX_TOKENS, tree_branches=memory.TREE_BRANCHES,
         tools=None, flat_fallback=False, independent_checker=False,
         failures='Retain content failures without resampling; authentication/identity/unknown transport stops.',
-        labels='120B reference-assisted machine labels with explicit assistant adjudication; human_gold=false')
+        labels='120B reference-assisted machine labels with explicit assistant adjudication; human_gold=false',
+        **(dict(prompt_profile=en.PROFILE, prepare_instruction=en.FINAL_QUERY) if english else {}))

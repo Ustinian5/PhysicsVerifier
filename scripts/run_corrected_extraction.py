@@ -1,11 +1,11 @@
 """Extract fresh experiences from the corrected, isolated 2000-question cohort.
 
 Freeze the per-answer audit prompt when preparing a new extraction plan.
-No old corpus, reference labels, embedding or separate checker is invoked.
+The new first review uses the original Combined Language exam solution.
 This stage exports raw experiences and deduplicated candidates, not a tree.
 """
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 import json
 import os
 from pathlib import Path
@@ -15,6 +15,10 @@ import httpx
 
 from scripts import run_corrected_collection as c
 from scripts import run_experience_first_120b as old
+from scripts.combined_language_io import iter_rollout_batches
+from scripts.combined_language_samples import extract_question
+from rule_framework.oss120b_construction import question_key
+from rule_framework import verifier_english as en
 from scripts.run_qwen30b_step_checks import validate_effective_input
 
 read, write, sha, digest, require = c.read, c.write, c.sha, c.digest, c.require
@@ -43,21 +47,70 @@ def build_rows(source):
     return rows, rejected, evidence
 
 
-def prepare(out, source):
+def build_references(rows, screen, inventory_path, dataset):
+    """Bind each completed build answer to the raw record that supplied its frozen question."""
+    plan = read(screen/'plan.json')
+    cfg = plan['configuration']
+    require(digest(cfg) == plan['configuration_sha256'], 'Source-screen plan drift')
+    split = read(screen/'split.json')
+    require(sha(screen/'plan.json') == split['source_plan_sha256'], 'Different build split')
+    source_ids = {row['id'] for row in split['build']}
+    require(all(row['id'] in source_ids for row in rows), 'Reference requested outside build split')
+    inventory = read(inventory_path)
+    index = read(screen/'references_private.json')
+    dataset_hash = sha(dataset)
+    require(sha(inventory_path) == cfg['source_inventory_sha256'] and digest(index) == cfg['source_refs_sha256']
+            and dataset_hash == index['source_sha256'] == cfg['source_sha256'], 'Different Combined Language source')
+    originals = {item['id']: item for item in inventory['questions']}
+    variants = {item['id']: item['variants'] for item in index['references']}
+    pending = defaultdict(list)
+    for row in rows:
+        sid = row['id']
+        original = originals[sid]
+        require(question_key(original['question']) == question_key(row['question']), 'Different frozen question')
+        loc = original['first_source']
+        pending[loc['rollout_id']].append((row, loc))
+    found = {}
+    for batch in iter_rollout_batches(dataset):
+        for row, loc in pending.pop(batch['rollout_id'], []):
+            sample = batch['samples'][loc['sample_position']]
+            sid = row['id']
+            require(sample['index'] == loc['sample_index'] and
+                    question_key(extract_question(sample)) == question_key(row['question']),
+                    'Raw Combined Language question mismatch')
+            label = en.exam_answer(sample['label'])
+            require(any(v['first_source'] == loc and v['value'] == label for v in variants[sid]),
+                    'Raw exam answer differs from the frozen source index')
+            found[sid] = dict(label=label, original_location=loc)
+        if not pending:
+            break
+    require(not pending and len(found) == len(rows), 'Incomplete build reference binding')
+    return found, {str(dataset): dataset_hash, str(inventory_path): cfg['source_inventory_sha256'],
+                   str(screen/'references_private.json'): sha(screen/'references_private.json'),
+                   str(screen/'plan.json'): split['source_plan_sha256'], str(screen/'split.json'): sha(screen/'split.json')}
+
+
+def prepare(out, source, dataset=None):
     require(not (out/'plan.json').exists(), 'Already prepared')
     audit_prompt = AUDIT_PROMPT_FILE.read_text(encoding='utf-8').rstrip('\n')
     require(bool(audit_prompt.strip()), 'Empty first-review prompt')
     rows, rejected, evidence = build_rows(source)
+    screen = (source/read(source/'plan.json')['configuration']['split_path']).resolve().parent
+    references, bound = build_references(rows, screen, screen.parent.parent/'source_question_inventory.json',
+                                         dataset or c.ROOT/'data/combined_language_only.json')
+    rows = [dict(row, official_reference=references[row['id']]) for row in rows]
+    evidence.update(bound)
     skeleton = old.flow.experience_topic_skeleton(read(c.ROOT/'catalogs/rules_catalog_top_down.json'))
     cfg = dict(model=c.corpus.r.EXPECTED_MODEL, auditor_api='http://127.0.0.1:18083/v1',
         max_tokens=16384, max_request_input_bytes=400000, reasoning_effort='medium', timeout_seconds=1200,
         technical_attempts=3, retry_cooldown_seconds=60, max_rules_per_sample=2,
         structural_repair_rounds=1, fixed_date='2026-11-07', pilot_size=12,
-        audit_system_prompt=audit_prompt,
+        prompt_profile=en.PROFILE, audit_system_prompt=audit_prompt,
         source_plan_sha256=sha(source/'plan.json'), source=str(source),
         inputs_sha256=digest(rows), skeleton_sha256=digest(skeleton), evidence_sha256=digest(evidence),
         sources={n:sha(c.ROOT/n) for n in sorted(set(list(old.SOURCES)+list(c.SOURCES)+
-            ['scripts/run_corrected_extraction.py','scripts/run_qwen30b_step_checks.py']))},
+            ['scripts/run_corrected_extraction.py','scripts/run_qwen30b_step_checks.py','rule_framework/verifier_english.py',
+             'scripts/combined_language_io.py','scripts/combined_language_samples.py']))},
         model_files=old.b.existing.MODEL_FILES, human_gold=False,
         policy='Frozen build order; one continuous audit+extraction; content failures retained; no resampling')
     for name, value in [('inputs',rows),('generation_failures',rejected),('topic_skeleton',skeleton),('source_evidence',evidence)]:
@@ -86,8 +139,18 @@ def confirm(out):
 def request_messages(stage, payload, config):
     messenger = old.Journal.__new__(old.Journal)
     messages = messenger.messages(stage, payload)
+    if en.active(config):
+        if stage == 'taxonomy':
+            messages[0]['content'] = en.TAXONOMY
+        elif stage in {'extract_experience', 'repair_experience'}:
+            source = payload['original'] if stage == 'repair_experience' else payload
+            fields = json.loads(messages[1]['content'])
+            fields[en.EXAM_REFERENCE] = en.exam_answer(source['sample']['official_reference']['label'])
+            messages[1]['content'] = json.dumps(fields, ensure_ascii=False, sort_keys=True).replace('<|', '\\u003c|')
+            if stage == 'repair_experience':
+                messages[-1]['content'] = en.AUDIT_REPAIR.format(error=payload['validation_error']).replace('<|', '\\u003c|')
     # The November frozen plans use the original first review, including in a repair turn.
-    if stage in {'extract_experience', 'repair_experience'} and 'audit_system_prompt' in config:
+    if stage in {'extract_experience', 'repair_experience'} and (en.active(config) or 'audit_system_prompt' in config):
         messages[0] = {'role': 'system', 'content': config['audit_system_prompt']}
     return messages
 
@@ -177,8 +240,9 @@ def run(out):
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('mode',choices=['prepare','verify','run','confirm-detached'])
     p.add_argument('--output',type=Path,required=True);p.add_argument('--source',type=Path)
+    p.add_argument('--dataset', type=Path, help='Original combined_language_only.json for prepare')
     a=p.parse_args();out=a.output.resolve()
-    if a.mode=='prepare':prepare(out,a.source.resolve())
+    if a.mode=='prepare':prepare(out,a.source.resolve(),a.dataset.resolve() if a.dataset else None)
     elif a.mode=='verify':verify(out)
     elif a.mode=='confirm-detached':confirm(out)
     else:run(out)

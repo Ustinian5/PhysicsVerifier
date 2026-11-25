@@ -9,6 +9,7 @@ import json
 
 from rule_framework.flat_skill_rag import FlatMemory, TreeMemory, require
 from rule_framework import final_answer_protocol as final
+from rule_framework import verifier_english as en
 from scripts import continuous_context_v2 as step
 
 VERSION = 'corrected_continuous_four_arm_v1'
@@ -44,12 +45,15 @@ def tools():
                         required=['id'], additionalProperties=False)))]
 
 
-def messages(row, arm, task, *, revision=None):
+def messages(row, arm, task, *, revision=None, english=False):
     require(arm in ARMS and task in {'step', 'final'}, 'Unknown experiment')
     require(revision in {None, CHECK_REVISION, LANGUAGE_REVISION, BILINGUAL_REVISION}, 'Unknown checking prompt revision')
     # Whitelist even when callers possess benchmark references or labels.
     public = {k: row.get(k, '') for k in ('question', 'prediction', 'context')}
     extra = USE + '\n' + DESCRIPTIONS[arm] if arm != 'pure' else ''
+    if english and extra:
+        extra = extra.replace('the materials are predominantly Chinese, so include appropriate Chinese terms when useful',
+                              'write every search query in English only')
     if task == 'final':
         result = final.verification_messages(public, tool_instructions=extra +
             '\nAt most 12 responses and 16384 cumulative generated tokens including reasoning and tools.')
@@ -61,7 +65,7 @@ def messages(row, arm, task, *, revision=None):
         result[-1]['content'] += '\n\n' + REQUIRED_LOOKUP_SUFFIX
         if revision in {LANGUAGE_REVISION, BILINGUAL_REVISION}:
             result[-1]['content'] += '\n\n' + READ_SUFFIX
-            if arm == 'rule_tree':result[-1]['content'] += '\n\n' + (
+            if arm == 'rule_tree' and not english:result[-1]['content'] += '\n\n' + (
                 TREE_BILINGUAL_SUFFIX if revision==BILINGUAL_REVISION else TREE_LANGUAGE_SUFFIX)
     return result
 
@@ -80,7 +84,7 @@ def all_ranked(memory, query, allowed=None):
 
 
 class Knowledge:
-    def __init__(self, arm, memory):
+    def __init__(self, arm, memory, *, english=False):
         require(arm in ARMS, 'Unknown arm')
         require((arm == 'pure') == (memory is None), 'Wrong pure memory')
         if arm == 'rule_tree':
@@ -90,6 +94,7 @@ class Knowledge:
             require(isinstance(memory, FlatMemory) and
                     all(d['kind'] == kind for d in memory.docs.values()), 'Wrong material kind')
         self.arm, self.memory = arm, memory
+        self.english = english
         self.offered, self.read_ids, self.events = set(), set(), []
         self.returned_chars = 0
 
@@ -100,6 +105,8 @@ class Knowledge:
             require(set(args) == {'query', 'offset'} and type(args['offset']) is int
                     and args['offset'] >= 0, 'Invalid search/page fields')
             query = args['query']
+            if self.english:
+                en.require_english_query(query)
             if self.arm == 'rule_tree':
                 _, trace = self.memory.retrieve(query)
                 allowed = {rid for route in trace['routes'] for rid in route.get('leaf_ids', [])}
@@ -114,7 +121,8 @@ class Knowledge:
         require(name == 'read_memory' and set(args) == {'id'} and isinstance(args['id'], str), 'Invalid read')
         require(args['id'] in self.offered, 'ID was not returned by this conversation')
         flat = self.memory.memory if self.arm == 'rule_tree' else self.memory
-        return flat.view(args['id'])
+        item = flat.view(args['id'])
+        return en.case_view(item) if self.english and self.arm == 'case_rag' else item
 
     def commit(self, name, args, result):
         size = len(json.dumps(result, ensure_ascii=False))

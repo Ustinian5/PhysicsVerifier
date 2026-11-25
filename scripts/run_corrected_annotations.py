@@ -7,6 +7,7 @@ import time
 from types import SimpleNamespace
 
 from dotenv import load_dotenv
+from rule_framework import verifier_english as en
 from scripts import run_corrected_step_generation as generation
 from scripts import run_bench_reannotation as teacher
 
@@ -48,11 +49,12 @@ def prepare(out,bench,screen,inventory,env):
             partial_reference=any(not x.strip() for x in chosen),human_gold=False))
     write(out/'annotation_inputs.json',labeled);write(out/'reference_bindings.json',reference_bindings)
     load_dotenv(env,override=False)
-    teacher.prepare(out/'annotation_inputs.json',out,os.environ['OPENAI_BASE_URL'],expected_count=100,pilot_size=100)
+    teacher.prepare(out/'annotation_inputs.json',out,os.environ['OPENAI_BASE_URL'],expected_count=100,pilot_size=100,
+                    prompt_profile=en.PROFILE)
     binding=dict(protocol='corrected_sol_step_annotations_v1',human_gold=False,
         parent_plan_sha256=sha(bench/'plan.json'),reference_index_sha256=sha(screen/'references_private.json'),
         inputs_sha256=sha(out/'annotation_inputs.json'),reference_bindings_sha256=sha(out/'reference_bindings.json'),
-        manifest_sha256=sha(out/'manifest.json'),evidence=evidence,code_hashes={n:sha(ROOT/n) for n in SOURCES},
+        manifest_sha256=sha(out/'manifest.json'),evidence=evidence,code_hashes={n:sha(ROOT/n) for n in (*SOURCES,'rule_framework/verifier_english.py')},
         downstream_scoring='offline original location matcher only; no semantic matching API')
     write(out/'binding.json',binding)
 

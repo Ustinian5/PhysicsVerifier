@@ -16,6 +16,7 @@ import httpx
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from dotenv import load_dotenv
+from rule_framework import verifier_english as en
 from scripts.run_retrieval_comparison import (
     Transport, BatchBudget, BatchBudgetExceeded, canonical, digest,
     write_json, platform_quota_probe,
@@ -157,8 +158,22 @@ def extract(response):
     return json.loads(text)
 
 
+def annotation_system(config):
+    return en.STEP_ANNOTATION if en.active(config) else SYSTEM
+
+
+def saved_system(out):
+    manifest = out / "manifest.json"
+    return annotation_system(json.loads(manifest.read_text())) if manifest.exists() else SYSTEM
+
+
 def prepare(source, out, endpoint, recover_technical=False, record_recovery=True,
-            expected_count=99, pilot_size=5):
+            expected_count=99, pilot_size=5, prompt_profile=None):
+    manifest = out / "manifest.json"
+    if prompt_profile is None and manifest.exists():
+        prompt_profile = json.loads(manifest.read_text()).get("prompt_profile")
+    language = {"prompt_profile": prompt_profile} if prompt_profile else {}
+    system = annotation_system(language)
     rows = json.loads(source.read_text())
     if (expected_count < 1 or not 1 <= pilot_size <= expected_count or
             len(rows) != expected_count or len({r["id"] for r in rows}) != expected_count):
@@ -170,15 +185,16 @@ def prepare(source, out, endpoint, recover_technical=False, record_recovery=True
     pilot = sorted(random.Random(20261011).sample([r["id"] for r in inputs], pilot_size))
     config = {"model": MODEL, "reasoning_effort": "high", "response_tokens": 32768,
               "endpoint_sha256": digest(endpoint), "source_sha256": sha256_file(source),
-              "input_sha256": digest(inputs), "prompts_sha256": digest([SYSTEM, INSTRUCTIONS]),
+              "input_sha256": digest(inputs), "prompts_sha256": digest([system, INSTRUCTIONS]),
               "runner_sha256": sha256_file(Path(__file__)), "pilot_ids": pilot,
-              "reference_authority": "unverified historical reference; independent verification required",
+              "reference_authority": ("original Combined Language exam reference; check applicability and equivalence"
+                                      if language else "unverified historical reference; independent verification required"),
               "max_requests": 1200 if expected_count == 99 else expected_count * 12,
               "max_input_tokens": 80000000 if expected_count == 99 else expected_count * 808081,
               "max_output_tokens": 40000000 if expected_count == 99 else expected_count * 404041,
               "platform_quota_floor": 1000000, "stages": list(STAGES),
               "model_alias_policy": "exact returned model ID; no automatic model substitution",
-              "human_gold": False, "formal_tasks": len(rows) * len(STAGES), "concurrency": 1}
+              "human_gold": False, "formal_tasks": len(rows) * len(STAGES), "concurrency": 1, **language}
     out.mkdir(parents=True, exist_ok=True)
     if (out / "manifest.json").exists():
         frozen = json.loads((out / "manifest.json").read_text())
@@ -189,7 +205,7 @@ def prepare(source, out, endpoint, recover_technical=False, record_recovery=True
             raise ValueError("frozen manifest mismatch")
         if json.loads((out / "inputs.json").read_text()) != inputs:
             raise ValueError("frozen input file mismatch")
-        if json.loads((out / "prompts.json").read_text()) != {"system": SYSTEM, "instructions": INSTRUCTIONS}:
+        if json.loads((out / "prompts.json").read_text()) != {"system": system, "instructions": INSTRUCTIONS}:
             raise ValueError("frozen prompt file mismatch")
         if recover_technical and record_recovery:
             write_json(out / ("recovery_receipt_" + config["runner_sha256"][:12] + ".json"), {
@@ -207,7 +223,7 @@ def prepare(source, out, endpoint, recover_technical=False, record_recovery=True
     else:
         write_json(out / "manifest.json", config)
         write_json(out / "inputs.json", inputs)
-        write_json(out / "prompts.json", {"system": SYSTEM, "instructions": INSTRUCTIONS})
+        write_json(out / "prompts.json", {"system": system, "instructions": INSTRUCTIONS})
     return inputs, config
 
 
@@ -227,9 +243,9 @@ def previous_annotations(out, stage, sid):
     return {n: json.loads((out / ("arm_"+n) / sid / "result.json").read_text())["annotation"] for n in names}
 
 
-def validate_request(record, body):
+def validate_request(record, body, *, system=SYSTEM):
     request = record.get("request") or {}
-    expected = {"instructions": SYSTEM, "input": canonical(body), "text": {"format": {"type": "json_object"}},
+    expected = {"instructions": system, "input": canonical(body), "text": {"format": {"type": "json_object"}},
                 "model": MODEL, "reasoning": {"effort": "high"}, "max_output_tokens": 32768, "store": False}
     # Legacy requests were nonstreamed; only the transport flag may differ.
     if record.get("endpoint") != "/responses" or {k: v for k, v in request.items() if k != "stream"} != expected:
@@ -238,9 +254,9 @@ def validate_request(record, body):
         raise ValueError("invalid stream flag")
 
 
-def annotation_from_record(path, body, stage, previous):
+def annotation_from_record(path, body, stage, previous, *, system=SYSTEM):
     record = json.loads(path.read_text())
-    validate_request(record, body)
+    validate_request(record, body, system=system)
     response = record.get("response") or {}
     if response.get("model") != MODEL or response.get("reasoning", {}).get("effort") != "high" or not response.get("id"):
         raise ValueError("response model/effort/identity mismatch")
@@ -359,7 +375,7 @@ def validate_saved(out, stage, row, previous):
         raise ValueError("success task hash or identity mismatch")
     if sha256_file(raw) != saved.get("response_record_sha256"):
         raise ValueError("success response record hash mismatch")
-    recovered = annotation_from_record(raw, body, stage, previous)
+    recovered = annotation_from_record(raw, body, stage, previous, system=saved_system(out))
     if recovered != saved["annotation"]:
         raise ValueError("saved annotation differs from raw response and documented correction")
     return saved
@@ -367,7 +383,7 @@ def validate_saved(out, stage, row, previous):
 
 def write_result(out, folder, stage, row, previous, path):
     body = task_body(stage, row, previous)
-    annotation = annotation_from_record(path, body, stage, previous)
+    annotation = annotation_from_record(path, body, stage, previous, system=saved_system(out))
     result = {"id": row["id"], "stage": stage, "task_sha256": digest(body),
               "response_record_sha256": sha256_file(path), "response_record": str(path.relative_to(out)),
               "annotation": annotation, "human_review": "pending", "completed_unix": time.time()}
@@ -460,7 +476,7 @@ def audit(out, inputs, config):
             if previous is None:
                 raise ValueError("decision coverage hold has missing dependencies")
             try:
-                annotation_from_record(raw, task_body(stage, row, previous), stage, previous)
+                annotation_from_record(raw, task_body(stage, row, previous), stage, previous, system=saved_system(out))
             except DecisionCoverageError as exc:
                 content_holds.append(hold_decision_coverage(out, raw, exc))
             else:
@@ -593,7 +609,7 @@ def run(args):
                         content_hold = None
                         held_429 = []
                         for path, rec in records:
-                            validate_request(rec, body)
+                            validate_request(rec, body, system=annotation_system(config))
                         # A later, fully received response can be recovered even
                         # when an earlier attempt was refused. Validate every
                         # envelope first, then use the earliest complete content;
@@ -656,7 +672,7 @@ def run(args):
                         update(state="running", active_task={"stage": stage, "id": sid, "attempt": len(paths)+1}, next_request_unix=None)
                         path = folder / f"request_{len(paths)+1:03d}.json"
                         try:
-                            transport.responses(instructions=SYSTEM, input=canonical(body), text={"format": {"type": "json_object"}}, stream=True)
+                            transport.responses(instructions=annotation_system(config), input=canonical(body), text={"format": {"type": "json_object"}}, stream=True)
                             write_result(out, folder, stage, row, previous, path)
                             circuit.observe(path, json.loads(path.read_text()))
                             made_progress = True

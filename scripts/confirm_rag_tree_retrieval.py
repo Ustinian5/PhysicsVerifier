@@ -1,6 +1,7 @@
 """Paired RAG and tree comparisons with the fixed 26-question skills cohort."""
 import argparse
 from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 import json
 import multiprocessing
 from pathlib import Path
@@ -8,6 +9,7 @@ import time
 from unittest.mock import patch
 
 import httpx
+from rule_framework import verifier_english as en
 from scripts import confirm_skill_retrieval as previous
 
 final, host, pilot, roles = previous.final, previous.host, previous.pilot, previous.roles
@@ -79,6 +81,8 @@ def prepare(root):
         'RRF CHECK cap, history and prompt, comparing its original delivery to empty, original-query BM25 and '
         'relation-ranked delivery. Reuse exact archived bodies. This case analysis is post hoc.',
         prior_checkpoint=host.CONFIG, human_gold=False)
+    if en.active(design):
+        record['prompt_profile'] = en.PROFILE
     final.immutable(out/'design.json',record)
     return record
 
@@ -89,7 +93,11 @@ def run_signature(out, arm):
 
 
 def make_plan(parent,arm,out):
-    config = vr.read(host.OUT/'plan.json')['configuration']
+    config = dict(vr.read(host.OUT/'plan.json')['configuration'])
+    english = en.active(vr.read(parent/'design.json'))
+    require(english == en.active(vr.read(out/'design.json')), 'Incompatible shared PREPARE language')
+    if english:
+        config['prompt_profile'] = en.PROFILE
     prior_config = dict(config,api_base=f'http://127.0.0.1:{pilot.PORT}/v1')
     prior_stamp = previous.signature(parent)
     require(vr.read(parent/'attempts/1/disconnect_acceptance.json')['configuration_sha256']==prior_stamp,
@@ -101,14 +109,15 @@ def make_plan(parent,arm,out):
 
 def prepared(row,parent,old):
     folder = parent/'rows'/row['id']
-    messages = final.p.query_messages(row)
+    english = en.active(old['configuration'])
+    messages = final.p.query_messages(row, english=english)
     wall = old['configuration']['limits']['wall_seconds_per_sample']
     prep = final.saved_request(folder/'prepare',messages,pilot.flat.QUERY_MAX_TOKENS,
-                               pilot.flat.validate_queries,old,available=wall)
+                               partial(pilot.flat.validate_queries, english=english),old,available=wall)
     require(prep['status']=='complete','Frozen shared PREPARE missing')
     prefix = messages+[dict(role='assistant',content=json.dumps(prep['value'],ensure_ascii=False))]
-    query_messages = prefix+[dict(role='user',content=pilot.REWRITE)]
-    rewrite = final.saved_request(folder/'rewrite',query_messages,4096,previous.query,old,
+    query_messages = pilot.rewrite_messages(row, prefix, english=english)
+    rewrite = final.saved_request(folder/'rewrite',query_messages,4096,partial(previous.query, english=english),old,
                                   available=wall-prep['wall_seconds'])
     require(rewrite['status']=='complete','Frozen shared rewrite missing')
     rank_prefix = [dict(role='system',content=roles.ROLE),*query_messages[1:],
@@ -173,7 +182,7 @@ def case_diagnostics(row,parent,folder,old,budget,prep,rewrite,store):
         variants['relation_without_gravity_pair']=[i for i in variants['relation'] if i not in hints]
     results = {}
     for name,ids in variants.items():
-        messages = final.p.continuation_messages(row,prep['value'],[store.view(i) for i in ids],arm='flat_skills')
+        messages = final.p.continuation_messages(row,prep['value'],[store.view(i) for i in ids],arm='flat_skills', english=en.active(old['configuration']))
         require(messages[:-1]==original['messages'][:-1], 'Counterfactual prefix mismatch')
         if name=='archived_rrf':
             record = final.saved_request(archived/'rrf/check',messages,cap,final.p.original.validate_verdict,
@@ -213,7 +222,7 @@ def evaluate(row):
     prep,rewrite,rank_prefix=prepared(row,parent,old)
     queries=prep['value']
     def messages(ids):
-        return final.p.continuation_messages(row,queries,[store.view(i) for i in ids],arm=arm)
+        return final.p.continuation_messages(row,queries,[store.view(i) for i in ids],arm=arm, english=en.active(old['configuration']))
     empty_size=budget.count(messages([]))
     if arm=='pure':
         check=budget.call(folder/'check',messages([]),budget.limits['max_tokens_per_response'],

@@ -9,7 +9,9 @@ from collections import Counter
 import copy
 import json
 import math
+from functools import partial
 
+from rule_framework import verifier_english as en
 from rule_framework.verified_resume import digest
 from rule_framework.rule_skill_comparison import source_payload
 from scripts.continuous_context_v2 import BASE as PREVIOUS_BASE
@@ -300,32 +302,46 @@ Return only the final diagnostics JSON, without a separate checker or a review o
 agent's diagnoses. Cite only actually supplied and relevant reference_ids. An empty list is valid.'''
 
 
-def query_messages(row):
+def prepare_messages(row, system, instruction):
     row = source_payload(row)
     visible = {k: row[k] for k in ('question', 'prediction', 'context')}
-    return [{'role': 'system', 'content': STAGED_BASE},
-            {'role': 'user', 'content': json.dumps(visible, ensure_ascii=False).replace('<|', '\\u003c|') +
-             '\nPREPARE: identify up to three concrete relations or assumptions worth checking across '
+    data = json.dumps(visible, ensure_ascii=False).replace('<|', '\\u003c|')
+    return [dict(role='system', content=system), dict(role='user', content=data + '\n' + instruction)]
+
+
+def query_messages(row, *, english=False):
+    if english:
+        return prepare_messages(row, en.STEP_CHECK, en.QUERY)
+    return prepare_messages(row, STAGED_BASE,
+             'PREPARE: identify up to three concrete relations or assumptions worth checking across '
              'the complete solution. For each, give a short Chinese AND English retrieval phrase in one string. '
              'Use concepts and distinguishing conditions, not claimed errors or answers. '
-             'Return only {"queries":[...]}; do not diagnose the solution yet.'}]
+             'Return only {"queries":[...]}; do not diagnose the solution yet.')
 
 
-def validate_queries(value):
+def validate_queries(value, *, english=False):
     require(isinstance(value, dict) and set(value) == {'queries'}, 'Preparation is queries only')
     q = value['queries']
     require(isinstance(q, list) and 1 <= len(q) <= 3 and
             all(isinstance(s, str) and 0 < len(s.strip()) <= 300 for s in q), 'Invalid query phrases')
+    if english:
+        for phrase in q:
+            en.require_english_query(phrase)
     return value
 
 
-def continuation_messages(row, queries, references):
-    validate_queries(queries)
-    result = query_messages(row)
+def continuation_messages(row, queries, references, *, english=False, arm=None):
+    validate_queries(queries, english=english)
+    result = query_messages(row, english=english)
+    if english and arm == 'case_rag':
+        references = [en.case_view(item) for item in references]
     result.append({'role': 'assistant', 'content': json.dumps(queries, ensure_ascii=False)})
-    result.append({'role': 'user', 'content': json.dumps({'stage': 'CHECK', 'Reference material': references},
-                                                       ensure_ascii=False).replace('<|', '\\u003c|') +
-                   '\nCheck the complete original answer in this conversation. Submit final diagnostics JSON.'})
+    data = json.dumps({'stage': 'CHECK', 'Reference material': references}, ensure_ascii=False).replace('<|', '\\u003c|')
+    instruction = ('Check the complete current solution.' if english else
+                   'Check the complete original answer in this conversation. Submit final diagnostics JSON.')
+    if english and arm == 'case_rag':
+        instruction += ' ' + en.CASE_BINDING
+    result.append({'role':'user', 'content':data + '\n' + instruction})
     return result
 
 
@@ -369,9 +385,12 @@ class TreeMemory:
                         'total_leaf_count': len(self.memory.docs), 'flat_fallback': False}
 
 
-def reference_packet(row, arm, queries, memory, count_tokens):
+def reference_packet(row, arm, queries, memory, count_tokens, *, english=False, render=None):
     """Same query, complete-item and context budgets for all representations."""
-    validate_queries(queries)
+    validate_queries(queries, english=english)
+    if render is None:
+        # The legacy runners can still supply their original continuation via the module.
+        render = partial(continuation_messages, english=True, arm=arm) if english else continuation_messages
     query = '\n'.join(queries['queries'])
     if arm == 'pure':
         require(memory is None, 'Pure model cannot access a knowledge store')
@@ -386,17 +405,18 @@ def reference_packet(row, arm, queries, memory, count_tokens):
         require(all(d['kind'] == kind for d in memory.docs.values()), 'Wrong flat memory kind')
         ranked, detail, flat = memory.search(query), {'algorithm': 'flat_bm25'}, memory
     chosen, omitted = [], []
-    base_tokens = count_tokens(continuation_messages(row, queries, []))
+    base_tokens = count_tokens(render(row, queries, []))
     cap = LIMITS['context_window'] - LIMITS['output_tokens_per_sample']
     require(base_tokens <= cap, 'Original input exceeds context; no truncation')
     for hit in ranked:
-        candidate = chosen + [flat.view(hit['id'])]
-        size = count_tokens(continuation_messages(row, queries, candidate))
+        item = flat.view(hit['id'])
+        candidate = chosen + [en.case_view(item) if english and arm == 'case_rag' else item]
+        size = count_tokens(render(row, queries, candidate))
         if size > cap or size - base_tokens > REFERENCE_TOKEN_CAP:
             omitted.append({'id': hit['id'], 'reason': 'whole_item_exceeds_reference_or_context_budget'})
         else:
             chosen = candidate
-    messages = continuation_messages(row, queries, chosen)
+    messages = render(row, queries, chosen)
     return {'messages': messages, 'references': chosen, 'retrieval': dict(detail, query=query,
             ranked=ranked, provided_complete_ids=[x['id'] for x in chosen], omitted=omitted,
             reference_tokens=count_tokens(messages)-base_tokens, embedding_calls=0, reranker_calls=0)}

@@ -90,6 +90,9 @@ def evaluate(row, arm, dest, old, plan, index, tok, client, stamp, *, replay=Fal
         return result
     if replay:
         require(result_path.is_file(), 'Missing terminal record')
+    english = b.final.en.active(plan['configuration'])
+    require(english == b.final.en.active(old['configuration']), 'Incompatible shared PREPARE language')
+    options = {'english': True} if english else {}
     _, prep = b.prefix_record(b.FORMAL, old, 'formal', row)
     limits = plan['configuration']['limits']
     budget = base.previous.Budget(dest, plan, tok, client)
@@ -129,8 +132,8 @@ def evaluate(row, arm, dest, old, plan, index, tok, client, stamp, *, replay=Fal
 
     if prep['status'] == 'complete':
         try:
-            selected, trace = index.fused_selection(query, call)
-            messages, delivered, full_tokens = base.pack(row, arm, prep['value'], selected, index, budget.count, limits)
+            selected, trace = index.fused_selection(query, call, **options)
+            messages, delivered, full_tokens = base.pack(row, arm, prep['value'], selected, index, budget.count, limits, **options)
             selection = dict(trace=trace, provided=delivered, preview_tokens=preview_tokens,
                              full_tokens=full_tokens, signature=stamp, query=query)
             if replay:

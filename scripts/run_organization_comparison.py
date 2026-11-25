@@ -16,6 +16,8 @@ import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from rule_framework import verifier_english as en
+
 import httpx
 
 from rule_framework import flat_skill_rag as p
@@ -223,13 +225,18 @@ def query(output, row, plan, tokenizer, client):
     folder = output / 'queries' / vr.digest(row['id'])[:24]
     receipt = folder / 'result.json'; binding = plan['configuration_sha256']
     request, raw, response = [folder / n for n in ('request.json', 'raw.json', 'response.json')]
+    english = en.active(plan['configuration'])
+    messages = p.query_messages(row, english=english)
     if receipt.exists():
         value = vr.read(receipt)
         require(value['configuration_sha256'] == binding and value['input_sha256'] == vr.digest(row), 'Query binding changed')
         for path, sha in value['files'].items():
             require(vr.sha(Path(path)) == sha, 'Query evidence changed')
+        if english:
+            require(vr.read(request)['request']['messages'] == messages, 'Shared PREPARE prompt changed')
+            actual = r.parse_json(vr.read(response)['content'])
+            require(value['queries'] == p.validate_queries(actual, english=True), 'Shared PREPARE result changed')
         return value
-    messages = p.query_messages(row)
     if request.exists():
         require(response.exists() and raw.exists(), 'Incomplete prior query; inspect, never resample')
         saved = vr.read(request)['request']; record = vr.read(response)
@@ -242,7 +249,7 @@ def query(output, row, plan, tokenizer, client):
             model=r.EXPECTED_MODEL, messages=messages, max_tokens=p.QUERY_MAX_TOKENS, timeout=1200,
             raw_path=raw, request_path=request, response_path=response)
     require(not record.get('error') and record.get('model_ids') == [r.EXPECTED_MODEL], 'Query transport/identity failure')
-    queries = p.validate_queries(r.parse_json(record['content']))
+    queries = p.validate_queries(r.parse_json(record['content']), english=english)
     evidence = {'turn': 1, 'request_path': str(request), 'request_sha256': vr.sha(request),
         'raw_sse_path': str(raw), 'raw_sse_sha256': vr.sha(raw), 'response_path': str(response),
         'response_sha256': vr.sha(response), 'model_ids': record['model_ids'], 'finish_reasons': record['finish_reasons'],
@@ -316,7 +323,7 @@ def register_content_failure_recovery(output):
 
 
 @contextmanager
-def checking(row, arm, packet, prefix):
+def checking(row, arm, packet, prefix, *, english=False):
     provided = packet['retrieval']['provided_complete_ids']
     def initial(*args, **kwargs):
         usage = prefix['evidence']['usage']
@@ -325,7 +332,8 @@ def checking(row, arm, packet, prefix):
             'returned_chars': len(json.dumps(packet['references'], ensure_ascii=False)),
             'reserved_output_tokens': usage['completion_tokens'], 'input_tokens': usage['prompt_tokens'],
             'turn': 1, 'pending': None, 'response_evidence': [copy.deepcopy(prefix['evidence'])],
-            'visible_output_tokens': 0, 'tree_access': False, 'started_unix': time.time(), 'sample_id': str(row['id'])}
+            'visible_output_tokens': 0, 'tree_access': False, 'started_unix': time.time(), 'sample_id': str(row['id']),
+            **({'prompt_profile': en.PROFILE} if english else {})}
     def audit(value, *args, **kwargs):
         r.validate_diagnostics(value)
         return reference_audit(value, provided)
@@ -366,14 +374,15 @@ def run_condition(output, row, phase, arm, memory, plan, tokenizer, client):
         return saved
     prefix = query(output, row, plan, tokenizer, client)
     count = lambda m: len(tokenizer.apply_chat_template(m, tokenize=True, add_generation_prompt=True))
-    packet = p.reference_packet(row, arm, prefix['queries'], memory, count)
+    options = {'english': True} if en.active(plan['configuration']) else {}
+    packet = p.reference_packet(row, arm, prefix['queries'], memory, count, **options)
     folder = path.parent; folder.mkdir(parents=True, exist_ok=True)
     packet_path = folder / 'reference_packet.json'
     packet_record = {'configuration_sha256': plan['configuration_sha256'], 'packet': packet,
                      'query_evidence_sha256': vr.digest(prefix), 'input_sha256': vr.digest(row)}
     if packet_path.exists(): require(vr.read(packet_path) == packet_record, 'Retrieval packet drift')
     else: vr.atomic(packet_path, packet_record)
-    with checking(row, arm, packet, prefix):
+    with checking(row, arm, packet, prefix, **options):
         result = r.run_sample(row, arm='C0p', catalog={'domains': []}, tokenizer=tokenizer, client=client,
             endpoint=plan['configuration']['api_base']+'/chat/completions', model=r.EXPECTED_MODEL,
             root=output/phase/arm, signature=plan['configuration_sha256'], limits=plan['configuration']['limits'])

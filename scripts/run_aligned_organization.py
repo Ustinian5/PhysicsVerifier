@@ -61,7 +61,7 @@ def code_hashes():
     return {n: vr.sha(ROOT / n) for n in sorted(names)}
 
 
-def assert_legacy(legacy):
+def assert_legacy(legacy, *, archived_sources=False):
     plan = vr.read(legacy / 'plan.json'); c = plan['configuration']
     require(vr.digest(c) == plan['configuration_sha256'], 'Legacy plan drift')
     require(c['protocol'] == bounded.VERSION and c['check_prompt'] == base.p.STAGED_BASE,
@@ -71,7 +71,13 @@ def assert_legacy(legacy):
     extensions = {'scripts/analyze_organization_comparison.py', 'scripts/evaluate_physics_eval_sets.py',
                   'scripts/rescore_frozen_bench.py', 'scripts/gpt_oss_harmony_transport.py'}
     for name, sha in c['source_hashes'].items():
-        if name not in extensions:
+        if archived_sources:
+            # The untracked retrieval dependency was recovered and committed after the v15 release.
+            commit = ('20c048bdb0004fddd9a260bde1da14f00e0e2005' if name == 'scripts/run_retrieval_comparison.py'
+                      else 'df8cfbb5eaf819ac8debe3fc23d7fc1a2d2ca51c')
+            source = subprocess.check_output(['git', 'show', commit + ':' + name], cwd=ROOT)
+            require(hashlib.sha256(source).hexdigest() == sha, 'Archived v15 source changed: ' + name)
+        elif name not in extensions:
             require(sha == vr.sha(ROOT / name), 'Legacy core changed: ' + name)
     require(c['skill_prompt'] == bounded.SKILL_PROMPT and c['max_skills_per_source'] == 2,
             'Bounded skill prompt changed')
@@ -90,6 +96,7 @@ def assert_legacy(legacy):
 
 def replay_request_contract(legacy):
     """Reconstruct all recorded first CHECK messages; no model calls."""
+    assert_legacy(legacy, archived_sources=True)
     rows = {x['id']: x for x in vr.read(legacy / 'inputs.json')}
     checked, files = 0, {}
     for arm in base.p.ARMS:

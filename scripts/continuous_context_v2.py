@@ -49,9 +49,15 @@ def invalid_quotes(value, row):
             if d["evidence"]["quote"] not in row["prediction"]]
 
 
-def repair_message(value, indices):
+def repair_message(value, indices, *, english=False):
     payload = {"invalid_indices": indices, "original_quotes": [
         {"index": i, "quote": value["diagnostics"][i]["evidence"]["quote"]} for i in indices]}
+    if english:
+        return ("Correct only the listed evidence quotes. For each zero-based index, copy the shortest continuous "
+                "passage in the current student's solution that expresses the diagnosed claim. Preserve its original "
+                "language, notation and spelling. Use null if you cannot locate it. Preserve all findings and their order.\n"
+                'Return only {"quote_patches":[{"index":0,"quote":"exact passage"}]} with each listed index once.\n'
+                + json.dumps(payload, ensure_ascii=False).replace('<|', '\\u003c|'))
     return ("Mechanical source-copy check only. The listed quotes are not exact continuous substrings of the original Student Solution already in this conversation. "
             "Keep every diagnosis, its message, order and rule_refs unchanged. Do not reconsider physics, add/delete findings, look up rules, or quote extra surrounding paragraphs. "
             "For EACH listed zero-based index, copy a minimal original substring that expresses the SAME diagnosed claim. "
@@ -148,8 +154,9 @@ def maybe_start_repair(value, row, state, limits, sample_dir, content):
             state["input_tokens"] >= limits["input_tokens_per_sample"]):
         return False
     state["quote_repair"].update(status="pending", attempts=1)
+    from rule_framework.verifier_english import active
     state["messages"].extend([{"role": "assistant", "content": content},
-                              {"role": "user", "content": repair_message(value, indices)}])
+                              {"role": "user", "content": repair_message(value, indices, english=active(state))}])
     state["pending"] = None
     state["turn"] += 1
     r.write_json(sample_dir / "state.json", state)

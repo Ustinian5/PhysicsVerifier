@@ -1,5 +1,7 @@
 # 脚本入口
 
+新版 verifier 的英文审阅稿由实际请求函数生成。用项目 conda 环境执行 `python -m scripts.print_verifier_prompts` 即可离线查看各阶段的系统指令、模型可见字段、修复轮和英文查询。建库首审读取本题原始官方参考，四组闭卷迁移评测共用英文 PREPARE。完成批次的原始请求可从下文的冻结记录追溯。[英文提示词全文](../docs/Verifier英文提示词.md) · [建库首审](../rule_framework/build_review_prompt.txt) · [英文请求与查询约束](../rule_framework/verifier_english.py)
+
 已完成的11月21日474题最终答案评测使用 `scripts.run_final_answer_revision`。原题、30B回答、参考、三库及实验参数均由准备配置绑定。node14 的正式入口复用已通过固定6题验收的服务与个人互斥锁。[题目级执行器](run_final_answer_revision.py) · [项目进展](../docs/项目进展.md)
 
 | 环节 | 服务器入口与产物 |

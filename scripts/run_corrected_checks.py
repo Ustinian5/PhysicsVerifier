@@ -81,8 +81,9 @@ def run_case(folder, row, arm, task, memory, configuration, tokenizer):
     # allowance. One unknown-usage request exhausts the case conservatively;
     # it is not resampled under a fresh budget. Construction uses its own policy.
     cfg = dict(configuration['transport'], technical_attempts=1)
-    history = p.messages(row, arm, task, revision=configuration.get('check_prompt_revision'))
-    knowledge = p.Knowledge(arm, memory)
+    english = p.en.active(configuration)
+    history = p.messages(row, arm, task, revision=configuration.get('check_prompt_revision'), english=english)
+    knowledge = p.Knowledge(arm, memory, english=english)
     native = p.tools() if arm!='pure' else None
     used_in = used_out = 0
     evidence, input_audits, serializations = [], [], []
@@ -207,7 +208,7 @@ def run_case(folder, row, arm, task, memory, configuration, tokenizer):
             bad=p.step.invalid_quotes(value,row)
             if bad:
                 patch_pending=True
-                history.append(dict(role='user',content=p.step.repair_message(first,bad)))
+                history.append(dict(role='user',content=p.step.repair_message(first,bad,english=english)))
                 quote_repair=dict(status='pending_or_budget_exhausted',invalid_indices=bad)
                 continue
             status,reason='complete',None

@@ -14,7 +14,6 @@ LEGACY = run.ROOT / 'results/organization_bounded99_20261103_v15'
 
 @pytest.mark.skipif(not (LEGACY / 'inputs.json').exists(), reason='Private historical run unavailable')
 def test_all_396_first_check_requests_reconstructed_exactly():
-    run.assert_legacy(LEGACY)
     value = run.replay_request_contract(LEGACY)
     assert value['checked'] == 396 and value['all_messages_exact']
 

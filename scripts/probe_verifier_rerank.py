@@ -77,10 +77,13 @@ def probe(root, sid, arm, selection=None, *, library='n2000'):
             if size([doc]) > cap:
                 continue
             if name == 'cases':
-                heading = '120B原始核查说明\n' if library is not None else '120B解题/纠错说明\n'
-                _, marker, note = doc['text'].rpartition(heading)
-                final.require(marker, 'Case has no original audit note')
-                excerpt = note.partition('\n未决事项')[0]
+                if library is not None:
+                    from rule_framework.verifier_english import review_text
+                    excerpt = review_text(doc['text'])
+                else:
+                    _, marker, note = doc['text'].rpartition('120B解题/纠错说明\n')
+                    final.require(marker, 'Case has no original audit note')
+                    excerpt = note.partition('\n未决事项')[0]
             else:
                 excerpt = doc['text']
             cards.append(dict(id=key, title=doc['title'], check_excerpt=excerpt[:600]))
