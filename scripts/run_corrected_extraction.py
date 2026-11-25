@@ -1,6 +1,6 @@
 """Extract fresh experiences from the corrected, isolated 2000-question cohort.
 
-Reuse the original per-answer audit+rule prompt and one structural repair.
+Freeze the per-answer audit prompt when preparing a new extraction plan.
 No old corpus, reference labels, embedding or separate checker is invoked.
 This stage exports raw experiences and deduplicated candidates, not a tree.
 """
@@ -18,6 +18,7 @@ from scripts import run_experience_first_120b as old
 from scripts.run_qwen30b_step_checks import validate_effective_input
 
 read, write, sha, digest, require = c.read, c.write, c.sha, c.digest, c.require
+AUDIT_PROMPT_FILE = c.ROOT / 'rule_framework/build_review_prompt.txt'
 
 
 def build_rows(source):
@@ -44,12 +45,15 @@ def build_rows(source):
 
 def prepare(out, source):
     require(not (out/'plan.json').exists(), 'Already prepared')
+    audit_prompt = AUDIT_PROMPT_FILE.read_text(encoding='utf-8').rstrip('\n')
+    require(bool(audit_prompt.strip()), 'Empty first-review prompt')
     rows, rejected, evidence = build_rows(source)
     skeleton = old.flow.experience_topic_skeleton(read(c.ROOT/'catalogs/rules_catalog_top_down.json'))
     cfg = dict(model=c.corpus.r.EXPECTED_MODEL, auditor_api='http://127.0.0.1:18083/v1',
         max_tokens=16384, max_request_input_bytes=400000, reasoning_effort='medium', timeout_seconds=1200,
         technical_attempts=3, retry_cooldown_seconds=60, max_rules_per_sample=2,
         structural_repair_rounds=1, fixed_date='2026-11-07', pilot_size=12,
+        audit_system_prompt=audit_prompt,
         source_plan_sha256=sha(source/'plan.json'), source=str(source),
         inputs_sha256=digest(rows), skeleton_sha256=digest(skeleton), evidence_sha256=digest(evidence),
         sources={n:sha(c.ROOT/n) for n in sorted(set(list(old.SOURCES)+list(c.SOURCES)+
@@ -79,10 +83,18 @@ def confirm(out):
     write(out/'disconnect_acceptance.json',dict(ready,passed=True,confirmed_unix=time.time()))
 
 
+def request_messages(stage, payload, config):
+    messenger = old.Journal.__new__(old.Journal)
+    messages = messenger.messages(stage, payload)
+    # The November frozen plans use the original first review, including in a repair turn.
+    if stage in {'extract_experience', 'repair_experience'} and 'audit_system_prompt' in config:
+        messages[0] = {'role': 'system', 'content': config['audit_system_prompt']}
+    return messages
+
+
 def call(out, journal, tokenizer, stage, key, payload):
     cfg=journal.config
-    messenger=old.Journal.__new__(old.Journal)
-    messages=messenger.messages(stage,payload)
+    messages=request_messages(stage, payload, cfg)
     body=c.corpus.r.request_body(cfg['model'],messages,cfg['max_tokens'],backend='vllm')
     body.update(stream=False,return_token_ids=True,reasoning_effort='medium');body.pop('stream_options',None)
     require(len(json.dumps(body,ensure_ascii=False).encode())<=cfg['max_request_input_bytes'],'Request byte budget exceeded')
