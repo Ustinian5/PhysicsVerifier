@@ -6,6 +6,9 @@ from rule_framework import verified_resume as vr
 from scripts.audit_final_answer_metrics import ARMS, divide, measure
 
 
+EXAM_ARMS = ('pure', 'with_exam_answer')
+
+
 def report_row(group):
     c = group['counts']
     tp, fp, fn, tn = (c[k] for k in ('TP', 'FP', 'FN', 'TN'))
@@ -35,7 +38,27 @@ def tables(report):
         return [('旧输出同题复算（修订标签）', {arm: groups[arm]['revised_labels_same_subset'] for arm in ARMS})]
     if report.get('positive_class') != 'incorrect':
         raise ValueError('Expected a published final-answer report with incorrect as the positive class')
+    if 'registered_sensitivity' in report:
+        return [('题目级本题参考答案对照', groups)]
     return [('题目级正式成绩', groups)]
+
+
+def exam_pair_stats(path, report):
+    from scripts.score_final_exam_reference import analyze
+
+    source = path.parent/'details.json'
+    design = path.parent/'design.json'
+    if vr.sha(source)!=report['details_sha256'] or vr.sha(design)!=report['design_sha256']:
+        raise ValueError('Changed reference comparison details or design')
+    rows = vr.read(source)['rows']
+    labels = {r['id']: r['label'] for r in rows}
+    if (list(labels)!=vr.read(design)['configuration']['ids'] or len(rows)!=len(labels) or
+            len(labels)!=report['measured'] or report['registered']!=len(labels)+report['held']):
+        raise ValueError('Incomplete paired final-answer cohort')
+    replay = analyze(labels,{r['id']:r['arms'] for r in rows},report['registered_sensitivity']['held_label'])
+    if any(replay[k]!=report[k] for k in replay):
+        raise ValueError('Paired final-answer statistics changed')
+    return replay['inference']
 
 
 def paired_records(path, report):
@@ -106,17 +129,25 @@ def main():
         parser.exit(1, f'还没有该发布文件：{args.file}\n')
     path = args.file.resolve()
     published = vr.read(path)
+    exam = 'registered_sensitivity' in published
+    order = EXAM_ARMS if exam else ARMS
     for title, groups in tables(published):
-        if set(groups) != set(ARMS):
-            raise ValueError('Expected all four verifier arms')
+        if set(groups) != set(order):
+            raise ValueError('Unexpected verifier arms')
         print(f'\n{title}\n')
         print('| 组别 | Precision | Recall | F1 | 有效/总数 | 弃权 | 内容失败 | 全体标错题检出率 |')
         print('|---|---:|---:|---:|---:|---:|---:|---:|')
-        for arm in ARMS:
+        for arm in order:
             row = report_row(groups[arm])
             print('| {arm} | {precision:.2%} | {recall:.2%} | {f1:.2%} | {valid}/{total} | '
                   '{abstained} | {failed} | {all_wrong_detected:.2%} |'.format(arm=arm, **row))
     if args.paired:
+        if exam:
+            result = exam_pair_stats(path, published)
+            lo,hi = result['stratified_paired_ci95_pp']
+            print(f"\n同题 ΔF1 {result['delta_f1_pp']:+.2f} 个百分点，"
+                  f"95% 区间 [{lo:+.2f}, {hi:+.2f}]，双侧 p = {result['paired_two_sided_p']:.6g}。")
+            return
         labels, binary = paired_records(path, published)
         print('\n与纯组在同题均给出有效二分类时比较\n')
         print('| 组别 | 共同有效 | 新检出错答 | 丢失错答 | 消除误报 | 新增误报 |')

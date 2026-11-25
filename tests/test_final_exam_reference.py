@@ -5,6 +5,7 @@ from itertools import product
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from scripts import report_final_answer_metrics as report
 from scripts import run_final_exam_reference as trial
 from scripts import score_final_exam_reference as score
 
@@ -69,3 +70,14 @@ class FinalReferenceTest(unittest.TestCase):
         bounds=result['registered_sensitivity']
         self.assertEqual(len(bounds['scenarios']),9)
         self.assertEqual(bounds['delta_f1_pp_range'][1],100.)
+        with TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            trial.vr.atomic(root/'design.json',{'configuration':{'ids':list(labels)}})
+            trial.vr.atomic(root/'details.json',{'rows':[dict(id=q,label=y,arms=pairs[q]) for q,y in labels.items()]})
+            published=dict(result,positive_class='incorrect',registered=5,measured=4,held=1,
+                           details_sha256=trial.vr.sha(root/'details.json'),design_sha256=trial.vr.sha(root/'design.json'))
+            self.assertEqual(report.tables(published)[0][0],'题目级本题参考答案对照')
+            self.assertEqual(report.exam_pair_stats(root/'metrics.json',published),result['inference'])
+            published['inference']={}
+            with self.assertRaises(ValueError):
+                report.exam_pair_stats(root/'metrics.json',published)
