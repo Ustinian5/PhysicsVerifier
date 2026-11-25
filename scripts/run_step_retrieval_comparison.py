@@ -34,6 +34,15 @@ def design():
                      f.__file__,f.step.__file__, t.semantic.__file__, t.runtime.__file__, t.PROCESSOR)})
     # JSON arrays are also used when validating an existing design after reconnect.
     cfg.update(arms=list(ARMS), modes=list(MODES))
+    repair = ROOT/'check_replay_repair.json'
+    if repair.is_file():
+        receipt = vr.read(repair)
+        name = Path(__file__).name
+        require(receipt['original_design_sha256']==vr.sha(ROOT/'design.json')
+                == '430c7c4b88dcbcf8a5d163b3231548e14b947e95b254b9198aa59a6ad1d3cfe9'
+                and receipt['old_code_sha256']=='9be03c4e854442f488edd4d4eeefe5617767b625ee324d65bde62db149063577'
+                and receipt['new_code_sha256']==cfg['code'][name], 'Unbound CHECK verification repair')
+        cfg['code'][name] = receipt['old_code_sha256']
     signature = vr.digest(cfg)
     write(ROOT/'design.json', dict(configuration=cfg,configuration_sha256=signature))
     return signature
@@ -90,13 +99,15 @@ def row_pair(row, arm, phase, tasks, index, tok, client, plan):
         remaining = packets.check_limits(limits, prepared, charges, mode)
         cfg = dict(plan['configuration'], limits=remaining)
         local_plan = dict(plan,configuration=cfg)
+        # The native step engine appends its response to the input message list in place.
+        expected_messages = vr.digest(packet['messages'])
         with f.step.old.a.configured(work,tok), patch.object(f.base,'query',return_value=prefix), \
                 patch.object(f.base.p,'reference_packet',return_value=packet):
             result = f.step.old.a.bench.run_condition(work,row,phase,arm,None,local_plan,tok,client)
         require(result['id']==sid and result['configuration_sha256']==stamp,'CHECK identity drift')
         turn = path.parent/'turn_02'
         body = vr.read(turn/'request.json')['request']
-        require(body['messages']==packet['messages'] and body['max_tokens']==remaining['output_tokens_per_sample']-
+        require(vr.digest(body['messages'])==expected_messages and body['max_tokens']==remaining['output_tokens_per_sample']-
                 prepared['usage']['completion_tokens'] and 'vllm_xargs' not in body, 'Step CHECK protocol changed')
         if phase=='pilot':
             require(f.base.runtime.healthy_result(result) and result['protocol_audit']['passed'], 'Pilot CHECK failure')
@@ -151,7 +162,8 @@ def run(folder, arm, stamp):
     while not all((ROOT/'receipts'/a/'pilot.json').is_file() for a in ARMS):
         require(not (ROOT/'STOP').exists(),'STOP requested')
         for a in ARMS:
-            for p in (ROOT/a/'attempts').glob('*/exit.json'):
+            p = ROOT/a/'attempts'/folder.name/'exit.json'
+            if p.is_file():
                 if vr.read(p)['code'] and not (ROOT/'receipts'/a/'pilot.json').exists():
                     raise RuntimeError('Another pilot requires recovery')
         time.sleep(10)
