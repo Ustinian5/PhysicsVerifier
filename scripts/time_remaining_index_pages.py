@@ -120,7 +120,7 @@ def run(folder, arm, arm_dir, receipt):
 
 
 def report():
-    directory = b.RESULTS/cohort.RESULT/timed.NAME
+    directory = b.RESULTS/cohort.RESULT/timed.PRIOR
     scores = vr.read(directory/'metrics_10.json')
     ids = scores['ids']
     require(len(ids)==10 and scores['design_sha256']==vr.sha(directory/'design.json'), 'Different ten-question run')
@@ -185,7 +185,7 @@ if __name__ == '__main__':
         report()
         raise SystemExit(0)
     require(args.arm is not None,'Flat arm required')
-    arm_dir = b.RESULTS/cohort.RESULT/timed.NAME/args.arm
+    arm_dir = b.RESULTS/cohort.RESULT/timed.PRIOR/args.arm
     receipt = signature(arm_dir)
     runtime.detached(arm_dir/'index_profile', args.attempt, receipt,
                      lambda folder:run(folder,args.arm,arm_dir,receipt), args.action=='confirm')

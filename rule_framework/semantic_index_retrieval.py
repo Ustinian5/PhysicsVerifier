@@ -3,6 +3,7 @@ import json
 
 from rule_framework import verified_resume as vr
 from rule_framework.flat_skill_rag import FlatMemory, TreeMemory
+from rule_framework.rank_output import RankShape
 from scripts import pilot_retrieval_fusion as fusion
 
 PAGE_SIZE = 256
@@ -35,20 +36,8 @@ def item_card(doc, arm):
 
 
 def ranking_validator(count, limit, parents=None):
-    def validate(value):
-        ids = value.get('ids') if isinstance(value, dict) else None
-        if not (isinstance(ids, list) and len(ids) <= limit and len(ids) == len(set(ids))
-                and all(type(i) is int and 1 <= i <= count for i in ids)):
-            raise ValueError('Malformed or out-of-pool ranking')
-        if parents:
-            by_parent = {}
-            for i in ids:
-                key = parents[i-1]
-                by_parent[key] = by_parent.get(key, 0) + 1
-                if by_parent[key] > 2:
-                    raise ValueError('Semantic route exceeded two children under one parent')
-        return {'ids': ids}
-    return validate
+    groups = {p:i for i,p in enumerate(dict.fromkeys(parents or ()))}
+    return RankShape(count, limit, tuple(groups[p] for p in parents or ()))
 
 
 class Index:
