@@ -1,7 +1,7 @@
 """Print the current English verifier messages for human review, without model calls or dataset access."""
 import json
 
-from rule_framework import bounded_tree, final_answer_revision as final, flat_skill_rag as step
+from rule_framework import step_match, bounded_tree, final_answer_revision as final, flat_skill_rag as step
 from rule_framework import organization_followup, semantic_index_retrieval as selection, verifier_english as en
 from scripts import continuous_context_v2 as quotes, pilot_retrieval_fusion as fusion
 from scripts import rebuild_qwen30b_corpus as solver, run_bench_reannotation as annotator
@@ -76,6 +76,10 @@ def render():
          final.continuation_messages(row, queries, [case], arm='case_rag', english=True, official_reference=answer)[-1:])
     show('Step evidence-quote repair', [dict(role='user', content=quotes.repair_message(
         {'diagnostics':[{'evidence':{'quote':'3 metres per second'}}]}, [0], english=True))])
+    show('Independent post-publication step matching', step_match.messages(row, dict(
+        message='The stated speed is inconsistent with distance divided by time.', evidence={'quote': row['prediction']}),
+        [dict(root_id='E1', claim='The numerical speed is incorrect.', reason='12 m divided by 3 s gives 4 m/s.',
+              correct_relation='v = d/t', premises='The given speed is constant.', quote=row['prediction'])]))
     prefix = final.query_messages(row, english=True) + [dict(role='assistant', content=json.dumps(queries))]
     show('Retrieval development / English query rewrite', fusion.rewrite_messages(row,prefix,english=True)[-1:])
     show('Semantic candidate ranking / page or merge', timed.model_text(selection.RANK+'24.',

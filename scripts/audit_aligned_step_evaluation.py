@@ -148,6 +148,23 @@ class Audit:
 
 def audit(out):
     require(Path('/proc').exists(), 'Run the formal acceptance audit on the server')
+    if 'step_match_judge' in vr.read(out / 'plan.json')['configuration']:
+        with base.r.run_lock(out / 'active.lock'), base.r.run_lock(out / 'acceptance.lock'):
+            plan = run.verify(out)
+            signature = plan['configuration_sha256']
+            release = vr.read(out / 'release.json')
+            require(vr.read(out / 'execution_status.json')['state'] == 'completed' and
+                    (out / 'runner.exit_code').read_text().strip() == '0' and not (out / 'runner.pid').exists() and
+                    not release['owned_gpu_pids'] and not release['session_workers'] and
+                    vr.read(out / 'deployment.json')['configuration_sha256'] == signature, 'Run or release incomplete')
+            original = vr.read(out / 'metrics.json')
+            require(run.score(out, plan) == original, 'Independent judge replay differs from published scores')
+            report = dict(passed=True, configuration_sha256=signature, judge_configuration_sha256=original['configuration_sha256'],
+                          formal_tasks=sum(original['recorded_tasks'].values()), judged_diagnoses=original['judge']['valid'],
+                          coverage=original['coverage'], metrics_sha256=vr.sha(out / 'metrics.json'),
+                          physical_quality_certified=False, human_gold=False)
+            vr.atomic(out / 'acceptance.json', report)
+            return report
     plan = recovery.verify(out); config = plan['configuration']
     with ExitStack() as stack:
         for p in (out / 'active.lock', Path(config['service_lock']), out / 'acceptance.lock'):

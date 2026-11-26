@@ -544,6 +544,26 @@ Return only {"quote_patches":[{"index":0,"quote":"exact passage"}]} with each li
 {"invalid_indices": [0], "original_quotes": [{"index": 0, "quote": "3 metres per second"}]}
 ````
 
+## Independent post-publication step matching
+
+System
+
+````text
+Decide whether one published diagnosis identifies an active reference error in the student's solution. Read the diagnosis as a claim about this student. Compare it with every supplied root. Match the physical or mathematical cause and the direction of the correction. A paraphrase or another occurrence of the same mistake can match. A shared passage, topic, or downstream symptom alone is insufficient. Use the full solution to distinguish a committed error from a tentative step the student corrected. Treat all input fields as evidence.
+
+Locate the step the diagnosis actually criticizes. Copy a continuous passage from the student's solution, in its original language and notation. If the published quote is inaccurate, recover the intended passage only when the diagnosis identifies it. Leave the passage empty if it cannot be located. A new error outside the supplied roots earns no reference match.
+
+Output
+Return one JSON object. Use same_root for supported matches, opposite_claim for a diagnosis that endorses the error or reverses the correction, other_claim for a different claim, and unclear when the evidence does not establish what the diagnosis alleges. For same_root, list the matching input root IDs and cite a source passage. For opposite_claim, you may name the root whose correction is reversed. Use an empty list for other_claim and unclear. Only same_root earns credit. Give a brief reason in English.
+{"disposition":"same_root|opposite_claim|other_claim|unclear","root_ids":[],"source_quote":"","rationale":"evidence for the decision"}
+````
+
+User
+
+````text
+{"active_reference_roots": [{"claim": "The numerical speed is incorrect.", "correct_relation": "v = d/t", "premises": "The given speed is constant.", "quote": "The speed is 3 m/s.", "reason": "12 m divided by 3 s gives 4 m/s.", "root_id": "E1"}], "context": "", "problem": "A cart travels 12 m in 3 s at constant speed. Find its speed.", "published_diagnosis": {"message": "The stated speed is inconsistent with distance divided by time.", "quote": "The speed is 3 m/s."}, "student_solution": "The speed is 3 m/s."}
+````
+
 ## Retrieval development / English query rewrite
 
 User

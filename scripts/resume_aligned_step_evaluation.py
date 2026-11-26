@@ -211,6 +211,11 @@ def main():
     parser.add_argument('command', choices=['register', 'verify', 'run', 'score', 'confirm-detached'])
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args(); out = args.output.resolve()
+    if 'step_match_judge' in vr.read(out / 'plan.json')['configuration']:
+        if args.command == 'run': return run.run(out)
+        if args.command == 'score': return run.score(out)
+        if args.command == 'confirm-detached': return run.confirm(out)
+        return run.verify(out)
     if args.command == 'register': register(out)
     elif args.command == 'verify': verify(out)
     elif args.command == 'confirm-detached': verify(out); run.confirm(out)
