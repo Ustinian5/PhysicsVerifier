@@ -2,7 +2,9 @@
 
 两级正式 verifier 的四组均隐藏测试题官方答案及 bench 标签。纯120B直接核查题干和冻结30B原答，三个知识组在英文 PREPARE、各库检索后以同一会话 CHECK。三库须来自对照建库题官方答案的同一份首审。[评测协议](../docs/效果测评.md)
 
-node14 使用个人解释器 `/data0/zengzheni/PhysicsVerifier-huhengyuan/envs/physicsverifier/bin/python`。步骤级模块为 `scripts.run_aligned_step_evaluation`。纯组使用 `prepare --pure-only --output <新目录>`，四组使用 `prepare --parent <已验收的参考答案指导建库目录> --output <新目录>`。两者均复用原6道开发题、99道可测题。后台执行 `run --output <新目录> --gpu 4`，重新连接后以 `confirm-detached --output <新目录>` 放行。程序逐题比对公开输入、历史材料及实际服务输入 token；开发验收通过后执行正式检查和独立步骤裁判。离线复算用 `score --output <新目录>`。[步骤级入口](run_aligned_step_evaluation.py)
+node14 使用个人解释器 `/data0/zengzheni/PhysicsVerifier-huhengyuan/envs/physicsverifier/bin/python`。在项目目录执行 `python -m scripts.run_reference_guided_verifier audit` 可从2,000份登记重新核对来源和实际可见题面。结果根 `english_blind_verifier/build_scope_audit.json` 保存逐题处置、题族对应关系、独立分问范围和原件哈希。该操作在 CPU 上执行。[来源与运行入口](run_reference_guided_verifier.py)
+
+步骤级模块 `scripts.run_aligned_step_evaluation` 的四组比较复用 `english_blind_verifier/step_pure` 已完成的检查与独立裁决。三库验收后由服务器执行器读取同一批材料，先跑固定6道开发题，再跑99道正式题的三个知识组。独立裁判汇总四组，`score --output <步骤级结果目录>` 可从原件复算。[步骤级入口](run_aligned_step_evaluation.py)
 
 11月26日步骤级纯组有31条首轮裁决需要补定位。仅此批次使用 `python -m scripts.repair_step_judge_locations score --published <english_blind_verifier/step_pure>` 离线复算。结果根的 `metrics.json` 汇总原32条有效裁决和31条补裁；`step_judge/location_repair/` 保存补裁清单、逐条原文位置和运行回执。[定位补裁入口](repair_step_judge_locations.py)
 

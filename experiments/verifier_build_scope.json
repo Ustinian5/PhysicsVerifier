@@ -1,0 +1,384 @@
+{
+  "split_sha256": "899d29698618bf87f228673a6bcd2444007f7ed49fbb5deb09ecd21f748f9f58",
+  "families": [
+    {
+      "name": "Floating melon",
+      "basis": "The source questions refer to tasks 2 and 4 and the same melon, bucket and photograph as task 1.",
+      "build": [
+        {
+          "position": 274,
+          "id": "cf3967541904ca6c31667b22134bab437cdc6837215faa7c47ae838c48a93e3d"
+        },
+        {
+          "position": 409,
+          "id": "62a07c4b8297c063fcb852b972e21db38f50ed9137326ff13b104f085544bdf0"
+        }
+      ],
+      "heldout": [
+        {
+          "cohort": "reserve",
+          "position": 255,
+          "id": "e49b7064e0e2b0b0b0248dc7026fdbb227ea8846eb70a72db8bdc1c7a7a02cbe"
+        }
+      ]
+    },
+    {
+      "name": "Van der Waals gas",
+      "basis": "Questions 2, 4 and 5 share the same figure and the sixth problem of the 39th Chinese Physics Olympiad final.",
+      "build": [
+        {
+          "position": 821,
+          "id": "8f2c693fc7a160b272b31af5e337caa25942b0662b1e62c4723ab33b4358d033"
+        },
+        {
+          "position": 1840,
+          "id": "e1525c5afd9f533decf2730acb4acd860fd84c7163faa178ef0c88976fa38856"
+        }
+      ],
+      "heldout": [
+        {
+          "cohort": "reserve",
+          "position": 453,
+          "id": "1527b918fc0d9105458135410e47d7669fe06f56870093ff452fd338633df803"
+        }
+      ]
+    },
+    {
+      "name": "Resistor cube",
+      "basis": "The capacitor subquestion modifies components in the same labelled cube network used in the reserved resistance problem.",
+      "build": [
+        {
+          "position": 455,
+          "id": "0b86a4efa5d4e6b6007b78bd54f932363a44195c83797cd5d74bfbd7879a2338"
+        }
+      ],
+      "heldout": [
+        {
+          "cohort": "reserve",
+          "position": 372,
+          "id": "85432fcb38c365c32c40d2de2963056c25eabc30216db05bf4df3174d80e66d4"
+        }
+      ]
+    },
+    {
+      "name": "Nuclear stability and neutron stars",
+      "basis": "The stems introduce the same competition problem and partition its modelling and observational subquestions.",
+      "build": [
+        {
+          "position": 486,
+          "id": "7a454327d7bcb1a86b2acb9e7706e78d56c5629c87c74677afdfa056b7501e2d"
+        },
+        {
+          "position": 1795,
+          "id": "1e594e7573d0ecc2487be2d3b7d5e0b3ad43b9bf311c04a05a40c1e62874647e"
+        },
+        {
+          "position": 1796,
+          "id": "1f286c50930afdd53d3726d71fd3f4dbdad05c100b97c7b3946afcd29cda4cca"
+        },
+        {
+          "position": 1797,
+          "id": "5635cfa01ac70e92219048531b1decc95815d77a9f990f8e6b99baee6c982472"
+        },
+        {
+          "position": 1798,
+          "id": "76a3b992860fbcbbb2ed8a3a2a1bbbbab4229a248cd3a844312ea0ff407e0aff"
+        }
+      ],
+      "heldout": [
+        {
+          "cohort": "reserve",
+          "position": 310,
+          "id": "b477131c65680a45d095ef6226767c1d3dd9449be3896ed2f50361409a4d39e7"
+        },
+        {
+          "cohort": "reserve",
+          "position": 613,
+          "id": "8738c5e90a8d6c8ff31ac7e6fa328a167975e1e9095949483bfa6f0b19c33986"
+        }
+      ]
+    },
+    {
+      "name": "Diffraction grating",
+      "basis": "All stems identify Romanian Master of Physics 2023, Problem 3, and contain different lettered subquestions.",
+      "build": [
+        {
+          "position": 738,
+          "id": "43f231023388bd5ab4a63d5b333cfdc085a863ca49b0575abbf166d9b8a1bd1e"
+        },
+        {
+          "position": 801,
+          "id": "f21ee8eb25753fc58ce27f7af8a79cc2916e2f61494516570ee5d1883531709d"
+        },
+        {
+          "position": 948,
+          "id": "2fb644eec6214d1924cf325ff1c6a83427222a5b05c7575f5c28654c2cc8bf35"
+        }
+      ],
+      "heldout": [
+        {
+          "cohort": "reserve",
+          "position": 610,
+          "id": "bdb59a4416e2261bf5e56881961c3283ef4572c75b1847681ca1c368fc2ed0da"
+        }
+      ]
+    },
+    {
+      "name": "Suspended rod",
+      "basis": "Numbered variants 1 and 2 use the same named rod and suspension experiment with different initial conditions.",
+      "build": [
+        {
+          "position": 857,
+          "id": "6a92dfe562b1b693b5b72a5869e0f0fef645bfe3d30d78dd93e2e639ad14e712"
+        }
+      ],
+      "heldout": [
+        {
+          "cohort": "reserve",
+          "position": 176,
+          "id": "3b11b1dc24f19f4f19fb4a22f28e2ab0937db02b12f97f8682fe971b5457b47e"
+        }
+      ]
+    },
+    {
+      "name": "Poynting–Robertson effect",
+      "basis": "Both stems introduce the same solar-system cleaning mechanism verbatim and ask successive orbital-speed and radiation-torque questions.",
+      "build": [
+        {
+          "position": 1172,
+          "id": "acb1d74de1d16bff23fdb963bb94f850fda14fa046e184f29f21bcde1c082429"
+        }
+      ],
+      "heldout": [
+        {
+          "cohort": "reserve",
+          "position": 573,
+          "id": "f174d7e4d7284a9890966ef781f8dae4f3816168453276c21ca82bec17aefadd"
+        }
+      ]
+    },
+    {
+      "name": "Cavitation",
+      "basis": "The B.2 tank and bubble expansion and the compression subquestion use the same cavitation model and notation in the frozen paper.",
+      "build": [
+        {
+          "position": 1261,
+          "id": "7d7f94cc6b2fd7bf8cc3ac8afaa8c779aa63122e7325ba98f80f401c3c93c557"
+        }
+      ],
+      "heldout": [
+        {
+          "cohort": "reserve",
+          "position": 502,
+          "id": "698fe2187ccc62ed401180409fb11c6d12f8d64c6059b72df599591168c1fabc"
+        },
+        {
+          "cohort": "reserve",
+          "position": 42,
+          "id": "6c95a29ff66190ab9f65324f554682600b7dd7adbe78dc6f46942da95dccba30"
+        }
+      ]
+    },
+    {
+      "name": "Coriolis force and pressure cyclone",
+      "basis": "Both questions name the same cyclone problem, repeat its introduction and refer to different figures and subquestions.",
+      "build": [
+        {
+          "position": 1636,
+          "id": "6c8313b2763f068b53d1ad887f6aed3dc408ed0f5035941cc56a601878d8ed83"
+        }
+      ],
+      "heldout": [
+        {
+          "cohort": "step",
+          "position": 60,
+          "id": "trainphysics_1899"
+        }
+      ]
+    }
+  ],
+  "retained_passages": [
+    {
+      "position": 1380,
+      "id": "2d2309c24185beefc8f5fe494046c0a983fc1db51d3de20a94b5a8fff36bfffb",
+      "first_line": 5,
+      "question_sha256": "cd00a061a02be445e6c5fffaccb6eabaff2eb45314cb48a6dd66209d73ed63df",
+      "retained_sha256": "79d26505cd01d296e220bc3cd81cdfaf4e44a68c6a2bb3df390a830036a9bd06",
+      "prediction_sha256": "479f44c6b2f8d150e7624d51174e56a9d881e484cb289ac9237306cfaa0b57fc",
+      "reference_digest": "5e28f3133bd35d640581300d258d373f3969205e61425e5f03da3fb3f5a1ca3c",
+      "shared_prefix_with": [
+        {
+          "position": 201,
+          "id": "74215da72a5c4729be26e8be35eea056c1b006a33a0fdd2b8c8088943178f13b"
+        },
+        {
+          "position": 229,
+          "id": "0f36b3b950507dc0e4cb2690694c9a31f1ae1b619b6aea7f81f3c5ba42a2346d"
+        }
+      ]
+    },
+    {
+      "position": 1384,
+      "id": "bdbe2dbf000f346251c448fef8f22142ef8edb702918db75407f31a49c659f3e",
+      "first_line": 2,
+      "question_sha256": "9a8f2bb43b1b053e92833ac6eb0b86207cfcf65db8930536f60a1a7c5c2128de",
+      "retained_sha256": "58ddcff7d927f349e4002af0a658152b80aeac37f4affaef6dba6722ee99d491",
+      "prediction_sha256": "36906690f7bbe968378bc29589b3cdd0c250f0dd0ae1b3709ed108ff8e5830cf",
+      "reference_digest": "c8abc978029aed4e3f428c4041b0d3fb7701c44a181a6f366c5189df8e1c40f0",
+      "shared_prefix_with": [
+        {
+          "position": 201,
+          "id": "74215da72a5c4729be26e8be35eea056c1b006a33a0fdd2b8c8088943178f13b"
+        },
+        {
+          "position": 229,
+          "id": "0f36b3b950507dc0e4cb2690694c9a31f1ae1b619b6aea7f81f3c5ba42a2346d"
+        }
+      ]
+    },
+    {
+      "position": 1386,
+      "id": "c7953a169f2aa019a2647d1e3b0b3a92a6641c7d155181e87056206a921732ff",
+      "first_line": 5,
+      "question_sha256": "1e318bc7333d6fe8b3a3cfef837a3ad58e292537db486f986f96dafd62548f78",
+      "retained_sha256": "541b2c303ada1b80853047ba68593ed1039b1649bd866f69822bdc7c084fef3b",
+      "prediction_sha256": "e6fe93478a947067fb448a35497e029ae35d84749889b0d6965895dd1cf43479",
+      "reference_digest": "5dc8ed1359d282d9e086d54293f623690db36028696888f0a90384559ed13f73",
+      "shared_prefix_with": [
+        {
+          "position": 201,
+          "id": "74215da72a5c4729be26e8be35eea056c1b006a33a0fdd2b8c8088943178f13b"
+        },
+        {
+          "position": 229,
+          "id": "0f36b3b950507dc0e4cb2690694c9a31f1ae1b619b6aea7f81f3c5ba42a2346d"
+        }
+      ]
+    },
+    {
+      "position": 1979,
+      "id": "1d3bd6da88cd9717fbfc5ee7edd8d9becd5f80573abf003ba7f35cd6f6deba9b",
+      "first_line": 5,
+      "question_sha256": "c186662d40a0f4becdde70476fab27591a1951ca7d3b389f7df7e34629a31c98",
+      "retained_sha256": "6b8bf4108f26f8448ad2cfea1331be4997b981fc2c94d1c67d66291fcc4aa8bc",
+      "prediction_sha256": "5182382a919d2c357cc49fa77f5957e2812ea44e5f2d9815616ce5a4fb36a743",
+      "reference_digest": "f9bb49d3645801cf3abe8e1636590ea653a73f1bfe68c4d80b8a0e27d84e26f7",
+      "shared_prefix_with": [
+        {
+          "position": 372,
+          "id": "85432fcb38c365c32c40d2de2963056c25eabc30216db05bf4df3174d80e66d4"
+        }
+      ]
+    }
+  ],
+  "inference_holds": [
+    {
+      "position": 44,
+      "id": "1d465317487221fc9634e92cb78bd04d4d8b8ca0ce2c3c7dbb5d3317043fef40"
+    },
+    {
+      "position": 49,
+      "id": "8051723f5153fa797fa3cb9a2b18e6a310efc07c01cd58c454fd54f9e5c2a9c3"
+    },
+    {
+      "position": 50,
+      "id": "cbbfe15ffced7df58b85d2b6cbc27409df63baf4721cd4b039766a1ed9308e80"
+    },
+    {
+      "position": 181,
+      "id": "883b9ad990ac68657b0ceb49c98eb143184631e2308078a330a8808e70fa2051"
+    },
+    {
+      "position": 200,
+      "id": "ec5c88ecafdc818ef5b5851c00641d3f7ccc6ed3175fa155f2c52dd19b125326"
+    },
+    {
+      "position": 246,
+      "id": "4ed1ff9c906aec51d77376697c7db8c598c1633bb24af3220f131ff09842f121"
+    },
+    {
+      "position": 258,
+      "id": "19ca0c4a6238c9bd0a9766214dc3054f88299d5097a5b50e12e4bc72c18f00f8"
+    },
+    {
+      "position": 426,
+      "id": "ebe02fb4ba8c76e698549b3f538d342c3dc512cb3d07c1b4cd97c05ca23d96b0"
+    },
+    {
+      "position": 675,
+      "id": "e2bfaf507d94f70c36a96ae7c4118b1fe691d6e2ad8d062c56289be2489d642c"
+    },
+    {
+      "position": 762,
+      "id": "a334e714ede96f15c81f7e5f607191bf17b6a2adfc4f28bca08735a303eb53e9"
+    },
+    {
+      "position": 766,
+      "id": "513c737a6ebbe41703ac192ccda98f08d95ad6497fcf2279a5ace7b42f536c80"
+    },
+    {
+      "position": 767,
+      "id": "73151fdfd171b05953e4f50ed9312628255ea019bc1e1737e55acb1a85178775"
+    },
+    {
+      "position": 768,
+      "id": "9f733a23281911e08f06e3122ed87872b6fed3cf81a076db8a1718120cf8d6bc"
+    },
+    {
+      "position": 769,
+      "id": "cfb5fc2b61b5c1374817bdec9b662fde48d2af32fd9bcfbdcb670a12c19b93c5"
+    },
+    {
+      "position": 1265,
+      "id": "ff1f1ff84264936ad45c4faf3f3b51ee89245a9ebd49061c491afc4f11a616aa"
+    },
+    {
+      "position": 1317,
+      "id": "067e181e14792015a13c5f73865dbfdc806883091757e63049cd8c3afc659783"
+    },
+    {
+      "position": 1319,
+      "id": "44c35b2c9420826c31cd7b4b05256b0f0d6b0466386fb1ed3010caab8875d30e"
+    },
+    {
+      "position": 1363,
+      "id": "1063368278a01da3122f5076d9e326ebf54aaa37fcdd29e8ab8292d8b9bfca50"
+    },
+    {
+      "position": 1372,
+      "id": "884a232c6966fbc6ae1fcdac57645af542aca6c8ecf0d029917ef6a657f6a35e"
+    },
+    {
+      "position": 1425,
+      "id": "785e6ff9413cd6cd11794fafb316cf40894a27c2dc43c6a5d47df3c3c007d6b0"
+    },
+    {
+      "position": 1656,
+      "id": "20b0f2f43afa628d37cf2f855cb3b8da0ec1dd3e026f910a39a12d4fe5c2b02b"
+    },
+    {
+      "position": 1657,
+      "id": "4659f0d1c30facf22ee86b66b6edf9835b2c9eedab4d2cbb04c1de685ad7711c"
+    },
+    {
+      "position": 1758,
+      "id": "ad8e459d7d92f37f5bc324d6f83703a2f424818fe48a67ac8778ec905e1c2035"
+    },
+    {
+      "position": 1915,
+      "id": "e6c4156a588f05d56cebca94b4569c48ad49041fe67559378da1e3510028c836"
+    },
+    {
+      "position": 1978,
+      "id": "0cf14c7307d9ee4a6c0ee85d3c38254523998592bacde7302cfe6422cdb47662"
+    },
+    {
+      "position": 1980,
+      "id": "b24717670d157198f30303c9d305adbd95af1554df263d01a663d825ae3e6cc6"
+    },
+    {
+      "position": 1981,
+      "id": "c85ea9cd9888b0ea057b572616f3a06004725d1f2449610190af5774e32fdce6"
+    }
+  ]
+}

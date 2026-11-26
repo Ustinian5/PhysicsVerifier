@@ -44,6 +44,7 @@ class ExtractionTests(unittest.TestCase):
             out=Path(temp)/'construction';source=Path(temp)/'source'
             e.write(source/'plan.json',{'configuration':{'split_path':'../source_screen/split.json'}})
             with patch.object(e,'build_rows',return_value=([{'id':'a'}],[],{})), \
+                 patch.object(e.scope,'source_scope',return_value=dict(registered=['a'],excluded={},evidence={})), \
                  patch.object(e,'build_references',return_value=({'a': {'label':['exam answer']}},{})):
                 e.prepare(out,source)
             e.verify(out)
@@ -56,6 +57,7 @@ class ExtractionTests(unittest.TestCase):
             output = Path(temp) / 'construction'
             e.write(source / 'plan.json', {'configuration': {'split_path':'../source_screen/split.json'}})
             with patch.object(e, 'build_rows', return_value=(ROWS[:1], [], {})), \
+                 patch.object(e.scope,'source_scope',return_value=dict(registered=[ROWS[0]['id']],excluded={},evidence={})), \
                  patch.object(e, 'build_references', return_value=({ROWS[0]['id']: {'label':['参考', '']}},{})):
                 e.prepare(output, source)
             config = e.verify(output)['configuration']

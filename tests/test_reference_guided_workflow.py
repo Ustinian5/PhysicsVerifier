@@ -1,0 +1,115 @@
+import copy
+import hashlib
+import json
+
+import pytest
+
+from scripts import reuse_step_baseline as reuse
+from scripts import run_reference_guided_verifier as workflow
+from scripts import run_step_match_judge as judge
+from scripts import verifier_build_scope as scope
+from tests.test_step_match_judge import decision, fixture, response
+
+
+def test_sources_keep_original_order_failures_and_denominator():
+    register = dict(registered=['first', 'held', 'failed', 'last'], excluded={'prior': ['held']})
+    rows = [dict(id=s) for s in ['first', 'held', 'last']]
+    failures = [dict(id='failed')]
+    assert scope.apply_scope(rows, failures, register) == [rows[0], rows[2]]
+    for changed_rows, changed_failures in [(rows[::-1], failures), (rows[1:], failures),
+                                           (rows, failures * 2), (rows, failures + [rows[0]])]:
+        with pytest.raises(ValueError, match='population'):
+            scope.apply_scope(changed_rows, changed_failures, register)
+
+
+def test_retained_passage_keeps_only_the_exact_subquestion_and_full_answer():
+    question = 'Unrelated exercise.\n\nCharge on a spherical drop.\nFind its electrostatic energy.'
+    answer, reference = 'The electrostatic energy is …', ['Benchmark-independent equation.']
+    row = dict(id='drop', question=question, prediction=answer, official_reference={'label':reference})
+    sha = lambda s: hashlib.sha256(s.encode()).hexdigest()
+    target = question.split('\n\n')[1]
+    view = dict(first_line=3, question_sha256=sha(question), retained_sha256=sha(target),
+                prediction_sha256=sha(answer), reference_digest=judge.vr.digest(reference))
+    register = dict(retained_passages={'drop': view})
+    assert scope.reviewed_input(row, register) == dict(row, question=target)
+    assert scope.reviewed_input(dict(row, id='other'), register)['question'] == question
+    for field, value in [('question', 'new header\n'+question), ('prediction', answer+' '),
+                         ('official_reference', {'label':['changed']})]:
+        with pytest.raises(ValueError, match='subquestion'):
+            scope.reviewed_input(dict(row, **{field:value}), register)
+
+
+def test_shared_prefix_flags_review_without_excluding_a_source():
+    intro = 'This common table lists physical constants in SI units.'
+    build = [dict(id='ice',question=intro+' How thick is the ice?')]
+    held = [dict(id='comet',question=intro+' Find the comet orbit.')]
+    assert scope.lexical_candidates(build, held)[0]['same_introduction']
+    assert scope.apply_scope(build, [], dict(registered=['ice'],excluded={})) == build
+
+
+def test_all_live_stages_observe_supervisor_stop(tmp_path):
+    folders = [tmp_path / name for name in ('construction', 'libraries', 'step', 'final')]
+    for folder in folders:
+        workflow.connect_stop(folder, tmp_path)
+        workflow.connect_stop(folder, tmp_path)
+        assert not (folder/'STOP').exists()
+    (tmp_path/'STOP').touch()
+    assert all((folder/'STOP').is_file() for folder in folders)
+    with pytest.raises(ValueError, match='STOP'):
+        workflow.connect_stop(folders[0], tmp_path)
+
+
+def frozen_comparison(out, monkeypatch, policy):
+    rows, results, coverage, _ = judge.controls()
+    row = rows[0]
+    base = results[row['id'], 'pure']
+    key = judge.vr.digest([row['id'], judge.match.messages(row, base['diagnostics'][0], row['roots'])])
+    old = dict(prompt_profile='english', model=judge.base.r.EXPECTED_MODEL, fixed_harmony_date='2026-11-03',
+               pure_prompt='direct', online_reference_visible=False, controls=[], limits={}, budget_limits={},
+               step_match_judge=judge.match.VERSION, sample_ids=[row['id']], cohort=coverage)
+    cfg = dict(old, reuse_pure=str(out/'pure'), judge_location_policy=policy,
+               arms=list(judge.ARMS), prepare_arms=[a for a in judge.ARMS if a != 'pure'])
+    checks = dict(configuration=cfg, configuration_sha256=judge.vr.digest(cfg))
+    judge.vr.atomic(out/'plan.json', checks)
+    previous = (old, rows, {(row['id'], 'pure'): base}, coverage, {key: decision()}, {},
+                [reuse.location.score_row(row, base, [decision()], [None])])
+    monkeypatch.setattr(reuse, 'baseline', lambda _: copy.deepcopy(previous))
+    for arm in cfg['prepare_arms']:
+        value = dict(results[row['id'], arm], id=row['id'], organization_arm=arm,
+                     configuration_sha256=checks['configuration_sha256'])
+        judge.vr.atomic(judge.base.path_for(out, 'formal', arm, row), value)
+    # The fixture provides synthetic published documents. The judge transport still saves and verifies its raw requests.
+    monkeypatch.setattr(judge.base.runtime, 'audit_result', lambda value: None)
+    return checks
+
+
+@pytest.mark.parametrize('policy,invalid,location_calls,complete', [
+    ('locate_once', 'quote', 1, True), ('stop', 'quote', 0, False), ('locate_once', 'root', 0, False),
+])
+def test_frozen_pure_reuse_and_evidence_only_repair(tmp_path, monkeypatch, policy, invalid, location_calls, complete):
+    plan = frozen_comparison(tmp_path, monkeypatch, policy)
+    def scripted(messages):
+        if messages[0]['content'] == reuse.location.PROMPT:
+            return json.dumps({'start_line': None, 'end_line': None})
+        diagnostic = json.loads(messages[1]['content'])['published_diagnosis']['message']
+        assert not diagnostic.startswith('The numerical'), 'The completed pure judgment must be reused'
+        if diagnostic.startswith('Multiplying'):
+            draft = decision(quote='not a literal quote') if invalid == 'quote' else decision(ids=['unknown'])
+            return json.dumps(draft)
+        return response(messages)
+    tokenizer, calls = fixture(monkeypatch, scripted)
+    live = dict(tokenizer=tokenizer, client=object())
+    if complete:
+        metrics = reuse.evaluate(tmp_path, plan, **live)
+        assert metrics['judge']['baseline_judgments_reused'] == 1
+        assert metrics['judge']['new_locations'] == 1
+        assert metrics['scores']['pure']['hits'] == metrics['scores']['case_rag']['hits'] == 1
+        assert metrics['scores']['flat_skills']['hits'] == 0
+        assert reuse.evaluate(tmp_path, plan) == metrics
+    else:
+        for kwargs in (live, {}):
+            with pytest.raises(ValueError, match='1 invalid'):
+                reuse.evaluate(tmp_path, plan, **kwargs)
+        assert not (tmp_path/'metrics.json').exists()
+    assert len(calls) == 2 + location_calls
+    assert len(list((tmp_path/'step_judge/locations').glob('*/result.json'))) == location_calls

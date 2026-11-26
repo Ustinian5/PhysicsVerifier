@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import time
 from unittest.mock import patch
 
@@ -158,6 +159,12 @@ def released_libraries(parent, files):
         files[str(path)] = evidence[str(path)]
     first = vr.read(build / 'plan.json')
     inputs = vr.read(build / 'inputs.json')
+    scope_file = (build / 'build_scope.json').resolve(strict=True)
+    accepted_scope = vr.read(scope_file)
+    require(vr.sha(scope_file) == evidence[str(scope_file)]
+            and vr.digest(accepted_scope) == first['configuration'].get('build_scope_sha256'),
+            'Different construction source exclusions')
+    files[str(scope_file)] = evidence[str(scope_file)]
     require(en.active(first['configuration']) and vr.digest(first['configuration']) == first['configuration_sha256']
             and vr.digest(inputs) == first['configuration']['inputs_sha256'] and inputs
             and all(en.exam_answer(r['official_reference']['label']) for r in inputs),
@@ -173,9 +180,14 @@ def released_libraries(parent, files):
     return paths, 'Common official-answer-guided first review of the construction questions'
 
 
-def prepare(out, parent, *, prompt_profile=None, benchmark=None, pure_only=False):
+def prepare(out, parent, *, prompt_profile=None, benchmark=None, pure_only=False, reuse_pure=None, judge_location_policy='stop'):
     """Read a released material snapshot and the frozen benchmark as data."""
     from scripts import run_step_match_judge as judge
+    from scripts import reuse_step_baseline as comparison
+    if not pure_only and reuse_pure is None:
+        reuse_pure = judge.frozen.sources.RESULTS / 'english_blind_verifier/step_pure'
+    require(not (pure_only and reuse_pure) and judge_location_policy in comparison.POLICIES, 'Invalid comparison settings')
+    require(judge_location_policy == 'stop' or reuse_pure, 'Location amendment requires the frozen baseline comparison')
     require(not (out / 'plan.json').exists(), 'Prepared already; never overwrite a release')
     require(prompt_profile in (None, en.PROFILE), 'Unknown prompt profile')
     bench = benchmark or (parent / 'evaluation' if parent and (parent / 'evaluation/inputs.json').exists() else judge.frozen.sources.RESULTS / 'aligned_old99/evaluation')
@@ -212,6 +224,14 @@ def prepare(out, parent, *, prompt_profile=None, benchmark=None, pure_only=False
              step_match_judge=judge.match.VERSION, step_benchmark=str(bench), cohort=coverage,
              sample_ids=[r['id'] for r in rows], planned_checks=len(rows) * len(arms), material_source=material_source,
              formal_released=True, human_gold=False)
+    if reuse_pure:
+        original, *_ = comparison.baseline(reuse_pure)
+        comparison.compatible(c, original)
+        c.update(reuse_pure=str(reuse_pure.resolve()), judge_location_policy=judge_location_policy)
+        c['source_hashes']['scripts/reuse_step_baseline.py'] = vr.sha(Path(comparison.__file__))
+        c['source_hashes']['scripts/repair_step_judge_locations.py'] = vr.sha(Path(comparison.location.__file__))
+        for name in ('plan.json','metrics.json','engineering_acceptance.json'):
+            files[str(reuse_pure/name)] = vr.sha(reuse_pure/name)
     vr.atomic(out / 'plan.json', dict(configuration=c, configuration_sha256=vr.digest(c)))
     return verify(out)
 
@@ -220,7 +240,18 @@ def verify(out):
     plan = vr.read(out / 'plan.json'); c = plan['configuration']
     version = ENGLISH_VERSION if 'step_match_judge' in c else VERSION
     require(c['protocol'] == version and vr.digest(c) == plan['configuration_sha256'], 'Plan drift')
-    require(c['source_hashes'] == code_hashes(english=en.active(c)), 'Code drift')
+    actual = code_hashes(english=en.active(c))
+    if c.get('reuse_pure'):
+        for name in ('scripts/reuse_step_baseline.py', 'scripts/repair_step_judge_locations.py'):
+            actual[name] = vr.sha(a.ROOT / name)
+    from scripts import reuse_step_baseline as comparison
+    if (plan['configuration_sha256'] == comparison.PURE_CONFIG and (out/'metrics.json').is_file()
+            and vr.sha(out/'metrics.json') == comparison.PURE_METRICS):
+        # The baseline was completed before reuse orchestration. Bind its actual executable sources via Git.
+        for name in ('scripts/run_aligned_step_evaluation.py', 'scripts/serve_frozen_bm25.py'):
+            archived = subprocess.check_output(['git','show','d8248a16bfbf63514925e95522a656162ce083be:'+name],cwd=a.ROOT)
+            actual[name] = hashlib.sha256(archived).hexdigest()
+    require(c['source_hashes'] == actual, 'Code drift')
     if 'step_match_judge' in c:
         from rule_framework import step_match
         require(c.get('online_reference_visible') is False and en.online_english(c)
@@ -260,6 +291,13 @@ def score(out, plan=None):
     plan = plan or verify(out)
     if 'step_match_judge' in plan['configuration']:
         from scripts import run_step_match_judge as judge
+        from scripts import reuse_step_baseline as comparison
+        if plan.get('configuration_sha256') == comparison.PURE_CONFIG and (out/'metrics.json').is_file():
+            comparison.baseline(out)
+            return vr.read(out/'metrics.json')
+        if plan['configuration'].get('reuse_pure'):
+            with base.r.run_lock(out / 'step_judge/runner.lock'):
+                return comparison.evaluate(out, plan)
         data = judge.production(Path(plan['configuration']['step_benchmark']), out)
         with base.r.run_lock(out / 'step_judge/runner.lock'):
             report = judge.evaluate(out / 'step_judge', data, offline=True)
@@ -338,19 +376,19 @@ def check_published(out, row, phase, arm, memory, plan, tokenizer, client):
     return recovery.record_failure(out, row, plan, receipt)[arm]
 
 
-def run(out, *, gpu=4):
+def run(out, *, gpu=4, wait_detached=None):
     require(Path('/proc').exists(), 'Formal execution must run on the server')
     with base.r.run_lock(out / 'active.lock'), ExitStack() as services:
         plan = verify(out); c = plan['configuration']; exit_code = 1
         judged = 'step_match_judge' in c
         (out / 'runner.pid').write_text(str(os.getpid()))
         try:
-            base.runtime.wait_detached(out, plan['configuration_sha256'])
+            (wait_detached or base.runtime.wait_detached)(out, plan['configuration_sha256'])
             from transformers import AutoTokenizer
             model_path = base.r.EXPECTED_MODEL
             if judged:
                 from scripts import run_step_match_judge as judge
-                if (out / 'step_judge/metrics.json').exists():
+                if (out / 'metrics.json').exists() or (out / 'step_judge/metrics.json').exists():
                     report = score(out, plan)
                     base.old.emit(out, 'completed', recorded_tasks=report['recorded_tasks'])
                     exit_code = 0
@@ -384,7 +422,7 @@ def run(out, *, gpu=4):
                         offset = i % len(c['arms'])
                         arms = c['arms'][offset:] + c['arms'][:offset]
                         if en.active(c):
-                            arms = ['pure', *(arm for arm in arms if arm != 'pure')]
+                            arms = ([] if c.get('reuse_pure') else ['pure']) + [arm for arm in arms if arm != 'pure']
                         for arm in arms:
                             require(not (out / 'STOP').exists(), 'STOP requested')
                             result = check_published(out, row, phase, arm, memories[arm], plan, tokenizer, client)
@@ -392,15 +430,19 @@ def run(out, *, gpu=4):
                                 verify_blind_delivery(out, phase, row, arm, memories[arm], tokenizer, result)
                             results.append(result)
                     if phase == 'controls':
-                        require(len(results) == len(rows) * len(c['arms']) and all(base.runtime.healthy_result(r) and r['protocol_audit']['passed']
+                        require(len(results) == len(rows) * (len(c['arms']) - int(bool(c.get('reuse_pure')))) and all(base.runtime.healthy_result(r) and r['protocol_audit']['passed']
                                 for r in results), 'Control content/protocol failure; no bulk release')
                         vr.atomic(out / 'engineering_acceptance.json', dict(configuration_sha256=plan['configuration_sha256'],
                             passed=True, checks=len(results), physical_quality_certified=False, score_threshold_used=False))
             if judged:
                 # Close the checker hooks before the independent conversations start.
-                data = judge.production(Path(c['step_benchmark']), out)
                 with base.r.run_lock(out / 'step_judge/runner.lock'), httpx.Client(trust_env=False) as client:
-                    report = judge.evaluate(out / 'step_judge', data, tokenizer=tokenizer, client=client, stop=out / 'STOP')
+                    if c.get('reuse_pure'):
+                        from scripts import reuse_step_baseline as comparison
+                        report = comparison.evaluate(out, plan, tokenizer=tokenizer, client=client)
+                    else:
+                        data = judge.production(Path(c['step_benchmark']), out)
+                        report = judge.evaluate(out / 'step_judge', data, tokenizer=tokenizer, client=client, stop=out / 'STOP')
                 judge.write(out / 'metrics.json', report)
             else:
                 report = score(out, plan)
@@ -424,6 +466,8 @@ def main():
     parser.add_argument('--benchmark', type=Path, help='Frozen step benchmark for a new English release')
     parser.add_argument('--gpu', type=int, choices=(4, 5, 6, 7), default=4)
     parser.add_argument('--pure-only', action='store_true', help='Freeze only the direct 120B baseline')
+    parser.add_argument('--reuse-pure', type=Path, help='Bind the completed pure baseline and run the three knowledge arms')
+    parser.add_argument('--judge-location-policy', choices=('stop','locate_once'), default='stop')
     args = parser.parse_args(); out = args.output.resolve()
     require(not args.pure_only or args.command == 'prepare', 'Arms are frozen at prepare')
     require(args.prompt_profile is None or args.command == 'prepare', 'Prompt profile is frozen at prepare')
@@ -433,7 +477,7 @@ def main():
         parent = args.parent.resolve() if args.parent else None
         with base.r.run_lock(out / 'active.lock'):
             prepare(out, parent, prompt_profile=args.prompt_profile, benchmark=args.benchmark.resolve() if args.benchmark else None,
-                    pure_only=args.pure_only)
+                    pure_only=args.pure_only, reuse_pure=args.reuse_pure, judge_location_policy=args.judge_location_policy)
     elif args.command == 'verify': verify(out)
     elif args.command == 'score': score(out)
     elif args.command == 'run': run(out, gpu=args.gpu)

@@ -67,7 +67,8 @@ def prepare(out, root):
     require(Path('/proc').exists(),'Prepare against server originals')
     require(not(out/'plan.json').exists(),'Already prepared; use verify/run, never overwrite')
     source=root/'construction'
-    english = en.active(extraction.verify(source)['configuration'])
+    extract_config = extraction.verify(source)['configuration']
+    english = en.active(extract_config)
     require(vr.read(source/'execution_status.json')['state']=='extraction_complete','Extraction not complete')
     files={}
     def bind(path):
@@ -104,6 +105,15 @@ def prepare(out, root):
                 set(rule['sample_ids'])<=error_ids,'Rule source mismatch')
     bundle=dict(taxonomy=vr.read(source/'taxonomy.json'),rules=distilled['rules'],provenance=dict(support),
                 human_gold=False,source_counts=vr.read(source/'execution_status.json')['counts'])
+    if english:
+        approved = bind(source/'build_scope.json')
+        require(vr.digest(approved) == extract_config.get('build_scope_sha256'), 'Build source scope drift')
+        held = {sid for group in approved['excluded'].values() for sid in group}
+        require(set(rows) <= set(approved['registered']) - held, 'Held source in new construction')
+        outputs = dict(tree_bundle=bundle, cases=cases, heldout_questions=approved['heldout'])
+        freeze_plan(out, root, outputs, files, english=True)
+        emit(out, 'prepared_materials', sources=len(rows), cases=len(cases), rules=len(distilled['rules']))
+        return
     split=bind(root/'source_screen/split.json')
     bind(root/'source_screen/family_components.json')
     hipho=bind(root.parent/'hipho_overlap_audit.json')
@@ -113,12 +123,6 @@ def prepare(out, root):
     require(set(rows) <= {x['id'] for x in split['build']}, 'Construction sources escaped frozen split')
     step_rows=bind(root/'bench_generation/inputs.json')
     pilot_source=bind(root.parent/'inputs.json')
-    if english:
-        outputs = dict(tree_bundle=bundle, cases=cases, heldout_questions=list(map(public, step_rows)) +
-                       list(map(public, split['reserve'])) + list(map(public, pilot_source)))
-        freeze_plan(out, root, outputs, files, english=True)
-        emit(out, 'prepared_materials', sources=len(rows), cases=len(cases), rules=len(distilled['rules']))
-        return
     annotations.verify(root/'annotations');final_labels.verify(root/'final_labels')
     labeled=bind(root/'annotations/annotation_inputs.json')
     require(list(map(public,step_rows))==list(map(public,labeled)) and len(step_rows)==100,'Step answer cohort drift')
@@ -664,7 +668,16 @@ def accept_materials(out,cfg):
     require(bool(cases) and bool(flat),'Empty auxiliary store; inspect construction failure')
     allowed={sid for d in cases for sid in d['source_ids']}
     require(all(set(d['source_ids'])<=allowed for d in flat),'Skill provenance escaped common experience pool')
-    root=Path(cfg['root']);hipho=vr.read(root.parent/'hipho_overlap_audit.json')
+    root=Path(cfg['root'])
+    audit_path=root.parent/'hipho_overlap_audit.json'
+    if cfg.get('scope')=='materials_only':
+        approved=vr.read(root/'construction/build_scope.json')
+        audit_path=Path(approved['hipho_audit'])
+        held={sid for ids in approved['excluded'].values() for sid in ids}
+        require(allowed <= set(approved['registered'])-held, 'Held source in published materials')
+        require(all(set(r['sample_ids']) <= allowed for r in bundle['rules']),
+                'Rule tree contains a source outside the same published first reviews')
+    hipho=vr.read(audit_path)
     external=isolation.Audit(hipho['question_references'])
     internal=isolation.Audit(vr.read(out/'heldout_questions.json'))
     tree_memory=TreeMemory(catalog)
@@ -695,7 +708,7 @@ def accept_materials(out,cfg):
         if own or ext:checks.append(dict(id=doc['id'],source_ids=doc['source_ids'],internal=own,external=ext,unreviewed_external=new))
     unresolved=[x for x in checks if x['internal'] or x['unreviewed_external']]
     vr.atomic(out/'material_isolation.json',dict(matches=checks,unresolved=unresolved,
-        source_audit_sha256=vr.sha(root.parent/'hipho_overlap_audit.json'),semantic_independence_proven=False))
+        source_audit_sha256=vr.sha(audit_path),semantic_independence_proven=False))
     require(not unresolved,'New derived-material overlap candidates require review; frozen cohorts unchanged')
     immutable(receipt,dict(passed=True,files=hashes,tree_counts=report['counts'],cases=len(cases),skills=len(flat),
         common_error_sources=len(allowed),human_gold=False,physical_quality_certified=False,

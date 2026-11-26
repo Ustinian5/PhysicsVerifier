@@ -31,7 +31,7 @@ def confirm(folder, signature):
 
 
 @contextmanager
-def service(folder, gpu, stop_file, signature):
+def service(folder, gpu, stop_file, signature, *, fixed_date=CHECK_DATE):
     """The caller opens this context only when a verified new request is ready."""
     require(gpu in (4, 5, 6, 7), 'Unexpected stage or GPU')
     node()
@@ -44,7 +44,8 @@ def service(folder, gpu, stop_file, signature):
     proof = vr.read(host.CONTROL / 'attempts/2/deployment.json')['weights_receipt_sha256']
     redirect = host.weight_location(cfg, folder, proof)
     script, _ = host.service_script(cfg)
-    date = CHECK_DATE
+    require(fixed_date in (CHECK_DATE, '2026-11-07'), 'Unrecognized verifier service date')
+    date = fixed_date
     url = f'http://127.0.0.1:{port}'
     lock = host.final.base.r.run_lock
     with lock(host.HOT / f'locks/organization_service_{port}.lock'), lock(host.HOT / f'locks/library_gpu_{gpu}.lock'):

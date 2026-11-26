@@ -19,6 +19,7 @@ from scripts.combined_language_io import iter_rollout_batches
 from scripts.combined_language_samples import extract_question
 from rule_framework.oss120b_construction import question_key
 from rule_framework import verifier_english as en
+from scripts import verifier_build_scope as scope
 from scripts.run_qwen30b_step_checks import validate_effective_input
 
 read, write, sha, digest, require = c.read, c.write, c.sha, c.digest, c.require
@@ -90,30 +91,35 @@ def build_references(rows, screen, inventory_path, dataset):
                    str(screen/'plan.json'): split['source_plan_sha256'], str(screen/'split.json'): sha(screen/'split.json')}
 
 
-def prepare(out, source, dataset=None):
+def prepare(out, source, dataset=None, *, results_root=None):
     require(not (out/'plan.json').exists(), 'Already prepared')
     audit_prompt = AUDIT_PROMPT_FILE.read_text(encoding='utf-8').rstrip('\n')
     require(bool(audit_prompt.strip()), 'Empty first-review prompt')
     rows, rejected, evidence = build_rows(source)
+    approved = scope.source_scope(results_root or source.parent.parent)
+    rows = scope.apply_scope(rows, rejected, approved)
+    evidence.update(approved['evidence'])
     screen = (source/read(source/'plan.json')['configuration']['split_path']).resolve().parent
     references, bound = build_references(rows, screen, screen.parent.parent/'source_question_inventory.json',
                                          dataset or c.ROOT/'data/combined_language_only.json')
-    rows = [dict(row, official_reference=references[row['id']]) for row in rows]
+    rows = [scope.reviewed_input(dict(row, official_reference=references[row['id']]), approved) for row in rows]
     evidence.update(bound)
     skeleton = old.flow.experience_topic_skeleton(read(c.ROOT/'catalogs/rules_catalog_top_down.json'))
     cfg = dict(model=c.corpus.r.EXPECTED_MODEL, auditor_api='http://127.0.0.1:18083/v1',
         max_tokens=16384, max_request_input_bytes=400000, reasoning_effort='medium', timeout_seconds=1200,
         technical_attempts=3, retry_cooldown_seconds=60, max_rules_per_sample=2,
         structural_repair_rounds=1, fixed_date='2026-11-07', pilot_size=12,
-        prompt_profile=en.PROFILE, audit_system_prompt=audit_prompt,
+        prompt_profile=en.PROFILE, audit_system_prompt=audit_prompt, build_scope_sha256=digest(approved),
         source_plan_sha256=sha(source/'plan.json'), source=str(source),
-        inputs_sha256=digest(rows), skeleton_sha256=digest(skeleton), evidence_sha256=digest(evidence),
+        inputs_sha256=digest(rows), generation_failures_sha256=digest(rejected),
+        skeleton_sha256=digest(skeleton), evidence_sha256=digest(evidence),
         sources={n:sha(c.ROOT/n) for n in sorted(set(list(old.SOURCES)+list(c.SOURCES)+
             ['scripts/run_corrected_extraction.py','scripts/run_qwen30b_step_checks.py','rule_framework/verifier_english.py',
-             'scripts/combined_language_io.py','scripts/combined_language_samples.py']))},
+             'scripts/combined_language_io.py','scripts/combined_language_samples.py','scripts/verifier_build_scope.py']))},
         model_files=old.b.existing.MODEL_FILES, human_gold=False,
         policy='Frozen build order; one continuous audit+extraction; content failures retained; no resampling')
-    for name, value in [('inputs',rows),('generation_failures',rejected),('topic_skeleton',skeleton),('source_evidence',evidence)]:
+    for name, value in [('inputs',rows),('generation_failures',rejected),('topic_skeleton',skeleton),
+                        ('build_scope',approved),('source_evidence',evidence)]:
         write(out/(name+'.json'), value)
     write(out/'plan.json',dict(configuration=cfg,configuration_sha256=digest(cfg)))
     write(out/'execution_status.json',dict(state='prepared',complete_inputs=len(rows),generation_failures=len(rejected)))
@@ -125,6 +131,15 @@ def verify(out):
     require(all(sha(c.ROOT/n)==h for n,h in cfg['sources'].items()),'Code drift')
     for name,key in [('inputs','inputs_sha256'),('topic_skeleton','skeleton_sha256'),('source_evidence','evidence_sha256')]:
         require(digest(read(out/(name+'.json')))==cfg[key], 'Input drift: '+name)
+    if 'build_scope_sha256' in cfg:
+        approved=read(out/'build_scope.json')
+        require(digest(approved)==cfg['build_scope_sha256'], 'Source exclusions changed')
+        held={sid for group in approved['excluded'].values() for sid in group}
+        failures=read(out/'generation_failures.json')
+        require(digest(failures)==cfg['generation_failures_sha256'], 'Generation failures changed')
+        failed={r['id'] for r in failures}
+        require([r['id'] for r in read(out/'inputs.json')]==[s for s in approved['registered'] if s not in held|failed],
+                'First review escaped the accepted source population')
     require(sha(Path(cfg['source'])/'plan.json')==cfg['source_plan_sha256'], 'Source plan drift')
     return plan
 
@@ -178,13 +193,14 @@ def call(out, journal, tokenizer, stage, key, payload):
     return value,evidence
 
 
-def run(out):
+def run(out, *, wait_detached=None):
     require(Path('/proc').exists(),'Server only')
     with c.corpus.r.run_lock(out/'active.lock'),c.corpus.r.run_lock(out.parent/'organization_service_18083.lock'):
         plan=verify(out);cfg=plan['configuration'];code=1
         (out/'runner.pid').write_text(str(os.getpid()))
         try:
-            c.corpus.runtime.wait_detached(out,plan['configuration_sha256'])
+            (wait_detached or c.corpus.runtime.wait_detached)(out,plan['configuration_sha256'])
+            require(not en.active(cfg) or 'build_scope_sha256' in cfg, 'New first reviews need a frozen source scope')
             for n,h in cfg['model_files'].items():require(sha(Path(cfg['model'])/n)==h,'Model configuration drift')
             for n,h in read(out/'source_evidence.json').items():require(sha(Path(n))==h,'Source evidence changed')
             with httpx.Client(trust_env=False,timeout=20) as client:
@@ -243,8 +259,10 @@ def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('mode',choices=['prepare','verify','run','confirm-detached'])
     p.add_argument('--output',type=Path,required=True);p.add_argument('--source',type=Path)
     p.add_argument('--dataset', type=Path, help='Original combined_language_only.json for prepare')
+    p.add_argument('--results-root', type=Path, help='Frozen benchmark and source-isolation archive')
     a=p.parse_args();out=a.output.resolve()
-    if a.mode=='prepare':prepare(out,a.source.resolve(),a.dataset.resolve() if a.dataset else None)
+    if a.mode=='prepare':prepare(out,a.source.resolve(),a.dataset.resolve() if a.dataset else None,
+                                 results_root=a.results_root.resolve() if a.results_root else None)
     elif a.mode=='verify':verify(out)
     elif a.mode=='confirm-detached':confirm(out)
     else:run(out)
