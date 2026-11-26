@@ -54,6 +54,7 @@ def select(row, cfg, taxonomy, source, audit):
         previous = dict(value, experience_rules=[dict(r, symbolic_hint=dict(primitive='none', canonical='',
                              required_symbols=[])) for r in value['experience_rules']])
         require(digest(previous) == audit['canonical_value_sha256'], 'Other first-review fields changed')
+        value = review_fields.without_rule_metadata(value)
     return selected, value, error, evidence
 
 
@@ -122,7 +123,7 @@ def prepare(source, out):
             write(path, dict(id=sid, signature=digest([payload,cfg]), value=value, error=error,
                              evidence=evidence, selected=branch, human_gold=False))
             records[sid] = sha(path)
-        distilled = extract.old.extraction._build_distilled_library(valid, min_count=1, legacy_symbolic=False)
+        distilled = extract.old.extraction._build_distilled_library(valid, min_count=1, legacy_symbolic=False, include_auxiliary=False)
         summary = audit['summary']
         require(dict(statuses) == summary['fixed_final'] and dict(branches) == summary['fixed_selection'] and
                 len(distilled['rules']) == summary['canonical']['deduplicated_rules'], 'Different aggregate review release')

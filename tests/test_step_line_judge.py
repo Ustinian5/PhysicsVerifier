@@ -8,7 +8,25 @@ import pytest
 
 from rule_framework import step_match_lines as lines
 from scripts import run_step_line_judge as run
+from scripts import step_judge_release as release
 from tests.test_final_answer_revision import fake_runtime
+
+
+def test_release_uses_published_diagnoses_exact_boundary_and_reports_missing_passages():
+    groups = {'pure':['invalid_range'] + ['no_passage']*6 + ['located']*13,
+              'rule_tree':['content_failure','missing_match_evidence'] + ['located']*18, 'case_rag':[]}
+    measured = {arm:run.counts([dict(location_status=s) for s in items]) for arm,items in groups.items()}
+    report = dict(protocol=lines.VERSION,first_pass=measured, provisional_scores={a:{'published':len(v)} for a,v in groups.items()},
+                  recorded_tasks={a:99 for a in groups},coverage={})
+    accepted = release.assess(report)
+    assert accepted['groups_for_review'] == ['case_rag','rule_tree'] and not accepted['formal_metrics_released']
+    assert set(accepted['scores']) == {'pure'}
+    assert accepted['first_pass']['pure']['located_rate'] == 13/20
+    assert accepted['first_pass']['pure']['no_passage'] == 6
+    assert accepted['first_pass']['rule_tree']['technical_failure_rate'] == 2/20
+    report['provisional_scores']['pure']['published'] = 19
+    with pytest.raises(ValueError,match='denominator'):
+        release.assess(report)
 
 
 def decision(kind='same_root', ids=None, first=2, last=2):

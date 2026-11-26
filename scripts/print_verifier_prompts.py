@@ -53,10 +53,10 @@ def render():
         ('scan_groups', dict(items=[rule], groups=[], previous_best=[], best_by_item={'I1':None})),
         ('place_groups', dict(items=[rule], groups=[])),
     ]:
-        show('Rule tree / ' + stage, bounded_tree.messages(stage, payload, english=True))
+        show('Rule tree / ' + stage, bounded_tree.messages(stage, payload, english=True, optional_fields=True))
     show('Missing tree decisions after the preserved draft', bounded_tree.messages('complete_missing', dict(
         stage='route_topics', original=dict(items=[rule], topics=bounded_tree.topic_list(taxonomy)),
-        draft={'decisions':[]}, missing=['I1']), english=True)[2:])
+        draft={'decisions':[]}, missing=['I1']), english=True, optional_fields=True)[2:])
     show('Independent step annotations / shared system', [dict(role='instructions', content=annotator.annotation_system(profile))])
     annotation = dict(row, answer=json.dumps(answer))
     for stage in annotator.STAGES:

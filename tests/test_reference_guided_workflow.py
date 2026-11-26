@@ -1,17 +1,55 @@
 import copy
 import hashlib
 import json
+import os
+import sys
 import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 
 from scripts import reuse_step_baseline as reuse
 from scripts import reference_review_pool as pool
+from scripts import reference_material_pool as materials_pool
 from scripts import run_reference_guided_verifier as workflow
 from scripts import run_step_match_judge as judge
 from scripts import verifier_build_scope as scope
 from tests.test_step_match_judge import decision, fixture, response
+
+
+def test_skill_pool_partitions_sources_and_resumes_saved_outcomes(tmp_path, monkeypatch):
+    vr = materials_pool.vr
+    cases = [dict(id='case'+str(i),title='Title',text='History',source_ids=[str(i)]) for i in range(5)]
+    vr.atomic(tmp_path/'cases.json',cases)
+    cfg = dict(frozen_files={'cases.json':vr.sha(tmp_path/'cases.json')},transport={'fixed_date':'2026-11-07'})
+    sig = vr.digest(cfg)
+    vr.atomic(tmp_path/'plan.json',dict(configuration=cfg,configuration_sha256=sig))
+    opened,requests = [],[]
+
+    @contextmanager
+    def service(folder,gpu,port,stop,signature,date):
+        opened.append((gpu,port,date))
+        yield 'http://127.0.0.1:'+str(port)+'/v1'
+
+    def call(out,journal,tokenizer,stage,key,messages):
+        requests.append((key,journal.config['auditor_api']))
+        path = out/'raw'/key
+        vr.atomic(path,{'id':key})
+        return {'skills':[{'title':key,'text':'method'}]},{'file':str(path.relative_to(out)),'sha256':vr.sha(path)}
+
+    monkeypatch.setattr(pool,'replica_service',service)
+    monkeypatch.setattr(materials_pool.materials,'model_json',call)
+    monkeypatch.setitem(sys.modules,'transformers',SimpleNamespace(AutoTokenizer=SimpleNamespace(from_pretrained=lambda *a,**k:object())))
+    for _ in range(2):
+        for idx,gpu in enumerate((5,6)):
+            materials_pool.skill_worker(tmp_path,sig,gpu,idx,2,threading.Event(),os.getppid())
+    assert [key for key,_ in requests] == ['case0','case2','case4','case1','case3']
+    assert len(opened) == 2
+    outcomes = [materials_pool.materials.skill_outcome(tmp_path,cfg,c) for c in cases]
+    materials_pool.materials.publish_skills(tmp_path,cases,outcomes)
+    assert vr.read(tmp_path/'materials/cases.json') == cases
+    assert {tuple(d['source_ids']) for d in vr.read(tmp_path/'materials/skills.json')} == {(str(i),) for i in range(5)}
 
 
 def test_sources_keep_original_order_failures_and_denominator():

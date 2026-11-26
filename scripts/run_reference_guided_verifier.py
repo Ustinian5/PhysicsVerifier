@@ -15,28 +15,32 @@ from scripts import run_corrected_extraction as extract
 from scripts import run_corrected_pipeline as materials
 from scripts import run_final_answer_revision as final
 from scripts import serve_frozen_bm25 as node
+from scripts import step_judge_release as release
+from scripts import reference_material_pool as material_pool
 from scripts import verifier_build_scope as scope
 
 vr, require = final.vr, final.require
 RESULTS = node.host.HOT / 'results/qwen30b_step_verifier'
 ORIGINAL = RESULTS / 'english_blind_verifier'
-WORK = ORIGINAL / 'rule_fields'
+WORK = ORIGINAL / 'formal'
 
 
 def configuration(policy, gpus):
     require(gpus and len(gpus) == len(set(gpus)) and set(gpus) <= {4, 5, 6, 7}, 'Invalid review GPU list')
     names = ('scripts/run_reference_guided_verifier.py', 'scripts/verifier_build_scope.py', 'scripts/project_verifier_first_reviews.py',
              'scripts/run_corrected_extraction.py', 'scripts/run_corrected_pipeline.py',
+             'scripts/reference_material_pool.py', 'scripts/reference_review_pool.py',
              'scripts/reuse_step_baseline.py', 'scripts/repair_step_judge_locations.py',
              'scripts/run_aligned_step_evaluation.py', 'scripts/run_step_match_judge.py',
              'scripts/serve_frozen_bm25.py', 'scripts/run_final_answer_revision.py',
              'rule_framework/build_review_prompt.txt', 'rule_framework/review_fields.py', 'rule_framework/bounded_tree.py',
              'scripts/generate_experience_rules.py', 'scripts/build_unified_catalog.py', 'scripts/run_retrieval_comparison.py')
     if policy == 'lines_once':
-        names += ('rule_framework/step_match_lines.py', 'scripts/run_step_line_judge.py')
+        names += ('rule_framework/step_match_lines.py', 'scripts/run_step_line_judge.py', 'scripts/step_judge_release.py')
     return dict(source_scope_sha256=vr.sha(scope.SCOPE_FILE), source_audit_sha256=vr.sha(ORIGINAL/'build_scope_audit.json'),
                 rule_schema=projection.review_fields.SCHEMA, first_review_audit_sha256=projection.AUDIT_SHA,
-                judge_location_policy=policy, review_gpus=list(gpus),
+                judge_location_policy=policy, judge_release_policy=release.POLICY, pure_first_pass_sha256=release.PURE_FIRST_PASS,
+                review_gpus=list(gpus),
                 pure_metrics_sha256=baseline.PURE_METRICS, model=final.base.r.EXPECTED_MODEL,
                 build_date='2026-11-07', check_date=node.CHECK_DATE, registered_build=2000,
                 registered_step=100, formal_step=99, registered_final=474, formal_final=467,
@@ -45,7 +49,7 @@ def configuration(policy, gpus):
 
 def bind(policy, scope_sha, gpus):
     node.node()
-    require(policy in baseline.POLICIES and scope_sha == scope.SCOPE_SHA, 'Confirm the exact source register and judge policy')
+    require(policy == 'lines_once' and scope_sha == scope.SCOPE_SHA, 'Different approved source register or judge policy')
     cfg = configuration(policy, gpus)
     require(cfg['source_scope_sha256'] == scope_sha, 'Scope manifest changed')
     receipt = dict(configuration=cfg, configuration_sha256=vr.digest(cfg))
@@ -86,7 +90,7 @@ def prepare_materials():
     if not (library/'plan.json').exists():
         materials.prepare(library, WORK)
     plan = materials.verify(library)
-    require(projection.review_fields.current(plan['configuration']), 'Different rule field release')
+    require(projection.review_fields.compact(plan['configuration']), 'Different rule field release')
     return plan
 
 
@@ -147,17 +151,15 @@ def run(*, adopted=False):
             with final.base.r.run_lock(library/'active.lock'):
                 if not (library/'construction_acceptance.json').is_file():
                     if not all((library/'materials'/n).is_file() for n in ('catalog.json','tree_report.json','skills.json','skills_report.json','cases.json')):
-                        from transformers import AutoTokenizer
                         stage('organizing_libraries')
-                        tok = AutoTokenizer.from_pretrained(node.host.HOT/'models/gpt-oss-120b',local_files_only=True)
-                        with inference(library, cfg['build_date'], lp['configuration_sha256']):
-                            materials.build_materials(library,lc,tok)
+                        attached_to_supervisor(library,lp['configuration_sha256'])
+                        material_pool.build(library,lp,cfg['review_gpus'],inference)
                     stage('verifying_material_isolation')
                     materials.accept_materials(library,lc)
             step.released_libraries(library,{})
 
             # Keep the existing 63 pure judgments in their canonical, shared evidence directory.
-            evaluated = ORIGINAL/'step_rule_fields'
+            evaluated = ORIGINAL/'step_formal'
             connect_stop(evaluated, WORK)
             stage('step_knowledge_arms')
             if not (evaluated/'plan.json').is_file():
@@ -167,30 +169,20 @@ def run(*, adopted=False):
             cp = step.verify(evaluated)
             require(cp['configuration']['reuse_pure'] == str(pure) and cp['configuration']['parent'] == str(library)
                     and cp['configuration']['judge_location_policy'] == cfg['judge_location_policy'], 'Different step run')
-            citations_pending = False
             first_pass = evaluated/'step_judge_first_pass/first_pass.json'
-            measure_lines = cfg['judge_location_policy'] == 'lines_once'
-            try:
-                if not (evaluated/'metrics.json').is_file() and not (measure_lines and first_pass.is_file()):
-                    status_file = evaluated/'step_judge/status.json'
-                    if status_file.is_file():
-                        status = vr.read(status_file)
-                        if status['state'] == 'incomplete' and not status['missing'] and status['content_failures'] and set(
-                                status['content_failures'].values()) <= baseline.location.QUOTE_ERRORS:
-                            baseline.evaluate(evaluated, cp)
-                    step.run(evaluated, gpu=gpu, wait_detached=attached_to_supervisor)
-                report = step.score(evaluated)
-                scores = report['provisional_scores'] if measure_lines else report['scores']
-                require(all(n == 99 for n in report['recorded_tasks'].values()) and len(scores) == 4,
-                        'Incomplete step comparison')
-            except baseline.CitationDecisionPending:
-                require(cfg['judge_location_policy'] == 'stop', 'Unexpected pending citation protocol')
-                citations_pending = True
-                stage('step_citations_awaiting_decision', status_sha256=vr.sha(evaluated/'step_judge/status.json'))
+            require(cp['configuration']['judge_release_policy'] == release.POLICY, 'Missing approved step criterion')
+            if not first_pass.is_file():
+                step.run(evaluated, gpu=gpu, wait_detached=attached_to_supervisor)
+            report = step.score(evaluated)
+            require(len(report['first_pass']) == 4 and all(n == 99 for n in report['recorded_tasks'].values()),
+                    'Incomplete step comparison')
+            pending = report['groups_for_review']
+            if pending:
+                stage('step_judge_groups_for_review', groups=pending, receipt=str(evaluated/'judge_acceptance.json'))
 
             dest = WORK/'final'
             connect_stop(dest, WORK)
-            stage('final_answer_comparison', step_citations_pending=citations_pending, step_release_criterion_pending=measure_lines)
+            stage('final_answer_comparison', step_groups_for_review=pending)
             with final.base.r.run_lock(dest/'active.lock'):
                 if not (dest/'plan.json').is_file():
                     final.prepare(dest,RESULTS,material_parent=library)
@@ -209,12 +201,9 @@ def run(*, adopted=False):
                             final.run_checks(dest,fp,tok,client,pilot=True)
                         final.run_checks(dest,fp,tok,client,pilot=False)
                 final.score(dest)
-            if measure_lines:
-                stage('final_complete_step_first_pass_measured', step_first_pass_sha256=vr.sha(first_pass),
-                      final_metrics_sha256=vr.sha(dest/'metrics.json'), step_release_criterion_pending=True)
-                code = 2
-            elif citations_pending:
-                stage('final_complete_step_citations_pending', step_status_sha256=vr.sha(evaluated/'step_judge/status.json'),
+            if pending:
+                stage('final_complete_step_judge_groups_for_review', groups=pending,
+                      step_acceptance_sha256=vr.sha(evaluated/'judge_acceptance.json'),
                       final_metrics_sha256=vr.sha(dest/'metrics.json'))
                 code = 2
             else:
@@ -232,7 +221,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command',choices=('audit','prepare','run','confirm'))
     parser.add_argument('--approved-scope-sha256')
-    parser.add_argument('--judge-location-policy', choices=baseline.POLICIES, default='lines_once')
+    parser.add_argument('--judge-location-policy', choices=('lines_once',), default='lines_once')
     parser.add_argument('--gpus',type=int,nargs='+',choices=(4,5,6,7),default=[4])
     args=parser.parse_args()
     if args.command=='audit':
@@ -248,6 +237,7 @@ def main():
             require(args.approved_scope_sha256 == scope.SCOPE_SHA, 'Different approved construction scope')
             connect_stop(WORK, ORIGINAL)
             prepare_materials()
+            release.frozen_pure(ORIGINAL/'step_judge_lines', WORK/'pure_judge_acceptance.json')
             bind(args.judge_location_policy,args.approved_scope_sha256,args.gpus)
     elif args.command=='confirm':
         node.node()

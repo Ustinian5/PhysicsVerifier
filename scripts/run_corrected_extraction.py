@@ -157,7 +157,8 @@ def confirm(out):
 
 def request_messages(stage, payload, config):
     if stage == 'repair_experience' and review_fields.current(config):
-        payload = dict(payload, draft=review_fields.without_symbolic_hint(payload['draft']))
+        draft = review_fields.without_symbolic_hint(payload['draft'])
+        payload = dict(payload, draft=review_fields.without_rule_metadata(draft) if review_fields.compact(config) else draft)
     messenger = old.Journal.__new__(old.Journal)
     messages = messenger.messages(stage, payload)
     if en.active(config):
@@ -229,6 +230,8 @@ def review_one(out, row, taxonomy, cfg, journal, tokenizer, *, saved_only=False)
             break
         try:
             value = old.extraction.normalize_120b_experience(draft, **payload, legacy_symbolic=not review_fields.current(cfg))
+            if review_fields.compact(cfg):
+                value = review_fields.without_rule_metadata(value)
             error = None
             break
         except ValueError as exc:
@@ -286,7 +289,8 @@ def run(out, *, wait_detached=None, reviews=serial_reviews):
                     require(bool(valid),'All pilot outputs failed structure validation; inspect before continuing')
             require(len(valid)+len(invalid)==len(rows), 'Incomplete first-review population')
             write(out/'semantic_experience.json',valid);write(out/'invalid_outputs.json',invalid)
-            distilled=old.extraction._build_distilled_library(valid,min_count=1,legacy_symbolic=not review_fields.current(cfg))
+            distilled=old.extraction._build_distilled_library(valid,min_count=1,legacy_symbolic=not review_fields.current(cfg),
+                                                              include_auxiliary=not review_fields.compact(cfg))
             write(out/'distilled.json',distilled)
             write(out/'execution_status.json',dict(state='extraction_complete',processed=len(rows),counts=dict(counts),
                 rules=len(distilled['rules']),tree_complete=False,skills_complete=False,updated_unix=time.time()))

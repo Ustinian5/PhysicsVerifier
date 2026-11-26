@@ -1,6 +1,7 @@
 """Distribute independent frozen first reviews across privately owned node14 services."""
 import multiprocessing
 import os
+from contextlib import contextmanager
 from unittest.mock import patch
 
 from scripts import run_corrected_extraction as extract
@@ -13,6 +14,20 @@ class StopRequested:
 
     def exists(self):
         return self.file.exists() or self.aborted.is_set() or os.getppid() != self.parent
+
+
+@contextmanager
+def replica_service(folder, gpu, port, stop, signature, date):
+    original = node.host.service_script
+
+    def launcher(config):
+        script, paths = original(config)
+        node.require(script.count('18083') == 2, 'Unexpected frozen service port')
+        return script.replace('18083', str(port)), paths
+
+    with patch.object(node.host, 'PORT', port), patch.object(node.host, 'service_script', launcher), \
+            node.service(folder, gpu, stop, signature, fixed_date=date) as url:
+        yield url
 
 
 def replica(out, gpu, positions, gate, aborted, parent, signature):
@@ -31,16 +46,7 @@ def replica(out, gpu, positions, gate, aborted, parent, signature):
                                   dict(ids=assigned, gpu=gpu, port=port, configuration_sha256=signature))
         if all((out/'experiences'/(sid+'.json')).is_file() for sid in assigned):
             return
-        original = node.host.service_script
-
-        def launcher(config):
-            script, paths = original(config)
-            node.require(script.count('18083') == 2, 'Unexpected frozen service port')
-            return script.replace('18083', str(port)), paths
-
-        # The frozen launcher and its listener/release checks use the same process-local port.
-        with patch.object(node.host, 'PORT', port), patch.object(node.host, 'service_script', launcher), \
-                node.service(folder, gpu, stop, signature, fixed_date=cfg['fixed_date']) as url:
+        with replica_service(folder, gpu, port, stop, signature, cfg['fixed_date']) as url:
             from transformers import AutoTokenizer
             tokenizer = AutoTokenizer.from_pretrained(node.host.HOT/'models/gpt-oss-120b', local_files_only=True)
             journal = extract.c.corpus.Journal(out, dict(cfg, auditor_api=url), aborted)

@@ -551,7 +551,7 @@ def _fingerprint_rule(rule: Dict[str, Any], domain: str, topic: str) -> str:
 
 
 def _build_distilled_library(samples_payload: List[Dict[str, Any]], min_count: int, *,
-                             legacy_symbolic: bool = True) -> Dict[str, Any]:
+                             legacy_symbolic: bool = True, include_auxiliary: bool = True) -> Dict[str, Any]:
     bucket: Dict[str, Dict[str, Any]] = {}
 
     for item in samples_payload:
@@ -575,7 +575,7 @@ def _build_distilled_library(samples_payload: List[Dict[str, Any]], min_count: i
                     "check_logic": str(rule.get("check_logic") or ""),
                     "error_type": str(rule.get("error_type") or "logic"),
                     **({"symbolic_hint": dict(rule.get("symbolic_hint") or {})} if legacy_symbolic else {}),
-                    "auxiliary": _empty_auxiliary(),
+                    **({"auxiliary": _empty_auxiliary()} if include_auxiliary else {}),
                     "count": 0,
                     "sample_ids": [],
                 },
@@ -583,7 +583,8 @@ def _build_distilled_library(samples_payload: List[Dict[str, Any]], min_count: i
             if sample_id not in entry["sample_ids"]:
                 entry["sample_ids"].append(sample_id)
             entry["count"] = len(entry["sample_ids"])
-            _merge_auxiliary(entry["auxiliary"], _normalize_auxiliary(rule), sample_id)
+            if include_auxiliary:
+                _merge_auxiliary(entry["auxiliary"], _normalize_auxiliary(rule), sample_id)
 
     rules = [v for v in bucket.values() if int(v.get("count", 0)) >= min_count]
     rules.sort(key=lambda x: (-int(x.get("count", 0)), x.get("domain", ""), x.get("topic", ""), x.get("rule_id", "")))

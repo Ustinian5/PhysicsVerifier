@@ -88,7 +88,8 @@ def prepare(out, root):
         if record['value'] is not None:valid.append(record['value'])
     require(valid==vr.read(source/'semantic_experience.json'),'Experience aggregate drift')
     current_fields = review_fields.current(extract_config)
-    distilled=extraction.old.extraction._build_distilled_library(valid,min_count=1,legacy_symbolic=not current_fields)
+    distilled=extraction.old.extraction._build_distilled_library(valid,min_count=1,legacy_symbolic=not current_fields,
+                                                                 include_auxiliary=not review_fields.compact(extract_config))
     require(distilled==vr.read(source/'distilled.json'),'Rule aggregate drift')
     rows={x['id']:x for x in vr.read(source/'inputs.json')}; cases=[];support=defaultdict(list)
     for exp in valid:
@@ -109,7 +110,7 @@ def prepare(out, root):
     bundle=dict(taxonomy=vr.read(source/'taxonomy.json'),rules=distilled['rules'],provenance=dict(support),
                 human_gold=False,source_counts=vr.read(source/'execution_status.json')['counts'])
     if current_fields:
-        bundle['rule_schema'] = review_fields.SCHEMA
+        bundle['rule_schema'] = extract_config['rule_schema']
     if english:
         approved = bind(source/'build_scope.json')
         require(vr.digest(approved) == extract_config.get('build_scope_sha256'), 'Build source scope drift')
@@ -199,7 +200,7 @@ def freeze_plan(out, root, outputs, files, *, english):
     if english:
         cfg.update(prompt_profile=en.PROFILE, scope='materials_only')
         if current_fields:
-            cfg['rule_schema'] = review_fields.SCHEMA
+            cfg['rule_schema'] = outputs['tree_bundle']['rule_schema']
     else:
         cfg.update(auto_advance='User 2026-11-10: continue through both experiments; automatic engineering-only pilot gate',
                    planned_step_checks=400, planned_final_checks=2400, pilot_checks_per_task=24)
@@ -625,43 +626,66 @@ def native_probe(out,cfg,tokenizer):
         scope='native tool names/arguments, full tool text and preceding analysis in actual deployed prompt'))
 
 
-def build_materials(out,cfg,tokenizer):
+def build_tree(out,cfg,tokenizer,stop):
     english = en.active(cfg)
-    journal=c.corpus.Journal(out,cfg['transport'],threading.Event())
+    journal=c.corpus.Journal(out,cfg['transport'],stop)
     bundle=vr.read(out/'tree_bundle.json')
     progress=vr.Progress(out/'tree_progress.json',vr.digest([bundle,cfg]),tree.initial_state())
     def call(stage,key,payload):
-        return model_json(out,journal,tokenizer,'tree_'+stage,key,tree.messages(stage,payload,english=english))[0]
+        return model_json(out,journal,tokenizer,'tree_'+stage,key,
+                          tree.messages(stage,payload,english=english,optional_fields=review_fields.compact(bundle)))[0]
     organizer=tree.Organizer(bundle,progress,call,english=english)
     while organizer.state['phase']!='done':
-        require(not(out/'STOP').exists(),'STOP requested')
+        require(not stop.is_set() and not (out/'STOP').exists(),'STOP requested')
         organizer.step()
         emit(out,'building_tree',phase=organizer.state['phase'],jobs=organizer.state['jobs_committed'],
              placed=len(organizer.state['placed']),unresolved=len(organizer.state['unresolved']))
     products=organizer.products()
     immutable(out/'materials/catalog.json',products['catalog'])
     immutable(out/'materials/tree_report.json',{k:v for k,v in products.items() if k!='catalog'})
-    cases=vr.read(out/'cases.json');outcomes=[]
-    for i,case in enumerate(cases):
-        require(not(out/'STOP').exists(),'STOP requested')
-        path=out/'skill_outcomes'/(case['id']+'.json');signature=vr.digest([case,cfg])
-        if path.exists():
-            saved=vr.read(path);require(saved['signature']==signature,'Skill source drift')
-            require(vr.sha(out/saved['evidence']['file'])==saved['evidence']['sha256'],'Skill raw drift')
-        else:
-            value,ev=model_json(out,journal,tokenizer,'skills',case['id'],skills.skill_messages(case,english=english))
-            try:skills.validate_skills(value);state='collected';reason=None
-            except ValueError as exc:state='content_failure';reason=str(exc)
-            saved=dict(id=case['id'],signature=signature,status=state,value=value,reason=reason,evidence=ev)
-            vr.atomic(path,saved)
-        outcomes.append(saved)
-        emit(out,'extracting_flat_skills',processed=i+1,total=len(cases),content_failures=sum(x['status']=='content_failure' for x in outcomes))
+    return products
+
+
+def skill_outcome(out,cfg,case,journal=None,tokenizer=None):
+    path = out/'skill_outcomes'/(case['id']+'.json')
+    signature = vr.digest([case,cfg])
+    if path.exists():
+        saved = vr.read(path)
+        require(saved['signature'] == signature, 'Skill source drift')
+        require(vr.sha(out/saved['evidence']['file']) == saved['evidence']['sha256'], 'Skill raw drift')
+        return saved
+    require(journal is not None and tokenizer is not None, 'Missing skill outcome')
+    value,ev = model_json(out,journal,tokenizer,'skills',case['id'],skills.skill_messages(case,english=en.active(cfg)))
+    try:
+        skills.validate_skills(value)
+        state,reason = 'collected',None
+    except ValueError as exc:
+        state,reason = 'content_failure',str(exc)
+    saved = dict(id=case['id'],signature=signature,status=state,value=value,reason=reason,evidence=ev)
+    vr.atomic(path,saved)
+    return saved
+
+
+def publish_skills(out,cases,outcomes):
     docs,counts=skills.materialize_skills(cases,outcomes)
     # Convert case-document IDs back to actual question provenance, not labels.
     origins={x['id']:x['source_ids'] for x in cases}
     for d in docs:d['source_ids']=sorted({sid for cid in d['source_ids'] for sid in origins[cid]})
     immutable(out/'materials/skills.json',docs);immutable(out/'materials/skills_report.json',counts)
     immutable(out/'materials/cases.json',cases)
+
+
+def build_materials(out,cfg,tokenizer):
+    stop = threading.Event()
+    products = build_tree(out,cfg,tokenizer,stop)
+    journal = c.corpus.Journal(out,cfg['transport'],stop)
+    cases = vr.read(out/'cases.json')
+    outcomes = []
+    for i,case in enumerate(cases):
+        require(not (out/'STOP').exists(),'STOP requested')
+        outcomes.append(skill_outcome(out,cfg,case,journal,tokenizer))
+        emit(out,'extracting_flat_skills',processed=i+1,total=len(cases),content_failures=sum(x['status']=='content_failure' for x in outcomes))
+    publish_skills(out,cases,outcomes)
     return products
 
 
@@ -673,7 +697,7 @@ def accept_materials(out,cfg):
         saved=vr.read(receipt);require(saved['passed'] and saved['files']==hashes,'Material acceptance drift');return
     verify(out,full=True)
     bundle=vr.read(out/'tree_bundle.json');catalog=vr.read(paths[0]);report=vr.read(paths[1])
-    require(review_fields.current(bundle) == review_fields.current(cfg) == review_fields.current(catalog.get('metadata', {})),
+    require(bundle.get('rule_schema') == cfg.get('rule_schema') == catalog.get('metadata', {}).get('rule_schema'),
             'Rule fields differ between construction and catalog')
     require(report['counts']['all_candidates_preserved'] and report['counts']['placed_rules']>0,'No usable conserved tree')
     cases=vr.read(out/'materials/cases.json');flat=vr.read(out/'materials/skills.json')

@@ -174,8 +174,8 @@ def released_libraries(parent, files):
     receipt = vr.read(receipt_path)
     paths = {k: parent / 'materials' / (k + '.json') for k in ('cases', 'skills', 'catalog')}
     if review_fields.current(cfg):
-        require(review_fields.current(first['configuration']) and
-                review_fields.current(vr.read(paths['catalog']).get('metadata', {})), 'Different online rule fields')
+        require(cfg['rule_schema'] == first['configuration'].get('rule_schema') ==
+                vr.read(paths['catalog']).get('metadata', {}).get('rule_schema'), 'Different online rule fields')
         schema = 'rule_framework/review_fields.py'
         require(vr.sha(a.ROOT/schema) == cfg['code'][schema], 'Changed online rule schema')
         files[str(a.ROOT/schema)] = cfg['code'][schema]
@@ -241,6 +241,10 @@ def prepare(out, parent, *, prompt_profile=None, benchmark=None, pure_only=False
             from scripts import run_step_line_judge as line_judge
             c['step_match_judge'] = line_judge.lines.VERSION
             c['source_hashes'].update(line_judge.contract()['code'])
+            if parent and review_fields.compact(vr.read(parent/'plan.json')['configuration']):
+                from scripts import step_judge_release as release
+                c['judge_release_policy'] = release.POLICY
+                c['source_hashes']['scripts/step_judge_release.py'] = vr.sha(Path(release.__file__))
         comparison.compatible(c, original, same_judge=judge_location_policy != 'lines_once')
         c.update(reuse_pure=str(reuse_pure.resolve()), judge_location_policy=judge_location_policy)
         c['source_hashes']['scripts/reuse_step_baseline.py'] = vr.sha(Path(comparison.__file__))
@@ -263,6 +267,10 @@ def verify(out):
     if c.get('judge_location_policy') == 'lines_once':
         from scripts import run_step_line_judge as line_judge
         actual.update(line_judge.contract()['code'])
+        if 'judge_release_policy' in c:
+            from scripts import step_judge_release as release
+            require(c['judge_release_policy'] == release.POLICY, 'Different step release criterion')
+            actual['scripts/step_judge_release.py'] = vr.sha(Path(release.__file__))
     if (plan['configuration_sha256'] == comparison.PURE_CONFIG and (out/'metrics.json').is_file()
             and vr.sha(out/'metrics.json') == comparison.PURE_METRICS):
         # The baseline was completed before reuse orchestration. Bind its actual executable sources via Git.
@@ -316,7 +324,11 @@ def score(out, plan=None):
             return vr.read(out/'metrics.json')
         if plan['configuration'].get('judge_location_policy') == 'lines_once':
             from scripts import run_step_line_judge as line_judge
-            return line_judge.comparison(out, plan)
+            measured = line_judge.comparison(out, plan)
+            if 'judge_release_policy' in plan['configuration']:
+                from scripts import step_judge_release as release
+                return release.publish(out, measured)
+            return measured
         if plan['configuration'].get('reuse_pure'):
             with base.r.run_lock(out / 'step_judge/runner.lock'):
                 return comparison.evaluate(out, plan)
@@ -462,7 +474,12 @@ def run(out, *, gpu=4, wait_detached=None):
                 with base.r.run_lock(out / 'step_judge/runner.lock'), httpx.Client(trust_env=False) as client:
                     if c.get('judge_location_policy') == 'lines_once':
                         from scripts import run_step_line_judge as line_judge
+                        if 'judge_release_policy' in c:
+                            from scripts import step_judge_release as release
+                            release.frozen_pure(out.parent/'step_judge_lines')
                         report = line_judge.comparison(out, plan, tokenizer=tokenizer, client=client)
+                        if 'judge_release_policy' in c:
+                            report = release.publish(out, report)
                     elif c.get('reuse_pure'):
                         from scripts import reuse_step_baseline as comparison
                         report = comparison.evaluate(out, plan, tokenizer=tokenizer, client=client)
