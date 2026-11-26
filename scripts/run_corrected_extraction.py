@@ -18,7 +18,7 @@ from scripts import run_experience_first_120b as old
 from scripts.combined_language_io import iter_rollout_batches
 from scripts.combined_language_samples import extract_question
 from rule_framework.oss120b_construction import question_key
-from rule_framework import verifier_english as en
+from rule_framework import review_fields, verifier_english as en
 from scripts import verifier_build_scope as scope
 from scripts.run_qwen30b_step_checks import validate_effective_input
 
@@ -109,12 +109,13 @@ def prepare(out, source, dataset=None, *, results_root=None):
         max_tokens=16384, max_request_input_bytes=400000, reasoning_effort='medium', timeout_seconds=1200,
         technical_attempts=3, retry_cooldown_seconds=60, max_rules_per_sample=2,
         structural_repair_rounds=1, fixed_date='2026-11-07', pilot_size=12,
-        prompt_profile=en.PROFILE, audit_system_prompt=audit_prompt, build_scope_sha256=digest(approved),
+        prompt_profile=en.PROFILE, rule_schema=review_fields.SCHEMA, audit_system_prompt=audit_prompt, build_scope_sha256=digest(approved),
         source_plan_sha256=sha(source/'plan.json'), source=str(source),
         inputs_sha256=digest(rows), generation_failures_sha256=digest(rejected),
         skeleton_sha256=digest(skeleton), evidence_sha256=digest(evidence),
         sources={n:sha(c.ROOT/n) for n in sorted(set(list(old.SOURCES)+list(c.SOURCES)+
             ['scripts/run_corrected_extraction.py','scripts/run_qwen30b_step_checks.py','rule_framework/verifier_english.py',
+             'rule_framework/review_fields.py',
              'scripts/combined_language_io.py','scripts/combined_language_samples.py','scripts/verifier_build_scope.py']))},
         model_files=old.b.existing.MODEL_FILES, human_gold=False,
         policy='Frozen build order; one continuous audit+extraction; content failures retained; no resampling')
@@ -141,6 +142,9 @@ def verify(out):
         require([r['id'] for r in read(out/'inputs.json')]==[s for s in approved['registered'] if s not in held|failed],
                 'First review escaped the accepted source population')
     require(sha(Path(cfg['source'])/'plan.json')==cfg['source_plan_sha256'], 'Source plan drift')
+    if 'archived_review_plan' in cfg:
+        from scripts.project_verifier_first_reviews import verify_files
+        verify_files(out, cfg)
     return plan
 
 
@@ -152,6 +156,8 @@ def confirm(out):
 
 
 def request_messages(stage, payload, config):
+    if stage == 'repair_experience' and review_fields.current(config):
+        payload = dict(payload, draft=review_fields.without_symbolic_hint(payload['draft']))
     messenger = old.Journal.__new__(old.Journal)
     messages = messenger.messages(stage, payload)
     if en.active(config):
@@ -222,7 +228,7 @@ def review_one(out, row, taxonomy, cfg, journal, tokenizer, *, saved_only=False)
             error = draft['_content_failure']
             break
         try:
-            value = old.extraction.normalize_120b_experience(draft, **payload)
+            value = old.extraction.normalize_120b_experience(draft, **payload, legacy_symbolic=not review_fields.current(cfg))
             error = None
             break
         except ValueError as exc:
@@ -245,6 +251,7 @@ def run(out, *, wait_detached=None, reviews=serial_reviews):
     require(Path('/proc').exists(),'Server only')
     with c.corpus.r.run_lock(out/'active.lock'),c.corpus.r.run_lock(out.parent/'organization_service_18083.lock'):
         plan=verify(out);cfg=plan['configuration'];code=1
+        require('archived_review_plan' not in cfg, 'Archived reviews are published offline')
         (out/'runner.pid').write_text(str(os.getpid()))
         try:
             (wait_detached or c.corpus.runtime.wait_detached)(out,plan['configuration_sha256'])
@@ -279,7 +286,7 @@ def run(out, *, wait_detached=None, reviews=serial_reviews):
                     require(bool(valid),'All pilot outputs failed structure validation; inspect before continuing')
             require(len(valid)+len(invalid)==len(rows), 'Incomplete first-review population')
             write(out/'semantic_experience.json',valid);write(out/'invalid_outputs.json',invalid)
-            distilled=old.extraction._build_distilled_library(valid,min_count=1)
+            distilled=old.extraction._build_distilled_library(valid,min_count=1,legacy_symbolic=not review_fields.current(cfg))
             write(out/'distilled.json',distilled)
             write(out/'execution_status.json',dict(state='extraction_complete',processed=len(rows),counts=dict(counts),
                 rules=len(distilled['rules']),tree_complete=False,skills_complete=False,updated_unix=time.time()))

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from scripts import reuse_step_baseline as reuse
+from scripts import reference_review_pool as pool
 from scripts import run_reference_guided_verifier as workflow
 from scripts import run_step_match_judge as judge
 from scripts import verifier_build_scope as scope
@@ -120,7 +121,6 @@ def test_frozen_pure_reuse_and_evidence_only_repair(tmp_path, monkeypatch, polic
 
 
 def test_parallel_reviews_release_only_after_ordered_pilot(tmp_path, monkeypatch):
-    pool = workflow.pool
     cfg = {'pilot_size': 4}
     rows = [dict(id=str(i)) for i in range(11)]
     calls = []

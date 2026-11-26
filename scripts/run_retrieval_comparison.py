@@ -30,6 +30,7 @@ import httpx
 from dotenv import load_dotenv
 from core.rule_catalog_retrieval import iter_rule_leaves
 from core.unified_semantic_matcher import UnifiedSemanticMatcher
+from rule_framework import review_fields
 from scripts.experiment_manifest import sha256_file, capture_git_state, fingerprint_source_tree
 
 ASTRA = "gpt-6-astra"
@@ -133,6 +134,8 @@ class Corpus:
     def __init__(self, catalog, *, tree):
         self.leaves = {}
         self.nodes = {}
+        fields = review_fields.LEAF_FIELDS if review_fields.current(catalog.get("metadata", {})) else LEAF_FIELDS
+        expected_fields = set(fields)
         for domain in catalog["domains"]:
             did = "domain:" + str(domain["id"])
             dnode = {"id": did, "name": domain.get("name"), "summary": domain.get("summary", ""), "children": []}
@@ -143,7 +146,7 @@ class Corpus:
                     rid = rule["rule_id"]
                     if rid in self.leaves:
                         raise ValueError("Duplicate leaf ID: " + rid)
-                    if set(rule) != set(LEAF_FIELDS):
+                    if set(rule) != expected_fields:
                         raise ValueError("Leaf schema changed; review projection before running")
                     self.leaves[rid] = copy.deepcopy(rule)
                     tnode["rule_ids"].append(rid)

@@ -14,7 +14,7 @@ import subprocess
 import time
 from unittest.mock import patch
 
-from rule_framework import verifier_english as en
+from rule_framework import review_fields, verifier_english as en
 
 import httpx
 
@@ -173,6 +173,16 @@ def released_libraries(parent, files):
     receipt_path = parent / 'construction_acceptance.json'
     receipt = vr.read(receipt_path)
     paths = {k: parent / 'materials' / (k + '.json') for k in ('cases', 'skills', 'catalog')}
+    if review_fields.current(cfg):
+        require(review_fields.current(first['configuration']) and
+                review_fields.current(vr.read(paths['catalog']).get('metadata', {})), 'Different online rule fields')
+        schema = 'rule_framework/review_fields.py'
+        require(vr.sha(a.ROOT/schema) == cfg['code'][schema], 'Changed online rule schema')
+        files[str(a.ROOT/schema)] = cfg['code'][schema]
+        if 'archived_review_plan' in first['configuration']:
+            release = (build/'field_release.json').resolve(strict=True)
+            require(vr.sha(release) == evidence[str(release)], 'Different offline first-review release')
+            files[str(release)] = evidence[str(release)]
     require(receipt['passed'] and all(receipt['files'][str(p.relative_to(parent))] == vr.sha(p) for p in paths.values())
             and receipt['isolation_sha256'] == vr.sha(parent / 'material_isolation.json'), 'Library receipt drift')
     for path in (parent / 'plan.json', parent / 'source_evidence.json', parent / 'material_isolation.json', receipt_path):

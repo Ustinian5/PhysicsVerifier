@@ -1,7 +1,6 @@
 """Run the frozen reference-guided construction and blind evaluations on node14."""
 import argparse
 from contextlib import contextmanager
-from functools import partial
 import os
 from pathlib import Path
 import time
@@ -10,7 +9,7 @@ import httpx
 import tempfile
 
 from scripts import reuse_step_baseline as baseline
-from scripts import reference_review_pool as pool
+from scripts import project_verifier_first_reviews as projection
 from scripts import run_aligned_step_evaluation as step
 from scripts import run_corrected_extraction as extract
 from scripts import run_corrected_pipeline as materials
@@ -20,20 +19,23 @@ from scripts import verifier_build_scope as scope
 
 vr, require = final.vr, final.require
 RESULTS = node.host.HOT / 'results/qwen30b_step_verifier'
-WORK = RESULTS / 'english_blind_verifier'
+ORIGINAL = RESULTS / 'english_blind_verifier'
+WORK = ORIGINAL / 'rule_fields'
 
 
 def configuration(policy, gpus):
     require(gpus and len(gpus) == len(set(gpus)) and set(gpus) <= {4, 5, 6, 7}, 'Invalid review GPU list')
-    names = ('scripts/run_reference_guided_verifier.py', 'scripts/verifier_build_scope.py', 'scripts/reference_review_pool.py',
+    names = ('scripts/run_reference_guided_verifier.py', 'scripts/verifier_build_scope.py', 'scripts/project_verifier_first_reviews.py',
              'scripts/run_corrected_extraction.py', 'scripts/run_corrected_pipeline.py',
              'scripts/reuse_step_baseline.py', 'scripts/repair_step_judge_locations.py',
              'scripts/run_aligned_step_evaluation.py', 'scripts/run_step_match_judge.py',
              'scripts/serve_frozen_bm25.py', 'scripts/run_final_answer_revision.py',
-             'rule_framework/build_review_prompt.txt')
+             'rule_framework/build_review_prompt.txt', 'rule_framework/review_fields.py', 'rule_framework/bounded_tree.py',
+             'scripts/generate_experience_rules.py', 'scripts/build_unified_catalog.py', 'scripts/run_retrieval_comparison.py')
     if policy == 'lines_once':
-        names += ('rule_framework/step_match_lines.py', 'scripts/run_step_line_judge.py', 'scripts/step_judge_handoff.py')
-    return dict(source_scope_sha256=vr.sha(scope.SCOPE_FILE), source_audit_sha256=vr.sha(WORK/'build_scope_audit.json'),
+        names += ('rule_framework/step_match_lines.py', 'scripts/run_step_line_judge.py')
+    return dict(source_scope_sha256=vr.sha(scope.SCOPE_FILE), source_audit_sha256=vr.sha(ORIGINAL/'build_scope_audit.json'),
+                rule_schema=projection.review_fields.SCHEMA, first_review_audit_sha256=projection.AUDIT_SHA,
                 judge_location_policy=policy, review_gpus=list(gpus),
                 pure_metrics_sha256=baseline.PURE_METRICS, model=final.base.r.EXPECTED_MODEL,
                 build_date='2026-11-07', check_date=node.CHECK_DATE, registered_build=2000,
@@ -77,22 +79,27 @@ def connect_stop(folder, root):
         local.symlink_to(target)
 
 
+def prepare_materials():
+    build = WORK/'construction'
+    projection.prepare(ORIGINAL/'construction', build)
+    library = WORK/'libraries'
+    if not (library/'plan.json').exists():
+        materials.prepare(library, WORK)
+    plan = materials.verify(library)
+    require(projection.review_fields.current(plan['configuration']), 'Different rule field release')
+    return plan
+
+
 def run(*, adopted=False):
+    require(not adopted, 'The archived one-time judge handoff ended at the recorded tree stop')
     node.node()
     with final.base.r.run_lock(WORK/'workflow.lock'):
-        if adopted:
-            from scripts import step_judge_handoff as handoff
-            plan = handoff.verify()
-            handoff.take_boundary(plan)
-            supervisor = handoff.ROOT
-        else:
-            plan, supervisor = verify_plan(), WORK
+        plan, supervisor = verify_plan(), WORK
         sig, cfg = plan['configuration_sha256'], plan['configuration']
         gpu = cfg['review_gpus'][0]
         code = 1
         try:
-            if not adopted:
-                final.base.runtime.wait_detached(supervisor, sig)
+            final.base.runtime.wait_detached(supervisor, sig)
 
             def attached_to_supervisor(folder, signature):
                 ready = vr.read(supervisor/'disconnect_acceptance.json')
@@ -110,18 +117,15 @@ def run(*, adopted=False):
                     require(endpoint == 'http://127.0.0.1:18083/v1', 'Unexpected inference endpoint')
                     yield
 
-            pure = WORK/'step_pure'
+            pure = ORIGINAL/'step_pure'
             stage('verifying_frozen_baseline')
             baseline.baseline(pure)
             build = WORK/'construction'
-            connect_stop(build, WORK)
-            collection = RESULTS/'corrected/collection'
             stage('binding_frozen_build_inputs')
-            if not (build/'plan.json').exists():
-                extract.prepare(build, collection, scope.PROJECT/'data/combined_language_only.json', results_root=RESULTS)
+            lp = prepare_materials()
             build_plan = extract.verify(build)
             approved = vr.read(build/'build_scope.json')
-            audit = vr.read(WORK/'build_scope_audit.json')
+            audit = vr.read(ORIGINAL/'build_scope_audit.json')
             bc = build_plan['configuration']
             require(approved == scope.source_scope(RESULTS) and bc['fixed_date'] == cfg['build_date']
                     and audit['source_manifest_sha256'] == cfg['source_scope_sha256']
@@ -131,18 +135,12 @@ def run(*, adopted=False):
                     and audit['source_evidence_digest'] == bc['evidence_sha256'],
                     'First-review inputs differ from the verified frozen 30B source audit')
             build_status = vr.read(build/'execution_status.json')
-            if build_status['state'] != 'extraction_complete':
-                stage('first_review', eligible=len(vr.read(build/'inputs.json')))
-                with inference(build, cfg['build_date'], build_plan['configuration_sha256']):
-                    extract.run(build, wait_detached=attached_to_supervisor,
-                                reviews=partial(pool.ordered_reviews, gpus=cfg['review_gpus']))
+            require(build_status['state'] == 'extraction_complete' and bc['rule_schema'] == cfg['rule_schema'],
+                    'Missing current offline first-review release')
 
             library = WORK/'libraries'
             connect_stop(library, WORK)
             stage('preparing_libraries')
-            if not (library/'plan.json').exists():
-                materials.prepare(library, WORK)
-            lp = materials.verify(library)
             lc = lp['configuration']
             require(lc.get('scope') == 'materials_only' and lc['transport']['fixed_date'] == cfg['build_date'],
                     'Different material protocol')
@@ -158,7 +156,8 @@ def run(*, adopted=False):
                     materials.accept_materials(library,lc)
             step.released_libraries(library,{})
 
-            evaluated = WORK/'step'
+            # Keep the existing 63 pure judgments in their canonical, shared evidence directory.
+            evaluated = ORIGINAL/'step_rule_fields'
             connect_stop(evaluated, WORK)
             stage('step_knowledge_arms')
             if not (evaluated/'plan.json').is_file():
@@ -231,7 +230,7 @@ def run(*, adopted=False):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command',choices=('audit','prepare','run','confirm','adopt-lines'))
+    parser.add_argument('command',choices=('audit','prepare','run','confirm'))
     parser.add_argument('--approved-scope-sha256')
     parser.add_argument('--judge-location-policy', choices=baseline.POLICIES, default='lines_once')
     parser.add_argument('--gpus',type=int,nargs='+',choices=(4,5,6,7),default=[4])
@@ -241,25 +240,19 @@ def main():
         tempfile.tempdir = str(node.host.HOT / 'tmp')
         with final.base.r.run_lock(WORK/'source_audit.lock'):
             report = scope.audit(RESULTS)
-            final.immutable(WORK/'build_scope_audit.json', report)
+            require(report == vr.read(ORIGINAL/'build_scope_audit.json'), 'Frozen source audit changed')
             print(report['registered'], report['reviewable'], report['dispositions'])
     elif args.command=='prepare':
         with final.base.r.run_lock(WORK/'workflow.lock'):
+            node.node()
+            require(args.approved_scope_sha256 == scope.SCOPE_SHA, 'Different approved construction scope')
+            connect_stop(WORK, ORIGINAL)
+            prepare_materials()
             bind(args.judge_location_policy,args.approved_scope_sha256,args.gpus)
-    elif args.command == 'adopt-lines':
-        from scripts import step_judge_handoff as handoff
-        handoff.prepare()
     elif args.command=='confirm':
         node.node()
-        from scripts import step_judge_handoff as handoff
-        if handoff.ADOPTION.is_file():
-            node.confirm(handoff.ROOT, handoff.verify()['configuration_sha256'])
-        else:
-            node.confirm(WORK,verify_plan()['configuration_sha256'])
+        node.confirm(WORK,verify_plan()['configuration_sha256'])
     else:
-        from scripts import step_judge_handoff as handoff
-        if handoff.ADOPTION.is_file():
-            raise SystemExit(handoff.resume())
         raise SystemExit(run())
 
 

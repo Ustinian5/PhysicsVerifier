@@ -11,6 +11,7 @@ import copy
 import json
 
 from rule_framework.verified_resume import digest
+from rule_framework import review_fields
 
 VERSION = 'per_rule_topics_paged_scenarios_v1'
 POLICY = {'batch_size': 4, 'groups_per_page': 16, 'max_pages_per_batch': 64,
@@ -346,6 +347,9 @@ class Organizer:
             raise ValueError('Candidate conservation failed')
         catalog = {'metadata': {'builder': VERSION, 'embedding_calls': 0, 'human_gold': False,
                                'physical_validity': 'machine_candidates_not_quality_accepted'}, 'domains': []}
+        current_fields = review_fields.current(self.bundle)
+        if current_fields:
+            catalog['metadata']['rule_schema'] = review_fields.SCHEMA
         for domain in self.bundle['taxonomy']['domains']:
             d = {k: domain[k] for k in ('id', 'name', 'summary')}
             d['topics'] = []
@@ -358,7 +362,8 @@ class Organizer:
                 if len(members) != len(set(members)) or set(members) != {
                         rid for rid, decision in s['placed'].items() if decision['topic_key'] == key}:
                     raise ValueError('Registry membership changed')
-                leaves = [_project_navigation_rule(copy.deepcopy(self.rules[rid])) for rid in members]
+                leaves = [_project_navigation_rule(copy.deepcopy(self.rules[rid]), legacy_symbolic=not current_fields)
+                          for rid in members]
                 d['topics'].append(dict(topic, rules=leaves, scenario_clusters=[
                     {'id': g['id'], 'name': g['name'], 'summary': g['summary'], 'rule_ids': g['members']} for g in groups]))
             if d['topics']:

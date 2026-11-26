@@ -801,17 +801,20 @@ def _summarize_rule(rule: Dict[str, Any]) -> str:
     return title or trigger or norm_text(rule.get("check_logic") or "")
 
 
-def _project_navigation_rule(rule: Dict[str, Any]) -> Dict[str, Any]:
+def _project_navigation_rule(rule: Dict[str, Any], *, legacy_symbolic: bool = True) -> Dict[str, Any]:
     trigger = norm_text(rule.get("trigger") or "")
-    return {
+    leaf = {
         "rule_id": norm_text(rule.get("rule_id") or ""),
         "title": norm_text(rule.get("title") or ""),
         "summary": _summarize_rule(rule),
         "trigger": trigger,
         "check_logic": norm_text(rule.get("check_logic") or ""),
         "error_type": norm_text(rule.get("error_type") or "logic") or "logic",
-        "symbolic_hint": rule.get("symbolic_hint") if isinstance(rule.get("symbolic_hint"), dict) else {},
     }
+    if legacy_symbolic:
+        hint = rule.get("symbolic_hint")
+        leaf["symbolic_hint"] = hint if isinstance(hint, dict) else {}
+    return leaf
 
 
 def _project_navigation_group(group: Dict[str, Any]) -> Dict[str, Any]:

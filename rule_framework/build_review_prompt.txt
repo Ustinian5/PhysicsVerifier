@@ -10,7 +10,7 @@ Return one JSON object using the structure below. Use an empty array when there 
 
 Copy topic_key from the supplied T IDs. Number errors E1, E2, and so on. Use the shortest contiguous range of source lines that locates each error. For type and error_type choose one of concept, logic, calculation, modeling or units.
 Set status to error_found if any error is confirmed, uncertain if only unresolved issues remain, or no_error_found if neither is present.
-Produce at most max_rules_per_sample rules. For rule_status use included if a rule was derived, not_generalizable if the error does not transfer, uncertain if applicability is unresolved, or rule_budget if the limit was reached. Each rule must cite at least one source error. Together, source_error_ids must cover exactly the errors marked included. Copy the fixed symbolic_hint shown below.
+Produce at most max_rules_per_sample rules. For rule_status use included if a rule was derived, not_generalizable if the error does not transfer, uncertain if applicability is unresolved, or rule_budget if the limit was reached. Each rule must cite at least one source error. Together, source_error_ids must cover exactly the errors marked included.
 
 {
   "topic_key": "T1",
@@ -27,7 +27,6 @@ Produce at most max_rules_per_sample rules. For rule_status use included if a ru
   "experience_rules": [
     {"source_error_ids": ["E1"], "title": "Rule name", "trigger": "Conditions of applicability",
      "check_logic": "Expected relation, check and criterion for a violation", "error_type": "modeling",
-     "symbolic_hint": {"primitive": "none", "canonical": "", "required_symbols": []},
      "auxiliary": {"node_summary": "Scenario summary", "scene_cues": [], "boundary_cues": [], "explore_cues": []}}
   ]
 }

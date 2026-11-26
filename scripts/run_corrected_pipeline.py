@@ -18,7 +18,7 @@ from rule_framework import corrected_verifier as protocol
 from rule_framework import organization_followup as skills
 from rule_framework import verified_resume as vr
 from rule_framework.flat_skill_rag import FlatMemory, TreeMemory
-from rule_framework import verifier_english as en
+from rule_framework import review_fields, verifier_english as en
 from scripts import audit_hipho_overlap as isolation
 from scripts import run_corrected_annotations as annotations
 from scripts import run_corrected_extraction as extraction
@@ -77,6 +77,8 @@ def prepare(out, root):
     for n in ['plan.json','inputs.json','semantic_experience.json','distilled.json','taxonomy.json',
               'source_evidence.json','generation_failures.json','invalid_outputs.json']:
         bind(source/n)
+    if 'archived_review_plan' in extract_config:
+        bind(source/'field_release.json')
     files.update(vr.read(source/'source_evidence.json'))
     valid=[]
     for row in vr.read(source/'inputs.json'):
@@ -85,7 +87,8 @@ def prepare(out, root):
             files[str(source/ev['file'])]=ev['sha256']
         if record['value'] is not None:valid.append(record['value'])
     require(valid==vr.read(source/'semantic_experience.json'),'Experience aggregate drift')
-    distilled=extraction.old.extraction._build_distilled_library(valid,min_count=1)
+    current_fields = review_fields.current(extract_config)
+    distilled=extraction.old.extraction._build_distilled_library(valid,min_count=1,legacy_symbolic=not current_fields)
     require(distilled==vr.read(source/'distilled.json'),'Rule aggregate drift')
     rows={x['id']:x for x in vr.read(source/'inputs.json')}; cases=[];support=defaultdict(list)
     for exp in valid:
@@ -105,6 +108,8 @@ def prepare(out, root):
                 set(rule['sample_ids'])<=error_ids,'Rule source mismatch')
     bundle=dict(taxonomy=vr.read(source/'taxonomy.json'),rules=distilled['rules'],provenance=dict(support),
                 human_gold=False,source_counts=vr.read(source/'execution_status.json')['counts'])
+    if current_fields:
+        bundle['rule_schema'] = review_fields.SCHEMA
     if english:
         approved = bind(source/'build_scope.json')
         require(vr.digest(approved) == extract_config.get('build_scope_sha256'), 'Build source scope drift')
@@ -182,6 +187,9 @@ def freeze_plan(out, root, outputs, files, *, english):
         max_tokens=16384,technical_attempts=3,retry_cooldown_seconds=60,timeout_seconds=1200,
         reasoning_effort='medium',fixed_date='2026-11-07')
     sources = SOURCES + ('rule_framework/verifier_english.py', 'rule_framework/final_answer_revision.py') if english else SOURCES
+    current_fields = review_fields.current(outputs.get('tree_bundle', {}))
+    if current_fields:
+        sources += ('rule_framework/review_fields.py', 'scripts/build_unified_catalog.py', 'scripts/run_retrieval_comparison.py')
     cfg=dict(protocol=protocol.VERSION,root=str(root),transport=transport,
         model_files=extraction.old.b.existing.MODEL_FILES,limits=protocol.LIMITS,
         tree_policy=tree.POLICY,arms=list(protocol.ARMS),human_gold=False,
@@ -190,6 +198,8 @@ def freeze_plan(out, root, outputs, files, *, english):
         evidence_digest=vr.digest(files),unknown_usage_policy='Per online case, reserve full advertised allowance; never restart its budget')
     if english:
         cfg.update(prompt_profile=en.PROFILE, scope='materials_only')
+        if current_fields:
+            cfg['rule_schema'] = review_fields.SCHEMA
     else:
         cfg.update(auto_advance='User 2026-11-10: continue through both experiments; automatic engineering-only pilot gate',
                    planned_step_checks=400, planned_final_checks=2400, pilot_checks_per_task=24)
@@ -663,6 +673,8 @@ def accept_materials(out,cfg):
         saved=vr.read(receipt);require(saved['passed'] and saved['files']==hashes,'Material acceptance drift');return
     verify(out,full=True)
     bundle=vr.read(out/'tree_bundle.json');catalog=vr.read(paths[0]);report=vr.read(paths[1])
+    require(review_fields.current(bundle) == review_fields.current(cfg) == review_fields.current(catalog.get('metadata', {})),
+            'Rule fields differ between construction and catalog')
     require(report['counts']['all_candidates_preserved'] and report['counts']['placed_rules']>0,'No usable conserved tree')
     cases=vr.read(out/'materials/cases.json');flat=vr.read(out/'materials/skills.json')
     require(bool(cases) and bool(flat),'Empty auxiliary store; inspect construction failure')

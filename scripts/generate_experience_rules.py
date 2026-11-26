@@ -395,7 +395,7 @@ def _experience_topics(taxonomy: Dict[str, Any]) -> Dict[str, Tuple[str, str]]:
 
 def normalize_120b_experience(
     parsed: Dict[str, Any], *, sample: Dict[str, Any], taxonomy: Dict[str, Any],
-    max_rules_per_sample: int = 2,
+    max_rules_per_sample: int = 2, legacy_symbolic: bool = True,
 ) -> Dict[str, Any]:
     """Validate source references without the legacy fuzzy-topic/field fallback.
 
@@ -443,8 +443,9 @@ def normalize_120b_experience(
     for rule in rules:
         text_fields(rule, ("title", "trigger", "check_logic", "error_type"))
         require(rule["error_type"] in ERROR_TYPES, "Invalid rule type")
-        require(rule.get("symbolic_hint") == {"primitive": "none", "canonical": "", "required_symbols": []},
-                "Unexpected symbolic program")
+        if legacy_symbolic:
+            require(rule.get("symbolic_hint") == {"primitive": "none", "canonical": "", "required_symbols": []},
+                    "Unexpected symbolic program")
         ids = rule.get("source_error_ids")
         require(isinstance(ids, list) and ids and all(isinstance(i, str) for i in ids), "Missing rule evidence")
         require(len(ids) == len(set(ids)) and set(ids) <= included, "Invented/duplicate/not-included source")
@@ -453,10 +454,14 @@ def normalize_120b_experience(
         require(fp not in seen, "Duplicate rule within answer")
         seen.add(fp)
     require(covered == included, "Included error has no rule")
-    return {"sample_id": sample["id"], "status": "ok", "topic_key": parsed["topic_key"],
-            "topic_guess": dict(zip(("domain", "topic"), topics[parsed["topic_key"]])),
-            "semantic_audit": {**audit, "key_errors": anchored},
-            "experience_rules": rules, "human_gold": False}
+    experience = {"sample_id": sample["id"], "status": "ok", "topic_key": parsed["topic_key"],
+                  "topic_guess": dict(zip(("domain", "topic"), topics[parsed["topic_key"]])),
+                  "semantic_audit": {**audit, "key_errors": anchored},
+                  "experience_rules": rules, "human_gold": False}
+    if legacy_symbolic:
+        return experience
+    from rule_framework.review_fields import without_symbolic_hint
+    return without_symbolic_hint(experience)
 
 
 def _call_json(client: Any, model: str, system_prompt: str, user_prompt: str, temperature: float, max_tokens: int) -> Dict[str, Any]:
@@ -545,7 +550,8 @@ def _fingerprint_rule(rule: Dict[str, Any], domain: str, topic: str) -> str:
     return hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
 
 
-def _build_distilled_library(samples_payload: List[Dict[str, Any]], min_count: int) -> Dict[str, Any]:
+def _build_distilled_library(samples_payload: List[Dict[str, Any]], min_count: int, *,
+                             legacy_symbolic: bool = True) -> Dict[str, Any]:
     bucket: Dict[str, Dict[str, Any]] = {}
 
     for item in samples_payload:
@@ -568,7 +574,7 @@ def _build_distilled_library(samples_payload: List[Dict[str, Any]], min_count: i
                     "trigger": str(rule.get("trigger") or ""),
                     "check_logic": str(rule.get("check_logic") or ""),
                     "error_type": str(rule.get("error_type") or "logic"),
-                    "symbolic_hint": dict(rule.get("symbolic_hint") or {}),
+                    **({"symbolic_hint": dict(rule.get("symbolic_hint") or {})} if legacy_symbolic else {}),
                     "auxiliary": _empty_auxiliary(),
                     "count": 0,
                     "sample_ids": [],
