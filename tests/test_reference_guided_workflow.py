@@ -1,6 +1,8 @@
 import copy
 import hashlib
 import json
+import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -108,8 +110,50 @@ def test_frozen_pure_reuse_and_evidence_only_repair(tmp_path, monkeypatch, polic
         assert reuse.evaluate(tmp_path, plan) == metrics
     else:
         for kwargs in (live, {}):
-            with pytest.raises(ValueError, match='1 invalid'):
+            expected = reuse.CitationDecisionPending if invalid == 'quote' and policy == 'stop' else ValueError
+            with pytest.raises(expected, match='1 invalid') as failure:
                 reuse.evaluate(tmp_path, plan, **kwargs)
+            assert (type(failure.value) is reuse.CitationDecisionPending) == (expected is reuse.CitationDecisionPending)
         assert not (tmp_path/'metrics.json').exists()
     assert len(calls) == 2 + location_calls
     assert len(list((tmp_path/'step_judge/locations').glob('*/result.json'))) == location_calls
+
+
+def test_parallel_reviews_release_only_after_ordered_pilot(tmp_path, monkeypatch):
+    pool = workflow.pool
+    cfg = {'pilot_size': 4}
+    rows = [dict(id=str(i)) for i in range(11)]
+    calls = []
+
+    class Worker(threading.Thread):
+        @property
+        def exitcode(self):
+            return 0 if not self.is_alive() else None
+
+    def save(row, owner):
+        path = tmp_path/'experiences'/(row['id']+'.json')
+        assert not path.exists()
+        if int(row['id']) >= cfg['pilot_size']:
+            assert (tmp_path/'pilot_acceptance.json').exists()
+        calls.append((int(row['id']), owner))
+        pool.extract.write(path, row)
+
+    def secondary(out, gpu, positions, gate, aborted, parent, signature):
+        for i in positions:
+            if i >= cfg['pilot_size']:
+                assert gate.wait(5) and not aborted.is_set()
+            save(rows[i], gpu)
+
+    def primary(out, row, taxonomy, config, journal, tokenizer, *, saved_only):
+        if not saved_only:
+            save(row, 4)
+        return pool.extract.read(out/'experiences'/(row['id']+'.json'))
+
+    monkeypatch.setattr(pool.multiprocessing, 'get_context', lambda _: SimpleNamespace(Event=threading.Event, Process=Worker))
+    monkeypatch.setattr(pool, 'replica', secondary)
+    monkeypatch.setattr(pool.extract, 'review_one', primary)
+    for i, record in enumerate(pool.ordered_reviews(tmp_path, rows, {}, cfg, None, None, gpus=[4, 5, 6, 7])):
+        assert record == rows[i]
+        if i+1 == cfg['pilot_size']:
+            pool.extract.write(tmp_path/'pilot_acceptance.json', dict(passed=True, configuration_sha256=pool.extract.digest(cfg)))
+    assert sorted(calls) == [(i, 4+i%4) for i in range(len(rows))]

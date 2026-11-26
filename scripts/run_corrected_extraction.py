@@ -180,20 +180,68 @@ def call(out, journal, tokenizer, stage, key, payload):
     effective=validate_effective_input(raw,tokenizer,cfg['fixed_date'])
     if en.active(cfg) and stage in {'extract_experience', 'repair_experience'}:
         en.verify_visible_users(tokenizer.decode(raw['prompt_token_ids'], skip_special_tokens=False), messages)
-    text=c.corpus.harmony.decode_response(raw,model=cfg['model'],max_tokens=cfg['max_tokens'],native_tools=None)['content'].strip()
-    if text.startswith('```json\n') and text.endswith('```'):text=text[8:-3].strip()
     try:
-        escaped,controls=old.escape_json_controls(text)
-        value,_,positions=old.b.parse_json_escapes(escaped,repair=True)
-        require(isinstance(value,dict),'Expected JSON object')
-    except (ValueError,TypeError):
-        value={'_unparsed_response_text':text};controls=[];positions=[]
+        text = c.corpus.harmony.decode_response(raw, model=cfg['model'], max_tokens=cfg['max_tokens'],
+                                                native_tools=None)['content'].strip()
+    except ValueError as exc:
+        if not en.active(cfg) or stage == 'taxonomy' or str(exc) not in {
+            'Incomplete model output', 'No authoritative final/tool termination', 'Incomplete Harmony message', 'Missing final message'
+        }:
+            raise
+        value, controls, positions = {'_content_failure': str(exc)}, [], []
+    else:
+        if text.startswith('```json\n') and text.endswith('```'):
+            text = text[8:-3].strip()
+        try:
+            escaped, controls = old.escape_json_controls(text)
+            value, _, positions = old.b.parse_json_escapes(escaped, repair=True)
+            require(isinstance(value, dict), 'Expected JSON object')
+        except (ValueError, TypeError):
+            value, controls, positions = {'_unparsed_response_text': text}, [], []
     write(out/'decoded'/stage/(digest(key)+'.json'),dict(value=value,evidence=evidence,
         effective_input=effective,literal_control_positions=controls,literal_backslash_positions=positions))
     return value,evidence
 
 
-def run(out, *, wait_detached=None):
+def review_one(out, row, taxonomy, cfg, journal, tokenizer, *, saved_only=False):
+    path = out/'experiences'/(row['id']+'.json')
+    payload = dict(sample=row, taxonomy=taxonomy, max_rules_per_sample=cfg['max_rules_per_sample'])
+    signature = digest([payload, cfg])
+    if path.exists():
+        saved = read(path)
+        require(saved['id'] == row['id'] and saved['signature'] == signature, 'Saved experience drift')
+        for evidence in saved['evidence']:
+            require(sha(out/evidence['file']) == evidence['sha256'], 'Response drift')
+        return saved
+    require(not saved_only and not (out/'STOP').exists(), 'Review missing or stopped')
+    draft, first = call(out, journal, tokenizer, 'extract_experience', row['id'], payload)
+    evidence = [first]
+    value, error = None, None
+    for attempt in range(2):
+        if '_content_failure' in draft:
+            error = draft['_content_failure']
+            break
+        try:
+            value = old.extraction.normalize_120b_experience(draft, **payload)
+            error = None
+            break
+        except ValueError as exc:
+            error = str(exc)
+        if attempt == 0:
+            draft, repair = call(out, journal, tokenizer, 'repair_experience', row['id'],
+                                 dict(original=payload, draft=draft, validation_error=error))
+            evidence.append(repair)
+    saved = dict(id=row['id'], signature=signature, value=value, error=error, evidence=evidence, human_gold=False)
+    write(path, saved)
+    return saved
+
+
+def serial_reviews(out, rows, taxonomy, cfg, journal, tokenizer):
+    for row in rows:
+        yield review_one(out, row, taxonomy, cfg, journal, tokenizer)
+
+
+def run(out, *, wait_detached=None, reviews=serial_reviews):
     require(Path('/proc').exists(),'Server only')
     with c.corpus.r.run_lock(out/'active.lock'),c.corpus.r.run_lock(out.parent/'organization_service_18083.lock'):
         plan=verify(out);cfg=plan['configuration'];code=1
@@ -218,23 +266,9 @@ def run(out, *, wait_detached=None):
                 taxonomy['domains'].extend(value['domains'])
             write(out/'taxonomy.json',taxonomy)
             rows=read(out/'inputs.json');valid=[];invalid=[];counts=Counter()
-            for i,row in enumerate(rows):
-                require(not(out/'STOP').exists(),'STOP requested')
-                path=out/'experiences'/(row['id']+'.json')
-                payload=dict(sample=row,taxonomy=taxonomy,max_rules_per_sample=cfg['max_rules_per_sample'])
-                signature=digest([payload,cfg])
-                if path.exists():
-                    saved=read(path);require(saved['signature']==signature,'Saved experience drift')
-                    for ev in saved['evidence']:require(sha(out/ev['file'])==ev['sha256'],'Response drift')
-                else:
-                    draft,ev=call(out,journal,tokenizer,'extract_experience',row['id'],payload);evidence=[ev]
-                    try:value=old.extraction.normalize_120b_experience(draft,**payload);error=None
-                    except ValueError as exc:
-                        draft,ev=call(out,journal,tokenizer,'repair_experience',row['id'],dict(original=payload,draft=draft,validation_error=str(exc)));evidence.append(ev)
-                        try:value=old.extraction.normalize_120b_experience(draft,**payload);error=None
-                        except ValueError as last:value=None;error=str(last)
-                    saved=dict(id=row['id'],signature=signature,value=value,error=error,evidence=evidence,human_gold=False)
-                    write(path,saved)
+            for i, saved in enumerate(reviews(out, rows, taxonomy, cfg, journal, tokenizer)):
+                row = rows[i]
+                require(saved['id'] == row['id'] and not (out/'STOP').exists(), 'Wrong order or STOP requested')
                 if saved['value'] is None:invalid.append(dict(id=row['id'],error=saved['error']));counts['invalid_output']+=1
                 else:valid.append(saved['value']);counts[saved['value']['semantic_audit']['status']]+=1
                 write(out/'execution_status.json',dict(state='extracting',processed=i+1,total=len(rows),counts=dict(counts),updated_unix=time.time()))
@@ -243,6 +277,7 @@ def run(out, *, wait_detached=None):
                         configuration_sha256=plan['configuration_sha256'],counts=dict(counts),
                         files={str((out/'experiences'/(x['id']+'.json')).relative_to(out)):sha(out/'experiences'/(x['id']+'.json')) for x in rows[:i+1]}))
                     require(bool(valid),'All pilot outputs failed structure validation; inspect before continuing')
+            require(len(valid)+len(invalid)==len(rows), 'Incomplete first-review population')
             write(out/'semantic_experience.json',valid);write(out/'invalid_outputs.json',invalid)
             distilled=old.extraction._build_distilled_library(valid,min_count=1)
             write(out/'distilled.json',distilled)

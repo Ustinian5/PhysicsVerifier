@@ -1,6 +1,7 @@
 """Run the frozen reference-guided construction and blind evaluations on node14."""
 import argparse
 from contextlib import contextmanager
+from functools import partial
 import os
 from pathlib import Path
 import time
@@ -9,6 +10,7 @@ import httpx
 import tempfile
 
 from scripts import reuse_step_baseline as baseline
+from scripts import reference_review_pool as pool
 from scripts import run_aligned_step_evaluation as step
 from scripts import run_corrected_extraction as extract
 from scripts import run_corrected_pipeline as materials
@@ -21,25 +23,26 @@ RESULTS = node.host.HOT / 'results/qwen30b_step_verifier'
 WORK = RESULTS / 'english_blind_verifier'
 
 
-def configuration(policy):
-    names = ('scripts/run_reference_guided_verifier.py', 'scripts/verifier_build_scope.py',
+def configuration(policy, gpus):
+    require(gpus and len(gpus) == len(set(gpus)) and set(gpus) <= {4, 5, 6, 7}, 'Invalid review GPU list')
+    names = ('scripts/run_reference_guided_verifier.py', 'scripts/verifier_build_scope.py', 'scripts/reference_review_pool.py',
              'scripts/run_corrected_extraction.py', 'scripts/run_corrected_pipeline.py',
              'scripts/reuse_step_baseline.py', 'scripts/repair_step_judge_locations.py',
              'scripts/run_aligned_step_evaluation.py', 'scripts/run_step_match_judge.py',
              'scripts/serve_frozen_bm25.py', 'scripts/run_final_answer_revision.py',
              'rule_framework/build_review_prompt.txt')
     return dict(source_scope_sha256=vr.sha(scope.SCOPE_FILE), source_audit_sha256=vr.sha(WORK/'build_scope_audit.json'),
-                judge_location_policy=policy,
+                judge_location_policy=policy, review_gpus=list(gpus),
                 pure_metrics_sha256=baseline.PURE_METRICS, model=final.base.r.EXPECTED_MODEL,
                 build_date='2026-11-07', check_date=node.CHECK_DATE, registered_build=2000,
                 registered_step=100, formal_step=99, registered_final=474, formal_final=467,
                 code={n:vr.sha(scope.PROJECT/n) for n in names})
 
 
-def bind(policy, scope_sha):
+def bind(policy, scope_sha, gpus):
     node.node()
     require(policy in baseline.POLICIES and scope_sha == scope.SCOPE_SHA, 'Confirm the exact source register and judge policy')
-    cfg = configuration(policy)
+    cfg = configuration(policy, gpus)
     require(cfg['source_scope_sha256'] == scope_sha, 'Scope manifest changed')
     receipt = dict(configuration=cfg, configuration_sha256=vr.digest(cfg))
     final.immutable(WORK/'workflow.json', receipt)
@@ -49,7 +52,7 @@ def bind(policy, scope_sha):
 def verify_plan():
     plan = vr.read(WORK/'workflow.json')
     cfg = plan['configuration']
-    require(cfg == configuration(cfg['judge_location_policy']) and cfg['judge_location_policy'] in baseline.POLICIES
+    require(cfg == configuration(cfg['judge_location_policy'], cfg['review_gpus']) and cfg['judge_location_policy'] in baseline.POLICIES
             and cfg['source_scope_sha256'] == scope.SCOPE_SHA and vr.digest(cfg) == plan['configuration_sha256'],
             'Workflow code, configuration or approved source scope changed')
     return plan
@@ -72,11 +75,12 @@ def connect_stop(folder, root):
         local.symlink_to(target)
 
 
-def run(gpu):
+def run():
     node.node()
     with final.base.r.run_lock(WORK/'workflow.lock'):
         plan = verify_plan()
         sig, cfg = plan['configuration_sha256'], plan['configuration']
+        gpu = cfg['review_gpus'][0]
         code = 1
         try:
             final.base.runtime.wait_detached(WORK, sig)
@@ -121,7 +125,8 @@ def run(gpu):
             if build_status['state'] != 'extraction_complete':
                 stage('first_review', eligible=len(vr.read(build/'inputs.json')))
                 with inference(build, cfg['build_date'], build_plan['configuration_sha256']):
-                    extract.run(build, wait_detached=attached_to_supervisor)
+                    extract.run(build, wait_detached=attached_to_supervisor,
+                                reviews=partial(pool.ordered_reviews, gpus=cfg['review_gpus']))
 
             library = WORK/'libraries'
             connect_stop(library, WORK)
@@ -154,15 +159,27 @@ def run(gpu):
             cp = step.verify(evaluated)
             require(cp['configuration']['reuse_pure'] == str(pure) and cp['configuration']['parent'] == str(library)
                     and cp['configuration']['judge_location_policy'] == cfg['judge_location_policy'], 'Different step run')
-            if not (evaluated/'metrics.json').is_file():
-                step.run(evaluated, gpu=gpu, wait_detached=attached_to_supervisor)
-            report = step.score(evaluated)
-            require(all(n == 99 for n in report['recorded_tasks'].values()) and len(report['scores']) == 4,
-                    'Incomplete step comparison')
+            citations_pending = False
+            try:
+                if not (evaluated/'metrics.json').is_file():
+                    status_file = evaluated/'step_judge/status.json'
+                    if status_file.is_file():
+                        status = vr.read(status_file)
+                        if status['state'] == 'incomplete' and not status['missing'] and status['content_failures'] and set(
+                                status['content_failures'].values()) <= baseline.location.QUOTE_ERRORS:
+                            baseline.evaluate(evaluated, cp)
+                    step.run(evaluated, gpu=gpu, wait_detached=attached_to_supervisor)
+                report = step.score(evaluated)
+                require(all(n == 99 for n in report['recorded_tasks'].values()) and len(report['scores']) == 4,
+                        'Incomplete step comparison')
+            except baseline.CitationDecisionPending:
+                require(cfg['judge_location_policy'] == 'stop', 'Unexpected pending citation protocol')
+                citations_pending = True
+                stage('step_citations_awaiting_decision', status_sha256=vr.sha(evaluated/'step_judge/status.json'))
 
             dest = WORK/'final'
             connect_stop(dest, WORK)
-            stage('final_answer_comparison')
+            stage('final_answer_comparison', step_citations_pending=citations_pending)
             with final.base.r.run_lock(dest/'active.lock'):
                 if not (dest/'plan.json').is_file():
                     final.prepare(dest,RESULTS,material_parent=library)
@@ -181,13 +198,19 @@ def run(gpu):
                             final.run_checks(dest,fp,tok,client,pilot=True)
                         final.run_checks(dest,fp,tok,client,pilot=False)
                 final.score(dest)
-            stage('complete', step_metrics_sha256=vr.sha(evaluated/'metrics.json'), final_metrics_sha256=vr.sha(dest/'metrics.json'))
-            code = 0
+            if citations_pending:
+                stage('final_complete_step_citations_pending', step_status_sha256=vr.sha(evaluated/'step_judge/status.json'),
+                      final_metrics_sha256=vr.sha(dest/'metrics.json'))
+                code = 2
+            else:
+                stage('complete', step_metrics_sha256=vr.sha(evaluated/'metrics.json'), final_metrics_sha256=vr.sha(dest/'metrics.json'))
+                code = 0
         except BaseException as exc:
             stage('stopped', reason=str(exc))
             raise
         finally:
             vr.atomic(WORK/'workflow_exit.json', dict(code=code, unix=time.time(), configuration_sha256=sig))
+        return code
 
 
 def main():
@@ -195,7 +218,7 @@ def main():
     parser.add_argument('command',choices=('audit','prepare','run','confirm'))
     parser.add_argument('--approved-scope-sha256')
     parser.add_argument('--judge-location-policy', choices=baseline.POLICIES)
-    parser.add_argument('--gpu',type=int,choices=(4,5,6,7),default=4)
+    parser.add_argument('--gpus',type=int,nargs='+',choices=(4,5,6,7),default=[4])
     args=parser.parse_args()
     if args.command=='audit':
         node.node()
@@ -206,12 +229,12 @@ def main():
             print(report['registered'], report['reviewable'], report['dispositions'])
     elif args.command=='prepare':
         with final.base.r.run_lock(WORK/'workflow.lock'):
-            bind(args.judge_location_policy,args.approved_scope_sha256)
+            bind(args.judge_location_policy,args.approved_scope_sha256,args.gpus)
     elif args.command=='confirm':
         node.node()
         node.confirm(WORK,verify_plan()['configuration_sha256'])
     else:
-        run(args.gpu)
+        raise SystemExit(run())
 
 
 if __name__ == '__main__':

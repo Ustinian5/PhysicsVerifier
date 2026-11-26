@@ -59,6 +59,10 @@ def request(folder, root, messages, validator, plan, tokenizer, client):
     return judge.transport.request_once(root, *args, tokenizer, client, available=timeout)
 
 
+class CitationDecisionPending(ValueError):
+    """All first judgments are recorded; only exact-source citations remain unresolved."""
+
+
 def evaluate(out, checker, *, tokenizer=None, client=None):
     cfg = checker['configuration']
     base_path = Path(cfg['reuse_pure'])
@@ -124,6 +128,8 @@ def evaluate(out, checker, *, tokenizer=None, client=None):
                   missing=missing, content_failures=invalid, configuration_sha256=plan['configuration_sha256'])
     if invalid or missing:
         vr.atomic(directory/'status.json', dict(status, state='incomplete'))
+        if policy == 'stop' and not missing and set(invalid.values()) <= location.QUOTE_ERRORS:
+            raise CitationDecisionPending(f'Judge incomplete: {len(invalid)} invalid citations, 0 missing')
         raise ValueError(f'Judge incomplete: {len(invalid)} invalid, {len(missing)} missing')
     by_id = {r['id']: r for r in rows}
     details = {arm: [] for arm in cfg['arms']}
