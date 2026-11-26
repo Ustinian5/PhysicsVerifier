@@ -1,5 +1,8 @@
 import copy
 import json
+import sys
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 
@@ -124,3 +127,49 @@ def test_handoff_waits_for_released_libraries_and_preserves_an_operator_stop(tmp
     run.vr.atomic(marker,'later operator stop')
     with pytest.raises(ValueError,match='separately requested'):
         adoption.take_boundary(current)
+
+
+def test_dedicated_port_is_only_used_for_the_live_service(tmp_path, monkeypatch):
+    from scripts import step_judge_handoff as h
+    endpoint = f'http://127.0.0.1:{run.PORT}/v1'
+    historical = h.node.host.PORT
+    checked = []
+    @contextmanager
+    def service(*_):
+        assert h.node.host.PORT == run.PORT
+        yield endpoint
+        assert h.node.host.PORT == run.PORT
+        checked.append('released')
+    def measure(root, **kw):
+        assert h.node.host.PORT == historical and kw['endpoint'] == endpoint and root == tmp_path
+        checked.append('measured')
+    monkeypatch.setattr(h, 'ROOT', tmp_path)
+    monkeypatch.setattr(h.node.host, 'resources', lambda: {'gpus': [('5', 'available')]})
+    monkeypatch.setattr(h.node.host, 'idle_card', lambda snapshot: snapshot['gpus'][0])
+    monkeypatch.setattr(h.node.host, 'sockets', lambda *_: [])
+    monkeypatch.setattr(h.node, 'service', service)
+    monkeypatch.setitem(sys.modules, 'transformers', SimpleNamespace(
+        AutoTokenizer=SimpleNamespace(from_pretrained=lambda *_, **kw: object())))
+    monkeypatch.setattr(run, 'measure_pure', measure)
+    h.measure_on_available_card('accepted', endpoint)
+    assert checked == ['measured', 'released'] and h.node.host.PORT == historical
+
+
+def test_launcher_repair_preserves_frozen_marker_and_rejects_unrelated_edits(tmp_path, monkeypatch):
+    from scripts import step_judge_handoff as h
+    old = dict(judge_protocol_sha256='protocol', code={h.LAUNCHER:'before', 'verifier':'frozen'})
+    new = dict(old, code={**old['code'], h.LAUNCHER:'after'})
+    frozen = dict(configuration=old, configuration_sha256=run.vr.digest(old))
+    snapshot = lambda: dict(configuration=new, configuration_sha256=run.vr.digest(new))
+    monkeypatch.setattr(h, 'ROOT', tmp_path)
+    monkeypatch.setattr(h, 'ADOPTION', tmp_path/'adoption.json')
+    monkeypatch.setattr(h, 'INITIAL_ADOPTION', frozen['configuration_sha256'])
+    monkeypatch.setattr(h, 'plan', snapshot)
+    run.vr.atomic(h.ADOPTION, frozen)
+    run.vr.atomic(tmp_path/'launcher_repair.json', h.launcher_repair(frozen, snapshot()))
+    verified = h.verify()
+    assert verified['configuration_sha256'] == run.vr.digest(new)
+    assert h.boundary_marker(verified) == h.boundary_marker(frozen)
+    new['code']['verifier'] = 'changed'
+    with pytest.raises(ValueError, match='not confined'):
+        h.verify()

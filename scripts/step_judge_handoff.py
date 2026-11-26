@@ -13,6 +13,8 @@ node, vr, require = workflow.node, workflow.vr, workflow.require
 ROOT = line.ROOT
 ADOPTION = ROOT/'adoption.json'
 PARENT = '737f3258bc9e44249d2d0b65a055e4f7a190849bfdeb72b299c34e97410eb3f0'
+INITIAL_ADOPTION = 'a312ef7e7c919783482f70486d0c5dff4c459b0e53412d2e0a97ee93409d23e7'
+LAUNCHER = 'scripts/step_judge_handoff.py'
 CHANGED = {'scripts/run_reference_guided_verifier.py', 'scripts/run_aligned_step_evaluation.py',
            'scripts/reuse_step_baseline.py'}
 NEW = {'rule_framework/step_match_lines.py', 'scripts/run_step_line_judge.py', 'scripts/step_judge_handoff.py'}
@@ -33,14 +35,39 @@ def plan():
     return dict(configuration=current, configuration_sha256=vr.digest(current))
 
 
+def launcher_repair(frozen, current):
+    before, after = frozen['configuration'], current['configuration']
+    require(frozen['configuration_sha256'] == vr.digest(before) == INITIAL_ADOPTION and
+            current['configuration_sha256'] == vr.digest(after) and
+            before['code'][LAUNCHER] != after['code'][LAUNCHER] and
+            before == dict(after, code={**after['code'], LAUNCHER: before['code'][LAUNCHER]}),
+            'Judge amendment is not confined to the standby launcher')
+    return dict(original_adoption_sha256=INITIAL_ADOPTION, effective_workflow_sha256=current['configuration_sha256'],
+                file=LAUNCHER, before_sha256=before['code'][LAUNCHER], after_sha256=after['code'][LAUNCHER],
+                judge_protocol_sha256=before['judge_protocol_sha256'], change='isolate_archive_port_from_live_service')
+
+
+def bind_launcher_repair():
+    node.node()
+    with workflow.final.base.r.run_lock(ROOT/'supervisor.lock'):
+        require(vr.read(ROOT/'progress.json')['state'] == 'waiting_for_free_judge_gpu' and
+                not (ROOT/'deployment.json').exists() and not any((ROOT/'judgments').rglob('request.json')),
+                'Launcher repair requires an idle standby before its first request')
+        line.judge.write(ROOT/'launcher_repair.json', launcher_repair(vr.read(ADOPTION), plan()))
+
+
 def verify():
-    current = plan()
-    require(vr.read(ADOPTION) == current, 'Amended judge workflow changed')
+    current, frozen = plan(), vr.read(ADOPTION)
+    if current != frozen:
+        receipt = launcher_repair(frozen, current)
+        require(vr.read(ROOT/'launcher_repair.json') == receipt, 'Unregistered judge launcher change')
+        current['original_adoption_sha256'] = receipt['original_adoption_sha256']
     return current
 
 
 def boundary_marker(current):
-    return dict(parent=PARENT, adoption_sha256=current['configuration_sha256'], after='accepted_libraries')
+    return dict(parent=PARENT, adoption_sha256=current.get('original_adoption_sha256', current['configuration_sha256']),
+                after='accepted_libraries')
 
 
 def prepare():
@@ -85,6 +112,7 @@ def take_boundary(current):
 
 def measure_on_available_card(signature, endpoint):
     original = node.host.service_script
+    archive_port = node.host.PORT
     def launcher(cfg):
         script, paths = original(cfg)
         require(script.count('18083') == 2, 'Unexpected judge launcher port')
@@ -104,7 +132,8 @@ def measure_on_available_card(signature, endpoint):
                         require(actual == endpoint, 'Unexpected judge endpoint')
                         from transformers import AutoTokenizer
                         tokenizer = AutoTokenizer.from_pretrained(node.host.HOT/'models/gpt-oss-120b', local_files_only=True)
-                        with httpx.Client(trust_env=False) as client:
+                        # Historical inputs bind their original port. Live requests use the explicit endpoint.
+                        with patch.object(node.host, 'PORT', archive_port), httpx.Client(trust_env=False) as client:
                             line.measure_pure(ROOT, endpoint=endpoint, client=client, tokenizer=tokenizer)
                     return
                 except RuntimeError as exc:
