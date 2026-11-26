@@ -132,7 +132,8 @@ def test_hold_precedes_judge_and_prompt_is_exported(tmp_path):
     records[0][0]['id'] = next(iter(judge.frozen.sources.STEP_HOLD))
     with pytest.raises(ValueError, match='authorized cohort'):
         judge.prepare(tmp_path, *records)
-    assert matching.INSTRUCTION in prompts.render()
+    from rule_framework import step_match_lines
+    assert step_match_lines.INSTRUCTION in prompts.render()
 
 
 def test_normal_step_score_uses_only_the_saved_judge(tmp_path, monkeypatch):

@@ -180,10 +180,11 @@ def released_libraries(parent, files):
     return paths, 'Common official-answer-guided first review of the construction questions'
 
 
-def prepare(out, parent, *, prompt_profile=None, benchmark=None, pure_only=False, reuse_pure=None, judge_location_policy='stop'):
+def prepare(out, parent, *, prompt_profile=None, benchmark=None, pure_only=False, reuse_pure=None, judge_location_policy=None):
     """Read a released material snapshot and the frozen benchmark as data."""
     from scripts import run_step_match_judge as judge
     from scripts import reuse_step_baseline as comparison
+    judge_location_policy = judge_location_policy or ('stop' if pure_only else 'lines_once')
     if not pure_only and reuse_pure is None:
         reuse_pure = judge.frozen.sources.RESULTS / 'english_blind_verifier/step_pure'
     require(not (pure_only and reuse_pure) and judge_location_policy in comparison.POLICIES, 'Invalid comparison settings')
@@ -226,7 +227,11 @@ def prepare(out, parent, *, prompt_profile=None, benchmark=None, pure_only=False
              formal_released=True, human_gold=False)
     if reuse_pure:
         original, *_ = comparison.baseline(reuse_pure)
-        comparison.compatible(c, original)
+        if judge_location_policy == 'lines_once':
+            from scripts import run_step_line_judge as line_judge
+            c['step_match_judge'] = line_judge.lines.VERSION
+            c['source_hashes'].update(line_judge.contract()['code'])
+        comparison.compatible(c, original, same_judge=judge_location_policy != 'lines_once')
         c.update(reuse_pure=str(reuse_pure.resolve()), judge_location_policy=judge_location_policy)
         c['source_hashes']['scripts/reuse_step_baseline.py'] = vr.sha(Path(comparison.__file__))
         c['source_hashes']['scripts/repair_step_judge_locations.py'] = vr.sha(Path(comparison.location.__file__))
@@ -245,6 +250,9 @@ def verify(out):
         for name in ('scripts/reuse_step_baseline.py', 'scripts/repair_step_judge_locations.py'):
             actual[name] = vr.sha(a.ROOT / name)
     from scripts import reuse_step_baseline as comparison
+    if c.get('judge_location_policy') == 'lines_once':
+        from scripts import run_step_line_judge as line_judge
+        actual.update(line_judge.contract()['code'])
     if (plan['configuration_sha256'] == comparison.PURE_CONFIG and (out/'metrics.json').is_file()
             and vr.sha(out/'metrics.json') == comparison.PURE_METRICS):
         # The baseline was completed before reuse orchestration. Bind its actual executable sources via Git.
@@ -254,8 +262,9 @@ def verify(out):
     require(c['source_hashes'] == actual, 'Code drift')
     if 'step_match_judge' in c:
         from rule_framework import step_match
+        version = line_judge.lines.VERSION if c.get('judge_location_policy') == 'lines_once' else step_match.VERSION
         require(c.get('online_reference_visible') is False and en.online_english(c)
-                and c['step_match_judge'] == step_match.VERSION, 'Wrong online inputs or step adjudicator')
+                and c['step_match_judge'] == version, 'Wrong online inputs or step adjudicator')
     else:
         a.verify(Path(c['parent']))
     for name, sha in c['released_files'].items():
@@ -295,6 +304,9 @@ def score(out, plan=None):
         if plan.get('configuration_sha256') == comparison.PURE_CONFIG and (out/'metrics.json').is_file():
             comparison.baseline(out)
             return vr.read(out/'metrics.json')
+        if plan['configuration'].get('judge_location_policy') == 'lines_once':
+            from scripts import run_step_line_judge as line_judge
+            return line_judge.comparison(out, plan)
         if plan['configuration'].get('reuse_pure'):
             with base.r.run_lock(out / 'step_judge/runner.lock'):
                 return comparison.evaluate(out, plan)
@@ -388,7 +400,8 @@ def run(out, *, gpu=4, wait_detached=None):
             model_path = base.r.EXPECTED_MODEL
             if judged:
                 from scripts import run_step_match_judge as judge
-                if (out / 'metrics.json').exists() or (out / 'step_judge/metrics.json').exists():
+                if (out / 'metrics.json').exists() or (out / 'step_judge/metrics.json').exists() or (
+                        c.get('judge_location_policy') == 'lines_once' and (out/'step_judge_first_pass/first_pass.json').is_file()):
                     report = score(out, plan)
                     base.old.emit(out, 'completed', recorded_tasks=report['recorded_tasks'])
                     exit_code = 0
@@ -437,13 +450,17 @@ def run(out, *, gpu=4, wait_detached=None):
             if judged:
                 # Close the checker hooks before the independent conversations start.
                 with base.r.run_lock(out / 'step_judge/runner.lock'), httpx.Client(trust_env=False) as client:
-                    if c.get('reuse_pure'):
+                    if c.get('judge_location_policy') == 'lines_once':
+                        from scripts import run_step_line_judge as line_judge
+                        report = line_judge.comparison(out, plan, tokenizer=tokenizer, client=client)
+                    elif c.get('reuse_pure'):
                         from scripts import reuse_step_baseline as comparison
                         report = comparison.evaluate(out, plan, tokenizer=tokenizer, client=client)
                     else:
                         data = judge.production(Path(c['step_benchmark']), out)
                         report = judge.evaluate(out / 'step_judge', data, tokenizer=tokenizer, client=client, stop=out / 'STOP')
-                judge.write(out / 'metrics.json', report)
+                if c.get('judge_location_policy') != 'lines_once':
+                    judge.write(out / 'metrics.json', report)
             else:
                 report = score(out, plan)
             expected = len(c['sample_ids'])
@@ -467,7 +484,7 @@ def main():
     parser.add_argument('--gpu', type=int, choices=(4, 5, 6, 7), default=4)
     parser.add_argument('--pure-only', action='store_true', help='Freeze only the direct 120B baseline')
     parser.add_argument('--reuse-pure', type=Path, help='Bind the completed pure baseline and run the three knowledge arms')
-    parser.add_argument('--judge-location-policy', choices=('stop','locate_once'), default='stop')
+    parser.add_argument('--judge-location-policy', choices=('lines_once','stop','locate_once'))
     args = parser.parse_args(); out = args.output.resolve()
     require(not args.pure_only or args.command == 'prepare', 'Arms are frozen at prepare')
     require(args.prompt_profile is None or args.command == 'prepare', 'Prompt profile is frozen at prepare')

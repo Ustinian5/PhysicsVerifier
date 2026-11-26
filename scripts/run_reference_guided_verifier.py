@@ -31,6 +31,8 @@ def configuration(policy, gpus):
              'scripts/run_aligned_step_evaluation.py', 'scripts/run_step_match_judge.py',
              'scripts/serve_frozen_bm25.py', 'scripts/run_final_answer_revision.py',
              'rule_framework/build_review_prompt.txt')
+    if policy == 'lines_once':
+        names += ('rule_framework/step_match_lines.py', 'scripts/run_step_line_judge.py', 'scripts/step_judge_handoff.py')
     return dict(source_scope_sha256=vr.sha(scope.SCOPE_FILE), source_audit_sha256=vr.sha(WORK/'build_scope_audit.json'),
                 judge_location_policy=policy, review_gpus=list(gpus),
                 pure_metrics_sha256=baseline.PURE_METRICS, model=final.base.r.EXPECTED_MODEL,
@@ -75,18 +77,25 @@ def connect_stop(folder, root):
         local.symlink_to(target)
 
 
-def run():
+def run(*, adopted=False):
     node.node()
     with final.base.r.run_lock(WORK/'workflow.lock'):
-        plan = verify_plan()
+        if adopted:
+            from scripts import step_judge_handoff as handoff
+            plan = handoff.verify()
+            handoff.take_boundary(plan)
+            supervisor = handoff.ROOT
+        else:
+            plan, supervisor = verify_plan(), WORK
         sig, cfg = plan['configuration_sha256'], plan['configuration']
         gpu = cfg['review_gpus'][0]
         code = 1
         try:
-            final.base.runtime.wait_detached(WORK, sig)
+            if not adopted:
+                final.base.runtime.wait_detached(supervisor, sig)
 
             def attached_to_supervisor(folder, signature):
-                ready = vr.read(WORK/'disconnect_acceptance.json')
+                ready = vr.read(supervisor/'disconnect_acceptance.json')
                 require(ready['passed'] and ready['configuration_sha256'] == sig and ready['pid'] == os.getpid()
                         and ready['process_start'] == final.base.runtime.process_identity(os.getpid()),
                         'Stage is outside the accepted detached process')
@@ -160,8 +169,10 @@ def run():
             require(cp['configuration']['reuse_pure'] == str(pure) and cp['configuration']['parent'] == str(library)
                     and cp['configuration']['judge_location_policy'] == cfg['judge_location_policy'], 'Different step run')
             citations_pending = False
+            first_pass = evaluated/'step_judge_first_pass/first_pass.json'
+            measure_lines = cfg['judge_location_policy'] == 'lines_once'
             try:
-                if not (evaluated/'metrics.json').is_file():
+                if not (evaluated/'metrics.json').is_file() and not (measure_lines and first_pass.is_file()):
                     status_file = evaluated/'step_judge/status.json'
                     if status_file.is_file():
                         status = vr.read(status_file)
@@ -170,7 +181,8 @@ def run():
                             baseline.evaluate(evaluated, cp)
                     step.run(evaluated, gpu=gpu, wait_detached=attached_to_supervisor)
                 report = step.score(evaluated)
-                require(all(n == 99 for n in report['recorded_tasks'].values()) and len(report['scores']) == 4,
+                scores = report['provisional_scores'] if measure_lines else report['scores']
+                require(all(n == 99 for n in report['recorded_tasks'].values()) and len(scores) == 4,
                         'Incomplete step comparison')
             except baseline.CitationDecisionPending:
                 require(cfg['judge_location_policy'] == 'stop', 'Unexpected pending citation protocol')
@@ -179,7 +191,7 @@ def run():
 
             dest = WORK/'final'
             connect_stop(dest, WORK)
-            stage('final_answer_comparison', step_citations_pending=citations_pending)
+            stage('final_answer_comparison', step_citations_pending=citations_pending, step_release_criterion_pending=measure_lines)
             with final.base.r.run_lock(dest/'active.lock'):
                 if not (dest/'plan.json').is_file():
                     final.prepare(dest,RESULTS,material_parent=library)
@@ -198,7 +210,11 @@ def run():
                             final.run_checks(dest,fp,tok,client,pilot=True)
                         final.run_checks(dest,fp,tok,client,pilot=False)
                 final.score(dest)
-            if citations_pending:
+            if measure_lines:
+                stage('final_complete_step_first_pass_measured', step_first_pass_sha256=vr.sha(first_pass),
+                      final_metrics_sha256=vr.sha(dest/'metrics.json'), step_release_criterion_pending=True)
+                code = 2
+            elif citations_pending:
                 stage('final_complete_step_citations_pending', step_status_sha256=vr.sha(evaluated/'step_judge/status.json'),
                       final_metrics_sha256=vr.sha(dest/'metrics.json'))
                 code = 2
@@ -215,9 +231,9 @@ def run():
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command',choices=('audit','prepare','run','confirm'))
+    parser.add_argument('command',choices=('audit','prepare','run','confirm','adopt-lines'))
     parser.add_argument('--approved-scope-sha256')
-    parser.add_argument('--judge-location-policy', choices=baseline.POLICIES)
+    parser.add_argument('--judge-location-policy', choices=baseline.POLICIES, default='lines_once')
     parser.add_argument('--gpus',type=int,nargs='+',choices=(4,5,6,7),default=[4])
     args=parser.parse_args()
     if args.command=='audit':
@@ -230,10 +246,20 @@ def main():
     elif args.command=='prepare':
         with final.base.r.run_lock(WORK/'workflow.lock'):
             bind(args.judge_location_policy,args.approved_scope_sha256,args.gpus)
+    elif args.command == 'adopt-lines':
+        from scripts import step_judge_handoff as handoff
+        handoff.prepare()
     elif args.command=='confirm':
         node.node()
-        node.confirm(WORK,verify_plan()['configuration_sha256'])
+        from scripts import step_judge_handoff as handoff
+        if handoff.ADOPTION.is_file():
+            node.confirm(handoff.ROOT, handoff.verify()['configuration_sha256'])
+        else:
+            node.confirm(WORK,verify_plan()['configuration_sha256'])
     else:
+        from scripts import step_judge_handoff as handoff
+        if handoff.ADOPTION.is_file():
+            raise SystemExit(handoff.resume())
         raise SystemExit(run())
 
 

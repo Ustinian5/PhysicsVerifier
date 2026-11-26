@@ -9,7 +9,7 @@ vr, require = judge.vr, judge.require
 PURE_CONFIG = 'eac43473b16c0da5e63d4797ecde6d570f38c560dd3f41d55edc9f72ce5b6c45'
 PURE_METRICS = 'eae83906ecc3ec4c84842a15b41a716d1f9182eab5531a35335dc3aabbf92126'
 PURE_PILOT = '2d1457ec5d1169f1f006ca52317eb46767b12fedb8c2c705e3ec1c4e14cb2c84'
-POLICIES = ('stop', 'locate_once')
+POLICIES = ('lines_once', 'stop', 'locate_once')
 
 
 def baseline(folder):
@@ -42,10 +42,11 @@ def baseline(folder):
     return cfg, rows, results, coverage, decisions, spans, details
 
 
-def compatible(current, previous):
+def compatible(current, previous, *, same_judge=True):
     keys = ('prompt_profile', 'model', 'fixed_harmony_date', 'pure_prompt', 'online_reference_visible',
             'controls', 'limits', 'budget_limits', 'step_match_judge', 'sample_ids', 'cohort')
-    require(all(current[k] == previous[k] for k in keys), 'Pure task, population or inference parameters changed')
+    require(all(current[k] == previous[k] for k in keys if k != 'step_match_judge' or same_judge),
+            'Pure task, population or inference parameters changed')
 
 
 def request(folder, root, messages, validator, plan, tokenizer, client):
@@ -63,12 +64,8 @@ class CitationDecisionPending(ValueError):
     """All first judgments are recorded; only exact-source citations remain unresolved."""
 
 
-def evaluate(out, checker, *, tokenizer=None, client=None):
+def add_knowledge_checks(out, checker, rows, results):
     cfg = checker['configuration']
-    base_path = Path(cfg['reuse_pure'])
-    previous, rows, results, coverage, decisions, spans, expected = baseline(base_path)
-    compatible(cfg, previous)
-    reused = set(decisions)
     for row in rows:
         for arm in cfg['prepare_arms']:
             path = judge.base.path_for(out, 'formal', arm, row)
@@ -81,6 +78,15 @@ def evaluate(out, checker, *, tokenizer=None, client=None):
             judge.base.runtime.audit_result(value)
             results[row['id'], arm] = dict(sha256=vr.sha(path), source=str(path), failed=failed,
                                            status=value['status'], diagnostics=value['diagnostics'])
+
+
+def evaluate(out, checker, *, tokenizer=None, client=None):
+    cfg = checker['configuration']
+    base_path = Path(cfg['reuse_pure'])
+    previous, rows, results, coverage, decisions, spans, expected = baseline(base_path)
+    compatible(cfg, previous)
+    reused = set(decisions)
+    add_knowledge_checks(out, checker, rows, results)
     directory = out / 'step_judge'
     policy = cfg['judge_location_policy']
     require(policy in POLICIES, 'Unknown location policy')
