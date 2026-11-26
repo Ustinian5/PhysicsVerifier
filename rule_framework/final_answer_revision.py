@@ -117,6 +117,10 @@ def staged_prompt(english):
     return en.FINAL_CHECK if english else STAGED_PROMPT
 
 
+def direct_messages(row, *, official_reference=None):
+    return en.direct_messages(public(row), en.FINAL_DIRECT, official_reference=official_reference)
+
+
 def query_messages(row, *, english=False):
     if english:
         return memory.prepare_messages(public(row), en.FINAL_CHECK, en.FINAL_QUERY)
@@ -126,7 +130,7 @@ def query_messages(row, *, english=False):
 
 
 def continuation_messages(row, queries, references, *, arm, english=False, official_reference=None):
-    require(arm in memory.ARMS, 'Unknown comparison arm')
+    require(memory.uses_preparation(arm, english=english), 'English pure checks must use direct_messages')
     require(arm != 'pure' or not references, 'Pure arm received reference material')
     memory.validate_queries(queries, english=english)
     result = query_messages(row, english=english)
@@ -217,4 +221,5 @@ def contract(*, english=False):
         tools=None, flat_fallback=False, independent_checker=False,
         failures='Retain content failures without resampling; authentication/identity/unknown transport stops.',
         labels='120B reference-assisted machine labels with explicit assistant adjudication; human_gold=false',
-        **(dict(prompt_profile=en.PROFILE, prepare_instruction=en.FINAL_QUERY) if english else {}))
+        **(dict(prompt_profile=en.PROFILE, pure_prompt=en.FINAL_DIRECT, prepare_instruction=en.FINAL_QUERY,
+                prepare_arms=memory.prepared_arms(english=True)) if english else {}))

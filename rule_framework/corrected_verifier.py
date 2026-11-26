@@ -7,7 +7,8 @@ separate checker, flat tree fallback, or six-item material cap is introduced.
 import copy
 import json
 
-from rule_framework.flat_skill_rag import FlatMemory, TreeMemory, require
+from rule_framework.flat_skill_rag import FlatMemory, TreeMemory, require, direct_messages as direct_step_messages
+from rule_framework.final_answer_revision import direct_messages as direct_final_messages
 from rule_framework import final_answer_protocol as final
 from rule_framework import verifier_english as en
 from scripts import continuous_context_v2 as step
@@ -48,6 +49,8 @@ def tools():
 def messages(row, arm, task, *, revision=None, english=False):
     require(arm in ARMS and task in {'step', 'final'}, 'Unknown experiment')
     require(revision in {None, CHECK_REVISION, LANGUAGE_REVISION, BILINGUAL_REVISION}, 'Unknown checking prompt revision')
+    if english and arm == 'pure':
+        return direct_step_messages(row) if task == 'step' else direct_final_messages(row)
     # Whitelist even when callers possess benchmark references or labels.
     public = {k: row.get(k, '') for k in ('question', 'prediction', 'context')}
     extra = USE + '\n' + DESCRIPTIONS[arm] if arm != 'pure' else ''

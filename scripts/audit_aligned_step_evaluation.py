@@ -85,31 +85,41 @@ class Audit:
         item = e.read(path); base.runtime.audit_result(item)
         require(item['id'] == row['id'] and item['configuration_sha256'] == plan['configuration_sha256'],
                 'Wrong sample/configuration')
+        options = base.check_options(row, plan['configuration'])
+        staged = base.p.uses_preparation(arm, english=bool(options))
         if item.get('failure_stage') == 'prepare':
-            require(base.complete_content_failure(item), 'Unverified failed PREPARE')
+            require(staged and base.complete_content_failure(item), 'Unverified failed PREPARE')
             require(not list(path.parent.glob('turn_*/request.json')), 'CHECK executed after failed PREPARE')
             require(item['diagnostics'] == [] and item['status'] == 'failed', 'Failed PREPARE is not success')
             packet = e.read(path.with_name('reference_packet.json'))
             require(packet['packet']['retrieval']['status'] == 'not_executed_prepare_failure', 'False empty retrieval')
             return item
         count = lambda messages: len(self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True))
-        options = {'english': True} if base.en.active(plan['configuration']) else {}
-        packet = base.p.reference_packet(row, arm, prefix['queries'], memory, count, **options)
-        actual = e.read(path.with_name('reference_packet.json'))
-        require(actual == dict(configuration_sha256=plan['configuration_sha256'], packet=packet,
-            query_evidence_sha256=vr.digest(prefix), input_sha256=vr.digest(row)), 'Retrieval or payload drift')
+        if staged:
+            packet = base.p.reference_packet(row, arm, prefix['queries'], memory, count, **options)
+            actual = e.read(path.with_name('reference_packet.json'))
+            require(actual == dict(configuration_sha256=plan['configuration_sha256'], packet=packet,
+                query_evidence_sha256=vr.digest(prefix), input_sha256=vr.digest(row)), 'Retrieval or payload drift')
+            messages, provided = packet['messages'], packet['retrieval']['provided_complete_ids']
+            used_in = prefix['evidence']['usage']['prompt_tokens']
+            used_out = prefix['evidence']['usage']['completion_tokens']
+        else:
+            messages = base.p.direct_messages(row, official_reference=options.get('official_reference'))
+            base.verify_direct_step(path.parent, messages, item)
+            used_in, used_out, provided = 0, 0, []
         paths = sorted(path.parent.glob('turn_*/request.json'))
-        require(paths and [p.parent.name for p in paths] == ['turn_%02d' % n for n in range(2, 2 + len(paths))],
+        start = 2 if staged else 1
+        require(paths and [p.parent.name for p in paths] == ['turn_%02d' % n for n in range(start, start + len(paths))],
                 'Missing/duplicate CHECK turns')
         require(len(paths) <= 2, 'Unexpected extra CHECK or quote-repair attempt')
-        used_in = prefix['evidence']['usage']['prompt_tokens']
-        used_out = prefix['evidence']['usage']['completion_tokens']
-        messages, decoded, first = packet['messages'], None, None
+        decoded = first = None
         for index, request_path in enumerate(paths):
             if index:
                 require(first is not None and decoded is not None, 'Repair lacks initial diagnosis')
+                bad_quotes = base.quotes.invalid_quotes(first, row)
+                require(bad_quotes, 'Quote repair without an invalid quote')
                 messages = messages + [dict(role='assistant', content=decoded['content']), dict(role='user',
-                    content=base.quotes.repair_message(first, base.quotes.invalid_quotes(first, row), **options))]
+                    content=base.quotes.repair_message(first, bad_quotes, english=bool(options)))]
             usage, decoded = self.response(request_path, messages, 16384 - used_out)
             used_in += usage['prompt_tokens']; used_out += usage['completion_tokens']
             if index == 0 and path.with_name('first_diagnosis.json').exists():
@@ -124,7 +134,7 @@ class Audit:
                 try: final, _ = base.quotes.apply_quote_patches(first, json.loads(decoded['content']), row)
                 except (ValueError, TypeError, KeyError): pass  # original policy retains the first diagnosis
             require(final['diagnostics'] == item['diagnostics'], 'Publication changed diagnoses or quote policy')
-            require(item['protocol_audit'] == base.reference_audit(final, packet['retrieval']['provided_complete_ids']),
+            require(item['protocol_audit'] == base.reference_audit(final, provided),
                     'Citation protocol audit differs')
         else:
             require(item['diagnostics'] == [], 'Unexpected diagnostics on failed CHECK')
@@ -192,7 +202,8 @@ def audit(out):
                 else:
                     prefix = copy.deepcopy(prefix); prefix['configuration_sha256'] = plan['configuration_sha256']
                 for arm in base.p.ARMS:
-                    result = x.sample(row, arm, memories[arm], plan, prefix, phase)
+                    result = x.sample(row, arm, memories[arm], plan,
+                                      prefix if base.p.uses_preparation(arm, english=english) else None, phase)
                     if phase == 'formal': groups[arm].append(result)
                     else: require(base.runtime.healthy_result(result) and result['protocol_audit']['passed'], 'Control failed')
                 if (i+1) % 10 == 0:
@@ -201,7 +212,11 @@ def audit(out):
         require(expected_files == set((out/'formal').glob('**/result.json')), 'Missing/extra formal results')
         actual_requests = {str(p) for p in (out/'formal').glob('**/request.json')} | {str(p) for p in (out/'queries').glob('*/request.json')}
         checked = {p for p in x.requests if '/formal/' in p or '/queries/' in p}
-        require(actual_requests == checked and len(checked) == metrics['formal_actual_requests_shared_prefix_counted_once'],
+        control_queries = ({str(out/'queries'/vr.digest(row['id'])[:24]/'request.json') for row in config['controls']}
+                           if base.en.active(config) else set())
+        require(actual_requests == checked and control_queries <= checked, 'Missing or unaccounted requests')
+        checked -= control_queries
+        require(len(checked) == metrics['formal_actual_requests_shared_prefix_counted_once'],
                 'Unaccounted or repeated requests')
         require(sorted(query_failed) == sorted(metrics['shared_preparation_failures']['ids']), 'Failure counts differ')
         summaries = {}

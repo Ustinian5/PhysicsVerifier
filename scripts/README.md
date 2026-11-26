@@ -1,6 +1,6 @@
 # 脚本入口
 
-新版 verifier 的英文审阅稿由实际请求函数生成。用项目 conda 环境执行 `python -m scripts.print_verifier_prompts` 即可离线查看各阶段的系统指令、模型可见字段、修复轮和英文查询。建库首审读取本题原始官方参考，四组闭卷迁移评测共用英文 PREPARE。完成批次的原始请求可从下文的冻结记录追溯。[英文提示词全文](../docs/Verifier英文提示词.md) · [建库首审](../rule_framework/build_review_prompt.txt) · [英文请求与查询约束](../rule_framework/verifier_english.py)
+新版 verifier 的英文审阅稿由实际请求函数生成。用项目 conda 环境执行 `python -m scripts.print_verifier_prompts` 即可离线查看。建库首审读取本题官方参考。步骤级和题目级的闭卷评测中，纯组由 120B 直接核查题干和 30B 回答。RAG、skills、规则树三组逐题共用一次英文 PREPARE，各从本组知识库选材，再在原会话核查。查询用量和查询失败只计入这三组。若沿用旧输入发布，两级执行器的 `prepare --prompt-profile verifier_english_v1` 可把新版提示写入新计划，题目级准备的断连确认使用同一参数。下文按日期记录已完成批次的实际协议。[英文提示词全文](../docs/Verifier英文提示词.md)
 
 已完成的11月21日474题最终答案评测使用 `scripts.run_final_answer_revision`。原题、30B回答、参考、三库及实验参数均由准备配置绑定。node14 的正式入口复用已通过固定6题验收的服务与个人互斥锁。[题目级执行器](run_final_answer_revision.py) · [项目进展](../docs/项目进展.md)
 

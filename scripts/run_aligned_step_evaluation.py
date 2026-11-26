@@ -1,8 +1,7 @@
-"""Release and run the corrected 100 answers with the unchanged old99 v15 engine.
+"""Evaluate frozen 30B solutions with the step-level verifier and location scorer.
 
-The parent material generation, original annotations, and earlier scores remain
-immutable. This phase applies the old source filter, publishes reviewed quotes,
-and adapts only the cohort binding of the original offline scorer.
+The English profile uses a direct 120B baseline and one shared preparation
+for RAG, skills and the rule tree. The saved plan selects the checking protocol.
 """
 import argparse
 from contextlib import contextmanager
@@ -174,8 +173,8 @@ def collect(output, plan, rows):
                 item = a.bench.recovery.retained_failure(path, output_amended=True)
                 if not base.complete_content_failure(item):
                     extra = a.bench.recovery.account(path); supplemental.append(extra); requests.add(extra['request_path'])
-            packet = vr.read(path.parent / 'reference_packet.json')['packet']['retrieval']
-            provided += bool(packet['provided_complete_ids']); reference_tokens += packet['reference_tokens']
+            delivery = base.recorded_delivery(path, row, arm, plan, item)
+            provided += bool(delivery['provided_complete_ids']); reference_tokens += delivery['reference_tokens']
             requests.update(e['request_path'] for e in item['trace']['response_evidence']); items.append(item)
         groups[arm] = items; all_requests.update(requests)
         usage[arm] = dict(completed_records=len(items), questions_with_full_references=provided,
@@ -204,7 +203,7 @@ def score_parity(legacy):
                 exact_full_score_objects=True, scores=values, old_metrics_sha256=vr.sha(legacy / 'metrics.json'))
 
 
-def prepare(out, parent):
+def prepare(out, parent, *, prompt_profile=None):
     require(not (out / 'plan.json').exists(), 'Prepared already; never overwrite a release')
     plan = a.verify(parent); pc = plan['configuration']; current = Path(pc['current'])
     audit = vr.read(parent / 'readiness_audit.json')
@@ -225,7 +224,7 @@ def prepare(out, parent):
     release_labels(out, origin / 'annotations', rows, files)
     base.old.emit(out, 'checking_historical_score_parity', new_model_calls=0)
     vr.atomic(out / 'historical_scoring_parity.json', score_parity(Path(pc['legacy'])))
-    english = en.active(pc)
+    english = en.active(pc if prompt_profile is None else {'prompt_profile': prompt_profile})
     prefixes = {}
     if not english:
         for row in pc['controls']:
@@ -242,13 +241,16 @@ def prepare(out, parent):
         formal_blockers=[], formal_released=True, sample_ids=[r['id'] for r in rows],
         source_count=len(vr.read(out / 'sources.json')), planned_checks=400,
         service_lock=str(parent.parent / 'organization_service_18083.lock'),
-        controls_policy=('Generate one English PREPARE per control, shared across its four CHECKs.' if english else
+        controls_policy=('Pure checks directly. RAG, skills and rule tree share one English PREPARE per control.' if english else
                          'Reuse exact successful PREPARE; 20 fresh CHECKs against released libraries, then formal.'),
         current_materials_policy='Reuse parent generation; apply original v15 source filter and provenance pruning.',
         label_policy='Four Sol high passes plus assistant quote/ambiguity release; two unresolved remain separate.',
         final_answer_task='Not part of this release; no 600-case generation or rescoring.')
     if english:
-        c.update(check_prompt=en.STEP_CHECK, prepare_instruction=en.QUERY)
+        c.pop('shared_query', None)
+        c.update(prompt_profile=en.PROFILE, pure_prompt=en.STEP_DIRECT, check_prompt=en.STEP_CHECK, prepare_instruction=en.QUERY,
+                 prepare_arms=base.p.prepared_arms(english=True),
+                 query_policy='Share and charge one PREPARE per input across RAG, skills and rule tree only.')
     vr.atomic(out / 'plan.json', dict(configuration=c, configuration_sha256=vr.digest(c)))
     base.old.emit(out, 'released_pending_engineering_acceptance', formal_checks_completed=0,
                   new_model_calls=0, materials=vr.read(out / 'isolation.json')['material_counts'])
@@ -340,7 +342,10 @@ def run(out):
                                 'Released-material controls not accepted')
                     results = []
                     for i, row in enumerate(rows):
-                        for arm in c['arms'][i % 4:] + c['arms'][:i % 4]:
+                        arms = c['arms'][i % 4:] + c['arms'][:i % 4]
+                        if en.active(c):
+                            arms = ['pure', *(arm for arm in arms if arm != 'pure')]
+                        for arm in arms:
                             require(not (out / 'STOP').exists(), 'STOP requested')
                             results.append(a.bench.run_condition(out, row, phase, arm, memories[arm], plan, tokenizer, client))
                     if phase == 'controls':
@@ -363,11 +368,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['prepare', 'verify', 'run', 'score', 'confirm-detached'])
     parser.add_argument('--output', type=Path, required=True); parser.add_argument('--parent', type=Path)
+    parser.add_argument('--prompt-profile', choices=[en.PROFILE], help='Bind new online prompts when preparing from an older input release')
     args = parser.parse_args(); out = args.output.resolve()
+    require(args.prompt_profile is None or args.command == 'prepare', 'Prompt profile is frozen at prepare')
     if args.command == 'prepare':
         parent = args.parent.resolve()
         with base.r.run_lock(out / 'active.lock'), base.r.run_lock(parent.parent / 'organization_service_18083.lock'):
-            prepare(out, parent)
+            prepare(out, parent, prompt_profile=args.prompt_profile)
     elif args.command == 'verify': verify(out)
     elif args.command == 'score': score(out)
     elif args.command == 'run': run(out)

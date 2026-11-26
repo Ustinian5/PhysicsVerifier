@@ -83,6 +83,7 @@ def prepare(root):
         prior_checkpoint=host.CONFIG, human_gold=False)
     if en.active(design):
         record['prompt_profile'] = en.PROFILE
+        record['diagnostic'] = 'All 26 get an independent direct final-answer check.'
     final.immutable(out/'design.json',record)
     return record
 
@@ -206,7 +207,9 @@ def initialize(root,arm):
     before,plan = make_plan(root/PARENT,arm,out)
     tree = None
     lib = library(root)/'materials'
-    if arm=='rule_tree':
+    if arm == 'pure' and en.active(plan['configuration']):
+        store = None
+    elif arm=='rule_tree':
         tree=pilot.flat.TreeMemory(vr.read(lib/'catalog.json'))
         store=tree.memory
     else:
@@ -219,6 +222,13 @@ def evaluate(row):
     root,arm,tree,store,old,budget = worker_state
     parent=root/PARENT
     folder = budget.out/'rows'/row['id']
+    if arm == 'pure' and en.active(old['configuration']):
+        messages = final.p.direct_messages(row, official_reference=final.check_exam_answer(row, budget.plan['configuration']))
+        check = budget.call(folder/'check', messages, budget.limits['max_tokens_per_response'],
+                            final.p.original.validate_verdict, [], time.monotonic())
+        result = dict(status=check['status'], value=check['value'])
+        final.immutable(folder/'delivery.json', result)
+        return result
     prep,rewrite,rank_prefix=prepared(row,parent,old)
     queries=prep['value']
     def messages(ids):

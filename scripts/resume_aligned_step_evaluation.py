@@ -1,7 +1,7 @@
 """Continue the frozen v15 run after a schema-invalid shared PREPARE.
 
 No prompts, queries, retrieval, budgets, decoder, or metric are changed. A clean
-but invalid preparation blocks CHECK in all four arms, is counted as failure,
+but invalid preparation blocks CHECK in the arms that use it, is counted as failure,
 and is never truncated, repaired, retried, or substituted with an empty query.
 """
 import argparse
@@ -80,13 +80,16 @@ def inspect_preparation(out, row, plan):
         raw_sse_path=str(raw_path), raw_sse_sha256=vr.sha(raw_path), response_path=str(response_path),
         response_sha256=vr.sha(response_path), model_ids=response['model_ids'],
         finish_reasons=response['finish_reasons'], usage=response['usage'], shared_preparation=True)
+    english = base.en.active(plan.get('configuration', {}))
     return dict(policy=POLICY, id=row['id'], configuration_sha256=plan['configuration_sha256'],
         input_sha256=vr.digest(row), failure_stage='prepare', reason=reason, evidence=evidence,
         files={str(p): vr.sha(p) for p in (request, raw_path, response_path, effective)},
-        new_model_calls=0, response_edited=False, retry=False, affected_arms=list(base.p.ARMS))
+        new_model_calls=0, response_edited=False, retry=False, affected_arms=base.p.prepared_arms(english=english))
 
 
 def failure_result(out, row, arm, plan, receipt):
+    require(base.p.uses_preparation(arm, english=base.en.active(plan.get('configuration', {}))),
+            'A direct baseline cannot have a PREPARE failure')
     evidence = receipt['evidence']; usage = evidence['usage']
     path = out / 'queries' / vr.digest(row['id'])[:24] / FAILURE
     return dict(id=row['id'], model=base.r.EXPECTED_MODEL, verifier='C0p', organization_arm=arm,
@@ -103,10 +106,14 @@ def failure_result(out, row, arm, plan, receipt):
 
 def record_failure(out, row, plan, receipt):
     folder = out / 'queries' / vr.digest(row['id'])[:24]; path = folder / FAILURE
+    english = base.en.active(plan.get('configuration', {}))
+    affected = base.p.prepared_arms(english=english)
+    if english or 'affected_arms' in receipt:
+        require(receipt.get('affected_arms') == affected, 'Wrong affected arms for shared PREPARE failure')
     if path.exists(): require(vr.read(path) == receipt, 'Preparation failure receipt changed')
     else: vr.atomic(path, receipt)
     results = {}
-    for arm in base.p.ARMS:
+    for arm in affected:
         target = base.path_for(out, 'formal', arm, row)
         result = failure_result(out, row, arm, plan, receipt)
         packet = dict(configuration_sha256=plan['configuration_sha256'], input_sha256=vr.digest(row),
@@ -173,6 +180,8 @@ def recovered(out):
     def condition(root, row, phase, arm, memory, current, tokenizer, client):
         try: return original_run(root, row, phase, arm, memory, current, tokenizer, client)
         except ValueError:
+            if not base.p.uses_preparation(arm, english=base.en.active(current.get('configuration', {}))):
+                raise
             folder = out / 'queries' / vr.digest(row['id'])[:24]
             if phase != 'formal' or row['id'] not in rows or (folder / 'result.json').exists(): raise
             require(root == out and current['configuration_sha256'] == plan['configuration_sha256'] and
@@ -186,7 +195,7 @@ def recovered(out):
     def score(root, current=None):
         report = original_score(root, current)
         failures = [vr.read(p) for p in (out / 'queries').glob('*/' + FAILURE)]
-        report['shared_preparation_failures'] = dict(questions=len(failures), affected_arm_tasks=4 * len(failures),
+        report['shared_preparation_failures'] = dict(questions=len(failures), affected_arm_tasks=sum(len(x['affected_arms']) for x in failures),
             actual_requests=len(failures), ids=[x['id'] for x in failures], retained_in_full_cohort=True,
             classified_as_successful_empty=False, retried=False)
         vr.atomic(out / 'metrics.json', report)

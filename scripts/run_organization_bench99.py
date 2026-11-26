@@ -251,6 +251,8 @@ def run_condition(output,row,phase,arm,memory,plan,tokenizer,client):
         if not path.exists():raise
         value=recovery.retained_failure(path,output_amended=True)
         require(value['configuration_sha256']==plan['configuration_sha256'],'Failure binding changed')
+        if not base.p.uses_preparation(arm, english=base.en.active(plan.get('configuration', {}))):
+            base.recorded_delivery(path, row, arm, plan, value)
         base.old.emit(output,phase,arm=arm,sample_id=row['id'],result_status='failed_content_preserved')
         return value
 
@@ -270,7 +272,7 @@ def score(output,plan=None):
                 x=recovery.retained_failure(path,output_amended=True)
                 if not base.complete_content_failure(x):
                     extra=recovery.account(path);supplemental.append(extra);requests.add(extra['request_path'])
-            packet=vr.read(path.parent/'reference_packet.json')['packet']['retrieval']
+            packet=base.recorded_delivery(path,row,arm,plan,x)
             provided+=bool(packet['provided_complete_ids']);reference_tokens+=packet['reference_tokens']
             requests.update(e['request_path'] for e in x['trace']['response_evidence']);items.append(x)
         groups[arm]=items;all_requests.update(requests)

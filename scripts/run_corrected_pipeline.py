@@ -177,10 +177,11 @@ def freeze_plan(out, root, outputs, files, *, english):
     transport=dict(model=c.corpus.r.EXPECTED_MODEL,auditor_api='http://127.0.0.1:18083/v1',
         max_tokens=16384,technical_attempts=3,retry_cooldown_seconds=60,timeout_seconds=1200,
         reasoning_effort='medium',fixed_date='2026-11-07')
+    sources = SOURCES + ('rule_framework/verifier_english.py', 'rule_framework/final_answer_revision.py') if english else SOURCES
     cfg=dict(protocol=protocol.VERSION,root=str(root),transport=transport,
         model_files=extraction.old.b.existing.MODEL_FILES,limits=protocol.LIMITS,
         tree_policy=tree.POLICY,arms=list(protocol.ARMS),human_gold=False,
-        code={n:vr.sha(c.ROOT/n) for n in (SOURCES + ('rule_framework/verifier_english.py',) if english else SOURCES)},
+        code={n:vr.sha(c.ROOT/n) for n in sources},
         frozen_files={name+'.json':vr.sha(out/(name+'.json')) for name in outputs},
         evidence_digest=vr.digest(files),unknown_usage_policy='Per online case, reserve full advertised allowance; never restart its budget')
     if english:

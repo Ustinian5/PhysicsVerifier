@@ -82,6 +82,7 @@ def run_case(folder, row, arm, task, memory, configuration, tokenizer):
     # it is not resampled under a fresh budget. Construction uses its own policy.
     cfg = dict(configuration['transport'], technical_attempts=1)
     english = p.en.active(configuration)
+    citation_field = 'reference_ids' if english and arm == 'pure' else 'rule_refs'
     history = p.messages(row, arm, task, revision=configuration.get('check_prompt_revision'), english=english)
     knowledge = p.Knowledge(arm, memory, english=english)
     native = p.tools() if arm!='pure' else None
@@ -200,8 +201,8 @@ def run_case(folder, row, arm, task, memory, configuration, tokenizer):
                 break
             require(isinstance(draft,dict) and set(draft)=={'diagnostics'},'Expected diagnostics object')
             c.corpus.r.validate_diagnostics(draft)
-            require(all(isinstance(d.get('rule_refs',[]),list) and
-                        all(isinstance(x,str) for x in d.get('rule_refs',[])) for d in draft['diagnostics']),
+            require(all(isinstance(d.get(citation_field,[]),list) and
+                        all(isinstance(x,str) for x in d.get(citation_field,[])) for d in draft['diagnostics']),
                     'Invalid citation IDs')
             first=value=draft
             vr.atomic(folder/'first_diagnosis.json',first)
@@ -225,7 +226,7 @@ def run_case(folder, row, arm, task, memory, configuration, tokenizer):
     audit = knowledge.audit()
     if task=='step' and value:
         audit['quote_invalid_indices']=p.step.invalid_quotes(value,row)
-        audit['unread_citations']=[rid for d in value['diagnostics'] for rid in d.get('rule_refs',[]) if rid not in knowledge.read_ids]
+        audit['unread_citations']=[rid for d in value['diagnostics'] for rid in d.get(citation_field,[]) if rid not in knowledge.read_ids]
         audit['protocol_noncompliance']=bool(audit['protocol_noncompliance'] or audit['unread_citations'])
     result=dict(id=row['id'], arm=arm, task=task, signature=signature, status=status, reason=reason,
         value=value, evidence=evidence, input_audits=input_audits, usage=dict(requests=turns,input_tokens=used_in,

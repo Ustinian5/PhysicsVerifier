@@ -309,6 +309,23 @@ def prepare_messages(row, system, instruction):
     return [dict(role='system', content=system), dict(role='user', content=data + '\n' + instruction)]
 
 
+def direct_messages(row, *, official_reference=None):
+    return en.direct_messages(source_payload(row), en.STEP_DIRECT, official_reference=official_reference)
+
+
+def uses_preparation(arm, *, english):
+    require(arm in ARMS, 'Unknown comparison arm')
+    return arm != 'pure' or not english
+
+
+def prepared_arms(*, english):
+    return [arm for arm in ARMS if uses_preparation(arm, english=english)]
+
+
+def no_retrieval():
+    return dict(algorithm='none', provided_complete_ids=[], reference_tokens=0)
+
+
 def query_messages(row, *, english=False):
     if english:
         return prepare_messages(row, en.STEP_CHECK, en.QUERY)
@@ -330,13 +347,19 @@ def validate_queries(value, *, english=False):
     return value
 
 
-def continuation_messages(row, queries, references, *, english=False, arm=None):
+def continuation_messages(row, queries, references, *, english=False, arm=None, official_reference=None):
+    if arm is not None:
+        require(uses_preparation(arm, english=english), 'English pure checks must use direct_messages')
     validate_queries(queries, english=english)
     result = query_messages(row, english=english)
     if english and arm == 'case_rag':
         references = [en.case_view(item) for item in references]
     result.append({'role': 'assistant', 'content': json.dumps(queries, ensure_ascii=False)})
-    data = json.dumps({'stage': 'CHECK', 'Reference material': references}, ensure_ascii=False).replace('<|', '\\u003c|')
+    fields = {'stage': 'CHECK', 'Reference material': references}
+    if official_reference is not None:
+        require(english, 'Official references require an explicit reference-aware prompt')
+        fields[en.EXAM_REFERENCE] = en.exam_answer(official_reference)
+    data = json.dumps(fields, ensure_ascii=False).replace('<|', '\\u003c|')
     instruction = ('Check the complete current solution.' if english else
                    'Check the complete original answer in this conversation. Submit final diagnostics JSON.')
     if english and arm == 'case_rag':
@@ -385,12 +408,16 @@ class TreeMemory:
                         'total_leaf_count': len(self.memory.docs), 'flat_fallback': False}
 
 
-def reference_packet(row, arm, queries, memory, count_tokens, *, english=False, render=None):
+def reference_packet(row, arm, queries, memory, count_tokens, *, english=False, render=None, official_reference=None):
     """Same query, complete-item and context budgets for all representations."""
+    require(uses_preparation(arm, english=english), 'English pure checks must use direct_messages')
+    if official_reference is not None:
+        require(english and render is None, 'Step reference-aware checks require the English renderer')
     validate_queries(queries, english=english)
     if render is None:
         # The legacy runners can still supply their original continuation via the module.
-        render = partial(continuation_messages, english=True, arm=arm) if english else continuation_messages
+        render = (partial(continuation_messages, english=True, arm=arm, official_reference=official_reference)
+                  if english else continuation_messages)
     query = '\n'.join(queries['queries'])
     if arm == 'pure':
         require(memory is None, 'Pure model cannot access a knowledge store')

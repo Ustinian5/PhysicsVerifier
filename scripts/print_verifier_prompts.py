@@ -7,7 +7,6 @@ from scripts import continuous_context_v2 as quotes, pilot_retrieval_fusion as f
 from scripts import rebuild_qwen30b_corpus as solver, run_bench_reannotation as annotator
 from scripts import run_combined_source_screen as screen, run_corrected_extraction as build
 from scripts import run_timed_semantic_retrieval as timed, replay_retrieval_rank_role as rank_role
-from scripts.run_step_exam_reference import add_answer
 
 
 def render():
@@ -26,10 +25,11 @@ def render():
              'These are the messages built by the current request functions for an illustrative physics problem. '
              'Repeated conversation prefixes appear once. This document can be regenerated offline with '
              '`python -m scripts.print_verifier_prompts` in the physicsverifier conda environment.', '',
-             'The two evaluation tasks each share one English PREPARE across four arms. The pure arm receives an '
-             'empty material list. Skills and rule-tree arms use the same CHECK with their complete selected items. '
-             'RAG adds the historical-case binding shown below. In the closed-book transfer comparison all four arms '
-             'hide the current exam answer. The reference-assisted controls add it only in CHECK.', '']
+             'For both tasks the pure 120B reads the problem and the student response and checks them directly. '
+             'RAG, flat skills and the rule tree share one English PREPARE, retrieve from their own libraries, '
+             'and CHECK in that conversation. All four use the same student response and scoring criteria. '
+             'In the closed-book comparison the current exam answer is hidden. The optional reference-assisted '
+             'controls include it in the direct request or in the knowledge arm\'s CHECK.', '']
 
     def show(title, messages):
         lines.extend(['## ' + title, ''])
@@ -65,14 +65,15 @@ def render():
     show('Independent final-answer labels', final.original.label_messages(row, answer))
     show('Independent final-answer label review', final.review_messages(row, answer))
     for name, module in [('Step',step), ('Final answer',final)]:
-        show(name + ' / shared PREPARE', module.query_messages(row, english=True))
-        show(name + ' / CHECK', module.continuation_messages(row, queries, [], arm='pure', english=True)[2:])
+        show(name + ' / pure direct check', module.direct_messages(row))
+        show(name + ' / shared PREPARE for the three knowledge arms', module.query_messages(row, english=True))
+        item = dict(id='S1', title='Mean speed', text='Check distance divided by elapsed time.')
+        show(name + ' / skills or rule-tree CHECK', module.continuation_messages(row, queries, [item], arm='flat_skills', english=True)[2:])
         rag = module.continuation_messages(row, queries, [case], arm='case_rag', english=True)
         show(name + ' / CHECK with a historical RAG case', rag[-1:])
+        show(name + ' / direct check with an official exam answer', module.direct_messages(row, official_reference=answer))
     show('Final answer / CHECK with an official exam answer',
          final.continuation_messages(row, queries, [case], arm='case_rag', english=True, official_reference=answer)[-1:])
-    show('Step reference control / pure CHECK with an official exam answer',
-         add_answer(step.continuation_messages(row,queries,[],arm='pure',english=True),answer)[-1:])
     show('Step evidence-quote repair', [dict(role='user', content=quotes.repair_message(
         {'diagnostics':[{'evidence':{'quote':'3 metres per second'}}]}, [0], english=True))])
     prefix = final.query_messages(row, english=True) + [dict(role='assistant', content=json.dumps(queries))]

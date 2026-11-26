@@ -95,6 +95,26 @@ def test_completed_output_cannot_be_overwritten_by_failure(tmp_path):
     assert target.read_bytes() == original
 
 
+def test_english_prepare_failure_only_marks_the_three_knowledge_arms(tmp_path):
+    row, plan, receipt = failed_fixture(tmp_path)
+    plan['configuration'] = {'prompt_profile': r.base.en.PROFILE}
+    target = r.base.path_for(tmp_path, 'formal', 'pure', row)
+    with pytest.raises(ValueError, match='affected arms'):
+        r.record_failure(tmp_path, row, plan, dict(receipt, affected_arms=list(r.base.p.ARMS)))
+    receipt['affected_arms'] = r.base.p.prepared_arms(english=True)
+    results = r.record_failure(tmp_path, row, plan, receipt)
+    assert set(results) == {'case_rag', 'flat_skills', 'rule_tree'} and not target.parent.exists()
+    assert all(item['failure_stage'] == 'prepare' for item in results.values())
+    with pytest.raises(ValueError, match='direct baseline'):
+        r.failure_result(tmp_path, row, 'pure', plan, receipt)
+    r.vr.atomic(tmp_path/'inputs.json', [row])
+    with patch.object(r, 'verify', return_value=plan), \
+         patch.object(r.base, 'run_condition', side_effect=ValueError('direct verdict failed')), \
+         patch.object(r, 'inspect_preparation', side_effect=AssertionError('Read PREPARE for pure baseline')), \
+         r.recovered(tmp_path), pytest.raises(ValueError, match='direct verdict failed'):
+        r.base.run_condition(tmp_path, row, 'formal', 'pure', None, plan, None, None)
+
+
 def test_adapter_keeps_success_path_and_classifies_only_formal_prepare(tmp_path):
     row, plan, receipt = failed_fixture(tmp_path); r.vr.atomic(tmp_path / 'inputs.json', [row])
     with patch.object(r, 'verify', return_value=plan), \

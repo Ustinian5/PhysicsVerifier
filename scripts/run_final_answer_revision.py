@@ -1,4 +1,4 @@
-"""Revise final-answer labels, then evaluate the current four knowledge arms.
+"""Revise final-answer labels, then compare the pure 120B and three knowledge arms.
 
 Server-only, detached and locked.  Original generations, labels and 2400 old
 outputs are never edited.  Unresolved label disagreements gate publication;
@@ -70,12 +70,12 @@ def control_rows():
     return rows
 
 
-def prepare(out, root):
+def prepare(out, root, *, prompt_profile=None):
     require(Path('/proc').exists(), 'Formal preparation runs on the server')
     require(not (out / 'plan.json').exists(), 'Revision already prepared')
     current = root / 'aligned_old99/evaluation_revision'
     cp = step.verify(current)['configuration']
-    english = en.active(cp)
+    english = en.active(cp if prompt_profile is None else {'prompt_profile': prompt_profile})
     archive = root / 'corrected/pipeline/check_prompt_revision_bilingual'
     src = root / 'corrected'
     files = {}
@@ -503,46 +503,55 @@ def stores(out):
 
 
 def check_exam_answer(row, config):
-    if 'check_exam_references' not in config:
-        return None
-    require(en.active(config), 'Reference-aware CHECK requires the English profile')
-    item = config['check_exam_references'][row['id']]
-    require(item['input_sha256'] == vr.digest(p.public(row)), 'Exam reference belongs to a different input')
-    return en.exam_answer(item['label'])
+    return en.bound_exam_answer(config, row['id'], vr.digest(p.public(row)))
 
 
 def run_question(out, row, phase, plan, tokenizer, client, memories):
-    started = time.monotonic()
-    english = en.active(plan['configuration'])
-    limits=plan['configuration']['limits']; key=vr.digest(row['id'])[:24]
-    prefix=request_once(out,out/phase/'queries'/key,p.query_messages(row, english=english),base.p.QUERY_MAX_TOKENS,
-                        partial(base.p.validate_queries, english=english),plan,tokenizer,client,
-                        available=limits['wall_seconds_per_sample'],started=started)
-    # Same shared, label-free prefix is replayed and charged to all four arms.
-    count=lambda m:len(tokenizer.apply_chat_template(m,tokenize=True,add_generation_prompt=True,reasoning_effort='medium'))
+    config = plan['configuration']
+    english, limits = en.active(config), config['limits']
+    key = vr.digest(row['id'])[:24]
+    query_dir = out/phase/'queries'/key
+    prefix = None
+    def count(messages):
+        return len(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, reasoning_effort='medium'))
     for arm in ARMS:
+        staged = base.p.uses_preparation(arm, english=english)
+        if staged and prefix is None:
+            prefix = request_once(out, query_dir, p.query_messages(row, english=english), base.p.QUERY_MAX_TOKENS,
+                                  partial(base.p.validate_queries, english=english), plan, tokenizer, client,
+                                  available=limits['wall_seconds_per_sample'], started=time.monotonic())
         folder=out/phase/arm/key; path=folder/'result.json'
         if path.exists():
             saved=vr.read(path)
-            verify_arm(row,arm,path,saved,prefix,plan)
+            verify_arm(row,arm,path,saved,prefix if staged else None,plan)
             continue
         started = time.monotonic()
-        charged = prefix['wall_seconds']
-        files=dict(prefix['files']);files[str(out/phase/'queries'/key/'result.json')]=vr.sha(out/phase/'queries'/key/'result.json')
-        usage=dict(prefix['usage']); retrieval=dict(provided_complete_ids=[],reference_tokens=0)
-        value=None;status='content_failure';reason='Shared PREPARE failed';responses=1
-        if prefix['status']=='complete':
+        messages = None
+        if staged:
+            charged, responses = prefix['wall_seconds'], 1
+            files, usage = dict(prefix['files']), dict(prefix['usage'])
+            files[str(query_dir/'result.json')] = vr.sha(query_dir/'result.json')
+            retrieval = dict(provided_complete_ids=[], reference_tokens=0)
+            value, status, reason = None, 'content_failure', 'Shared PREPARE failed'
+            if prefix['status'] == 'complete':
+                packet = p.reference_packet(row, arm, prefix['value'], memories[arm], count, english=english,
+                                            official_reference=check_exam_answer(row, config))
+                immutable(folder/'reference_packet.json', packet)
+                files[str(folder/'reference_packet.json')] = vr.sha(folder/'reference_packet.json')
+                messages, retrieval = packet['messages'], packet['retrieval']
+        else:
+            require(not (folder/'reference_packet.json').exists(), 'Staged evidence in direct baseline folder')
+            charged, responses, files = 0, 0, {}
+            usage = dict(prompt_tokens=0, completion_tokens=0, total_tokens=0)
+            retrieval = base.p.no_retrieval()
+            messages = p.direct_messages(row, official_reference=check_exam_answer(row, config))
+        if messages is not None:
             available = limits['wall_seconds_per_sample'] - charged
             require(available > 0, 'Cumulative wall-time budget exhausted before CHECK')
-            packet=p.reference_packet(row,arm,prefix['value'],memories[arm],count, english=english,
-                                      official_reference=check_exam_answer(row, plan['configuration']))
-            immutable(folder/'reference_packet.json',packet)
-            files[str(folder/'reference_packet.json')]=vr.sha(folder/'reference_packet.json')
-            retrieval=packet['retrieval']
             remaining=limits['output_tokens_per_sample']-usage['completion_tokens']
-            require(remaining>0 and count(packet['messages'])+usage['prompt_tokens']<=limits['input_tokens_per_sample'],
+            require(remaining>0 and count(messages)+usage['prompt_tokens']<=limits['input_tokens_per_sample'],
                     'Cumulative input/output budget exceeded')
-            check=request_once(out,folder/'check',packet['messages'],min(remaining,limits['max_tokens_per_response']),
+            check=request_once(out,folder/'check',messages,min(remaining,limits['max_tokens_per_response']),
                 p.original.validate_verdict,plan,tokenizer,client,available=available,started=started)
             charged += check['wall_seconds']
             files.update(check['files']);files[str(folder/'check/result.json')]=vr.sha(folder/'check/result.json')
@@ -600,14 +609,23 @@ def verify_arm(row, arm, path, value, prefix, plan):
     require(value['id'] == row['id'] and value['arm'] == arm and
             value['configuration_sha256'] == plan['configuration_sha256'] and
             value['input_sha256'] == vr.digest(p.public(row)), 'Wrong result/cohort binding')
-    query_result = path.parents[2]/'queries'/path.parent.name/'result.json'
-    files = dict(prefix['files'])
-    files[str(query_result)] = vr.sha(query_result)
-    charged = prefix['wall_seconds']
-    usage = prefix['usage']
-    responses = 1
-    if prefix['status'] == 'complete':
-        packet_path = path.parent/'reference_packet.json'
+    english = en.active(plan['configuration'])
+    staged = base.p.uses_preparation(arm, english=english)
+    require(staged == (prefix is not None), 'Wrong preparation evidence for this arm')
+    packet_path = path.parent/'reference_packet.json'
+    if staged:
+        query_result = path.parents[2]/'queries'/path.parent.name/'result.json'
+        files = dict(prefix['files'])
+        files[str(query_result)] = vr.sha(query_result)
+        charged, usage, responses = prefix['wall_seconds'], prefix['usage'], 1
+    else:
+        require(not packet_path.exists() and value['retrieval'] == base.p.no_retrieval(),
+                'Unexpected material evidence for a direct check')
+        files, charged, responses = {}, 0, 0
+        usage = dict(prompt_tokens=0, completion_tokens=0, total_tokens=0)
+    if not staged:
+        expected = p.direct_messages(row, official_reference=check_exam_answer(row, plan['configuration']))
+    elif prefix['status'] == 'complete':
         packet = bind(files, packet_path)
         # FlatMemory.view sends id, title, text. Atomic JSON sorts the stored object keys.
         # Restore the send order only when replaying the archived packet.
@@ -616,10 +634,15 @@ def verify_arm(row, arm, path, value, prefix, plan):
         require(isinstance(references, list) and all(isinstance(ref, dict) and set(ref) == set(fields)
                 for ref in references), 'Invalid stored full-material fields')
         sent = [{k: ref[k] for k in fields} for ref in references]
-        expected = p.continuation_messages(row, prefix['value'], sent, arm=arm, english=en.active(plan['configuration']),
+        expected = p.continuation_messages(row, prefix['value'], sent, arm=arm, english=english,
                                             official_reference=check_exam_answer(row, plan['configuration']))
         require(packet['messages'] == expected and packet['retrieval'] == value['retrieval']
                 and (arm != 'pure' or not packet['references']), 'Wrong shared prefix or supplied materials')
+    else:
+        expected = None
+        require(value['status'] == 'content_failure' and value['value'] is None and
+                value['reason'] == 'Shared PREPARE failed', 'Failed preparation was silently reclassified')
+    if expected is not None:
         limit = min(limits['max_tokens_per_response'], limits['output_tokens_per_sample'] - usage['completion_tokens'])
         check = saved_request(path.parent/'check', expected, limit, p.original.validate_verdict, plan,
                               available=limits['wall_seconds_per_sample'] - charged)
@@ -631,9 +654,6 @@ def verify_arm(row, arm, path, value, prefix, plan):
         files.update(check['files'])
         check_result = path.parent/'check/result.json'
         files[str(check_result)] = vr.sha(check_result)
-    else:
-        require(value['status'] == 'content_failure' and value['value'] is None and
-                value['reason'] == 'Shared PREPARE failed', 'Failed preparation was silently reclassified')
     require(value['files'] == files, 'Result evidence changed')
     require(seconds(value['wall_seconds']) == charged <= limits['wall_seconds_per_sample'],
             'Incorrect cumulative wall-time charge')
@@ -652,9 +672,11 @@ def score(out):
         for row in rows:
             path=out/'formal'/arm/vr.digest(row['id'])[:24]/'result.json'
             value=bind(files,path)
-            prefix=saved_request(out/'formal/queries'/vr.digest(row['id'])[:24],p.query_messages(row, english=english),
-                                 base.p.QUERY_MAX_TOKENS,partial(base.p.validate_queries, english=english),plan,
-                                 available=plan['configuration']['limits']['wall_seconds_per_sample'])
+            prefix = None
+            if base.p.uses_preparation(arm, english=english):
+                prefix=saved_request(out/'formal/queries'/vr.digest(row['id'])[:24],p.query_messages(row, english=english),
+                                     base.p.QUERY_MAX_TOKENS,partial(base.p.validate_queries, english=english),plan,
+                                     available=plan['configuration']['limits']['wall_seconds_per_sample'])
             verify_arm(row,arm,path,value,prefix,plan)
             files.update(value['files']);predictions[row['id']]=value
         groups[arm]=measure(labels,predictions)
@@ -694,8 +716,9 @@ def confirm(out, signature):
     vr.atomic(out/'disconnect_acceptance.json',dict(ready,passed=True,confirmed_unix=time.time()))
 
 
-def prepare_signature():
-    return vr.digest(dict(stage='prepare_final_revision',sources=source_hashes(),contract=p.contract()))
+def prepare_signature(prompt_profile=None):
+    english = en.active({'prompt_profile': prompt_profile})
+    return vr.digest(dict(stage='prepare_final_revision',sources=source_hashes(english=english),contract=p.contract(english=english)))
 
 
 def repair_signature(out):
@@ -729,11 +752,13 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode',choices=['prepare','verify','review','freeze','rescore-archive','pilot','run','score','confirm-detached','status','register-repair','confirm-repair'])
     parser.add_argument('--output',type=Path,required=True);parser.add_argument('--root',type=Path)
+    parser.add_argument('--prompt-profile', choices=[en.PROFILE], help='Bind new online prompts when preparing from an older input release')
     parser.add_argument('--await-release',action='store_true',help='Require fresh reconnect acceptance for detached offline work')
     args=parser.parse_args();out=args.output.resolve()
     require(Path('/proc').exists(),'Formal preparation/execution/scoring runs on server')
+    require(args.prompt_profile is None or args.mode in ('prepare', 'confirm-detached'), 'Prompt profile is frozen at prepare')
     if args.mode=='confirm-detached':
-        confirm(out,verify(out)['configuration_sha256'] if (out/'plan.json').exists() else prepare_signature())
+        confirm(out,verify(out)['configuration_sha256'] if (out/'plan.json').exists() else prepare_signature(args.prompt_profile))
     elif args.mode=='confirm-repair':confirm(out/'repair_validation',repair_signature(out))
     elif args.mode=='verify':verify(out);print('verified')
     elif args.mode=='status':verify(out);print(dict(Counter(x['state'] for x in dispositions(out).values())))
@@ -746,13 +771,13 @@ def main():
             code=1;(control/'runner.pid').write_text(str(os.getpid()))
             try:
                 if args.mode=='register-repair':signature=repair_signature(out)
-                elif args.mode=='prepare':signature=prepare_signature()
+                elif args.mode=='prepare':signature=prepare_signature(args.prompt_profile)
                 else:signature=verify(out)['configuration_sha256']
                 base.runtime.wait_detached(control,signature)
                 require(not (out/'STOP').exists(),'STOP requested')
                 if args.mode=='prepare':
                     require(args.root is not None,'--root is required for prepare')
-                    prepare(out,args.root.resolve())
+                    prepare(out,args.root.resolve(),prompt_profile=args.prompt_profile)
                 elif args.mode=='register-repair':
                     effective=verify(out,register=True)
                     base.old.emit(control,'repair_bound',configuration_sha256=effective['configuration_sha256'],model_calls=0)

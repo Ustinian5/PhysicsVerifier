@@ -2,7 +2,7 @@
 
 These are the messages built by the current request functions for an illustrative physics problem. Repeated conversation prefixes appear once. This document can be regenerated offline with `python -m scripts.print_verifier_prompts` in the physicsverifier conda environment.
 
-The two evaluation tasks each share one English PREPARE across four arms. The pure arm receives an empty material list. Skills and rule-tree arms use the same CHECK with their complete selected items. RAG adds the historical-case binding shown below. In the closed-book transfer comparison all four arms hide the current exam answer. The reference-assisted controls add it only in CHECK.
+For both tasks the pure 120B reads the problem and the student response and checks them directly. RAG, flat skills and the rule tree share one English PREPARE, retrieve from their own libraries, and CHECK in that conversation. All four use the same student response and scoring criteria. In the closed-book comparison the current exam answer is hidden. The optional reference-assisted controls include it in the direct request or in the knowledge arm's CHECK.
 
 ## Source eligibility
 
@@ -356,7 +356,27 @@ User
 {"question": "A cart travels 12 m in 3 s at constant speed. Find its speed.", "student_answer": "The speed is 3 m/s.", "original_reference_answers": ["4 m/s"]}
 ````
 
-## Step / shared PREPARE
+## Step / pure direct check
+
+System
+
+````text
+Check the complete physics solution in the first user message. Verify its assumptions, equations, transitions and conclusion against the problem and supplied context. Accept equivalent methods, conventions and reasonable rounding. Distinguish a corrected tentative step from a claim the solution still uses. Report each independent root error once. A later step counts separately only if it introduces another mistake. If information is missing, report only contradictions you can establish. Use the current problem's official exam answer if supplied.
+
+For each error, explain in English what fails and why. Copy the shortest continuous passage in the current student's solution that expresses the diagnosed claim, preserving its original language, spelling and mathematical notation.
+
+Output
+Return one JSON object: {"diagnostics":[{"message":"error and justification","evidence":{"quote":"exact passage"},"reference_ids":[]}]}.
+Leave reference_ids empty. Return an empty diagnostics list when you identify no errors.
+````
+
+User
+
+````text
+{"question": "A cart travels 12 m in 3 s at constant speed. Find its speed.", "prediction": "The speed is 3 m/s.", "context": ""}
+````
+
+## Step / shared PREPARE for the three knowledge arms
 
 System
 
@@ -377,7 +397,7 @@ User
 PREPARE: identify one to three concrete physical relations or assumptions to check across the solution. Write a short retrieval phrase in English only for each, naming the concept and distinguishing conditions. Leave the verdict open. Return only {"queries":[...]}.
 ````
 
-## Step / CHECK
+## Step / skills or rule-tree CHECK
 
 Assistant
 
@@ -388,7 +408,7 @@ Assistant
 User
 
 ````text
-{"stage": "CHECK", "Reference material": []}
+{"stage": "CHECK", "Reference material": [{"id": "S1", "title": "Mean speed", "text": "Check distance divided by elapsed time."}]}
 Check the complete current solution.
 ````
 
@@ -401,7 +421,46 @@ User
 Check the complete current solution. Judge the prediction in the first user message. Each supplied case contains a different student's answer and its machine review. Apply a historical finding only if the current answer independently supports it.
 ````
 
-## Final answer / shared PREPARE
+## Step / direct check with an official exam answer
+
+System
+
+````text
+Check the complete physics solution in the first user message. Verify its assumptions, equations, transitions and conclusion against the problem and supplied context. Accept equivalent methods, conventions and reasonable rounding. Distinguish a corrected tentative step from a claim the solution still uses. Report each independent root error once. A later step counts separately only if it introduces another mistake. If information is missing, report only contradictions you can establish. Use the current problem's official exam answer if supplied.
+
+For each error, explain in English what fails and why. Copy the shortest continuous passage in the current student's solution that expresses the diagnosed claim, preserving its original language, spelling and mathematical notation.
+
+Output
+Return one JSON object: {"diagnostics":[{"message":"error and justification","evidence":{"quote":"exact passage"},"reference_ids":[]}]}.
+Leave reference_ids empty. Return an empty diagnostics list when you identify no errors.
+````
+
+User
+
+````text
+{"question": "A cart travels 12 m in 3 s at constant speed. Find its speed.", "prediction": "The speed is 3 m/s.", "context": "", "Official exam reference answer for the current problem": ["4 m/s"]}
+````
+
+## Final answer / pure direct check
+
+System
+
+````text
+Judge the student's committed final answer to each result the problem requests. Use the question, student response and the current problem's official exam answer if supplied. Give a brief justification in English.
+
+Accept equivalent expressions, compatible units, valid alternative methods and rounding justified by the stated precision. Ignore abandoned steps when the committed answer is correct. A definitely wrong or missing requested result makes the answer incorrect. Use uncertain when missing conditions, conflicting final statements or unresolved equivalence prevent a decision. Distinguish alternative forms of one reference result from separate required parts.
+
+Output
+Return one JSON object: {"verdict":"correct|incorrect|uncertain","student_final_answer":"committed result, or empty if absent","reason":"brief justification"}.
+````
+
+User
+
+````text
+{"question": "A cart travels 12 m in 3 s at constant speed. Find its speed.", "prediction": "The speed is 3 m/s.", "context": ""}
+````
+
+## Final answer / shared PREPARE for the three knowledge arms
 
 System
 
@@ -423,7 +482,7 @@ User
 PREPARE: identify one to three relations or conditions needed to judge the final results requested in the problem. Use the problem and the student's response without assuming the student's premises are correct. Write a short retrieval phrase in English only for each. Return only {"queries":[...]}.
 ````
 
-## Final answer / CHECK
+## Final answer / skills or rule-tree CHECK
 
 Assistant
 
@@ -434,7 +493,7 @@ Assistant
 User
 
 ````text
-{"stage": "CHECK", "Reference material": []}
+{"stage": "CHECK", "Reference material": [{"id": "S1", "title": "Mean speed", "text": "Check distance divided by elapsed time."}]}
 Judge the committed final answer in the first user message.
 ````
 
@@ -447,6 +506,25 @@ User
 Judge the committed final answer in the first user message. Judge the prediction in the first user message. Each supplied case contains a different student's answer and its machine review. Apply a historical finding only if the current answer independently supports it.
 ````
 
+## Final answer / direct check with an official exam answer
+
+System
+
+````text
+Judge the student's committed final answer to each result the problem requests. Use the question, student response and the current problem's official exam answer if supplied. Give a brief justification in English.
+
+Accept equivalent expressions, compatible units, valid alternative methods and rounding justified by the stated precision. Ignore abandoned steps when the committed answer is correct. A definitely wrong or missing requested result makes the answer incorrect. Use uncertain when missing conditions, conflicting final statements or unresolved equivalence prevent a decision. Distinguish alternative forms of one reference result from separate required parts.
+
+Output
+Return one JSON object: {"verdict":"correct|incorrect|uncertain","student_final_answer":"committed result, or empty if absent","reason":"brief justification"}.
+````
+
+User
+
+````text
+{"question": "A cart travels 12 m in 3 s at constant speed. Find its speed.", "prediction": "The speed is 3 m/s.", "context": "", "Official exam reference answer for the current problem": ["4 m/s"]}
+````
+
 ## Final answer / CHECK with an official exam answer
 
 User
@@ -454,15 +532,6 @@ User
 ````text
 {"stage": "CHECK", "Reference material": [{"id": "example_case", "title": "Resistance from current and voltage", "text": "Historical problem\nA resistor carries 2 A at 3 V. Find its resistance.\n\nOriginal 30B answer (may contain errors)\nIts resistance is 6 ohms.\n\nFirst 120B review\n{\"status\": \"error_found\", \"summary\": \"The response multiplied current and voltage to obtain resistance.\"}"}], "Official exam reference answer for the current problem": ["4 m/s"]}
 Judge the committed final answer in the first user message. Judge the prediction in the first user message. Each supplied case contains a different student's answer and its machine review. Apply a historical finding only if the current answer independently supports it.
-````
-
-## Step reference control / pure CHECK with an official exam answer
-
-User
-
-````text
-{"stage": "CHECK", "Reference material": [], "Official exam reference answer for the current problem": ["4 m/s"]}
-Check the complete current solution.
 ````
 
 ## Step evidence-quote repair

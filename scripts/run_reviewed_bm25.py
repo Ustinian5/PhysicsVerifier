@@ -78,17 +78,22 @@ def evaluate_row(out, parent, old, phase, row, plan, memories, tokenizer, client
     limits = plan['configuration']['limits']
     english = final.en.active(plan['configuration'])
     require(english == final.en.active(old['configuration']), 'Incompatible shared PREPARE language')
-    folder, prefix = prefix_record(parent, old, phase, row)
+    reference = final.check_exam_answer(row, plan['configuration'])
+    require(reference == final.check_exam_answer(row, old['configuration']), 'Incompatible exam reference for baseline reuse')
+    prefix = None
     def count(messages):
         return len(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
                                                  reasoning_effort='medium'))
     results = {}
     for arm in ARMS:
+        staged = final.base.p.uses_preparation(arm, english=english)
+        if staged and prefix is None:
+            folder, prefix = prefix_record(parent, old, phase, row)
         old_dir = parent / phase / arm / key
         old_result = old_dir / 'result.json'
         require(vr.sha(old_result) == source_files[str(old_result)], 'Unbound original arm outcome')
         previous = vr.read(old_result)
-        final.verify_arm(row, arm, old_result, previous, prefix, old)
+        final.verify_arm(row, arm, old_result, previous, prefix if staged else None, old)
         dest = out / phase / arm / key
         if arm not in FLAT_ARMS:
             retrieval = previous['retrieval']
@@ -106,7 +111,8 @@ def evaluate_row(out, parent, old, phase, row, plan, memories, tokenizer, client
         delivery = dict(provided_complete_ids=[], reference_tokens=0)
         reason, usage, wall = 'Shared PREPARE failed', dict(prefix['usage']), prefix['wall_seconds']
         if prefix['status'] == 'complete':
-            packet = final.p.reference_packet(row, arm, prefix['value'], memories[arm], count, english=english)
+            packet = final.p.reference_packet(row, arm, prefix['value'], memories[arm], count, english=english,
+                                              official_reference=reference)
             delivery = packet['retrieval']
             require(len(delivery['provided_complete_ids']) <= final.base.p.MAX_ITEMS and
                     delivery['reference_tokens'] <= final.base.p.REFERENCE_TOKEN_CAP, 'Material budget exceeded')

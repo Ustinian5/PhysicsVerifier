@@ -172,7 +172,8 @@ def fake_runtime(monkeypatch, *, content=None, model=None, error=None, elapsed=l
         payload = ({'queries':['speed 速度']} if len(req['messages']) < 4 else
                    {'verdict':'correct','student_final_answer':'10 m/s','reason':'Units agree'})
         rec=dict(http_status=200,model_ids=[raw['model']],raw_sse_sha256=r.vr.sha(kw['raw_path']),
-                 content=content or json.dumps(payload),elapsed_seconds=elapsed(req['messages']))
+                 content=content(req['messages']) if callable(content) else content or json.dumps(payload),
+                 elapsed_seconds=elapsed(req['messages']))
         if error:rec['error']=error
         r.vr.atomic(kw['response_path'],rec)
         if error:raise ValueError(error)

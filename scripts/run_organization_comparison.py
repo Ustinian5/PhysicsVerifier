@@ -322,16 +322,60 @@ def register_content_failure_recovery(output):
         verify(output)
 
 
+def check_options(row, config):
+    if not en.active(config):
+        return {}
+    reference = en.bound_exam_answer(config, row['id'], vr.digest(p.source_payload(row)))
+    return {'english': True, **({'official_reference': reference} if reference is not None else {})}
+
+
+def verify_direct_step(folder, messages, result=None):
+    require(not (folder/'reference_packet.json').exists(), 'Staged evidence in direct baseline folder')
+    state_path = folder/'state.json'
+    if state_path.exists():
+        state = vr.read(state_path)
+        require(state['messages'][:2] == messages and not state['tool_events'] and not state['read_rule_ids'],
+                'Wrong conversation in direct baseline checkpoint')
+    first = folder/'turn_01/request.json'
+    if first.exists() or result is not None or any(folder.glob('turn_*/request.json')):
+        require(first.is_file(), 'Direct check lacks its first request')
+        request = vr.read(first)['request']
+        require(request['messages'] == messages and not request.get('tools'), 'Wrong direct baseline request')
+    if result is not None:
+        trace = result['trace']
+        evidence = trace['response_evidence']
+        require(not trace['tool_events'] and not trace['read_rule_ids'] and result.get('failure_stage') != 'prepare'
+                and all(not e.get('shared_preparation') and
+                        Path(e['request_path']).resolve() == (folder/f"turn_{i:02d}"/'request.json').resolve()
+                        for i, e in enumerate(evidence, 1)), 'Foreign evidence in direct baseline')
+        if runtime.healthy_result(result):
+            require(result['retrieval'] == p.no_retrieval() and 1 <= len(evidence) == trace['model_requests'] <= 2,
+                    'Incorrect direct check delivery or request count')
+
+
+def recorded_delivery(path, row, arm, plan, result):
+    config = plan.get('configuration', {})
+    if p.uses_preparation(arm, english=en.active(config)):
+        return vr.read(path.with_name('reference_packet.json'))['packet']['retrieval']
+    options = check_options(row, config)
+    verify_direct_step(path.parent, p.direct_messages(row, official_reference=options.get('official_reference')), result)
+    return p.no_retrieval()
+
+
 @contextmanager
-def checking(row, arm, packet, prefix, *, english=False):
-    provided = packet['retrieval']['provided_complete_ids']
+def checking(row, arm, packet, prefix, *, english=False, official_reference=None):
+    staged = p.uses_preparation(arm, english=english)
+    require(staged == (prefix is not None) == (packet is not None), 'Wrong inputs for this checking arm')
+    retrieval = packet['retrieval'] if staged else p.no_retrieval()
+    messages = packet['messages'] if staged else p.direct_messages(row, official_reference=official_reference)
+    provided = retrieval['provided_complete_ids']
     def initial(*args, **kwargs):
-        usage = prefix['evidence']['usage']
-        return {'messages': packet['messages'], 'tool_events': [{'tool': 'provide_reference',
-            'arguments': {'ids': provided}, 'result': packet['references']}], 'read_rule_ids': provided,
-            'returned_chars': len(json.dumps(packet['references'], ensure_ascii=False)),
+        events = [dict(tool='provide_reference', arguments={'ids': provided}, result=packet['references'])] if staged else []
+        usage = prefix['evidence']['usage'] if staged else {'prompt_tokens': 0, 'completion_tokens': 0}
+        return {'messages': messages, 'tool_events': events, 'read_rule_ids': provided,
+            'returned_chars': len(json.dumps(packet['references'], ensure_ascii=False)) if staged else 0,
             'reserved_output_tokens': usage['completion_tokens'], 'input_tokens': usage['prompt_tokens'],
-            'turn': 1, 'pending': None, 'response_evidence': [copy.deepcopy(prefix['evidence'])],
+            'turn': int(staged), 'pending': None, 'response_evidence': [copy.deepcopy(prefix['evidence'])] if staged else [],
             'visible_output_tokens': 0, 'tree_access': False, 'started_unix': time.time(), 'sample_id': str(row['id']),
             **({'prompt_profile': en.PROFILE} if english else {})}
     def audit(value, *args, **kwargs):
@@ -348,7 +392,7 @@ def checking(row, arm, packet, prefix, *, english=False):
             'first_diagnosis_path': str(sample_dir/'first_diagnosis.json'),
             'first_diagnosis_sha256': vr.sha(sample_dir/'first_diagnosis.json'),
             'quote_repair': state.get('quote_repair', {'status': 'not_needed'}),
-            'retrieval': packet['retrieval'], 'trace': {'model_requests': state['turn'],
+            'retrieval': retrieval, 'trace': {'model_requests': state['turn'],
                 'input_tokens': state['input_tokens'], 'output_token_limit_reserved': state['reserved_output_tokens'],
                 'tool_events': state['tool_events'], 'read_rule_ids': provided, 'tree_access': False,
                 'response_evidence': state['response_evidence']}}
@@ -365,28 +409,38 @@ def path_for(output, phase, arm, row):
 
 def run_condition(output, row, phase, arm, memory, plan, tokenizer, client):
     path = path_for(output, phase, arm, row)
+    options = check_options(row, plan.get('configuration', {}))
+    staged = p.uses_preparation(arm, english=bool(options))
+    if not staged:
+        direct = p.direct_messages(row, official_reference=options.get('official_reference'))
+        if not path.exists():
+            verify_direct_step(path.parent, direct)
     if path.exists():
         saved = vr.read(path)
         require(saved['configuration_sha256'] == plan['configuration_sha256'], 'Existing result plan changed')
         runtime.audit_result(saved)
+        if not staged:
+            verify_direct_step(path.parent, direct, saved)
         require(runtime.healthy_result(saved) or (phase=='formal' and complete_content_failure(saved)),
                 'Preserved failed result requires audited recovery')
         return saved
-    prefix = query(output, row, plan, tokenizer, client)
-    count = lambda m: len(tokenizer.apply_chat_template(m, tokenize=True, add_generation_prompt=True))
-    options = {'english': True} if en.active(plan['configuration']) else {}
-    packet = p.reference_packet(row, arm, prefix['queries'], memory, count, **options)
-    folder = path.parent; folder.mkdir(parents=True, exist_ok=True)
-    packet_path = folder / 'reference_packet.json'
-    packet_record = {'configuration_sha256': plan['configuration_sha256'], 'packet': packet,
-                     'query_evidence_sha256': vr.digest(prefix), 'input_sha256': vr.digest(row)}
-    if packet_path.exists(): require(vr.read(packet_path) == packet_record, 'Retrieval packet drift')
-    else: vr.atomic(packet_path, packet_record)
+    prefix = packet = None
+    if staged:
+        prefix = query(output, row, plan, tokenizer, client)
+        count = lambda m: len(tokenizer.apply_chat_template(m, tokenize=True, add_generation_prompt=True))
+        packet = p.reference_packet(row, arm, prefix['queries'], memory, count, **options)
+        packet_path = path.with_name('reference_packet.json')
+        packet_record = {'configuration_sha256': plan['configuration_sha256'], 'packet': packet,
+                         'query_evidence_sha256': vr.digest(prefix), 'input_sha256': vr.digest(row)}
+        if packet_path.exists(): require(vr.read(packet_path) == packet_record, 'Retrieval packet drift')
+        else: vr.atomic(packet_path, packet_record)
     with checking(row, arm, packet, prefix, **options):
         result = r.run_sample(row, arm='C0p', catalog={'domains': []}, tokenizer=tokenizer, client=client,
             endpoint=plan['configuration']['api_base']+'/chat/completions', model=r.EXPECTED_MODEL,
             root=output/phase/arm, signature=plan['configuration_sha256'], limits=plan['configuration']['limits'])
     runtime.audit_result(result)
+    if not staged:
+        verify_direct_step(path.parent, direct, result)
     require(runtime.healthy_result(result) or (phase=='formal' and complete_content_failure(result)),
             'Technical failure retained; no reroll')
     require(phase != 'controls' or result['protocol_audit']['passed'], 'Engineering reference protocol failure')
