@@ -1,8 +1,10 @@
 # 脚本入口
 
-新版 verifier 的英文审阅稿由实际请求函数生成。用项目 conda 环境执行 `python -m scripts.print_verifier_prompts` 即可离线查看。建库首审读取本题官方参考。步骤级和题目级的闭卷评测中，纯组由 120B 直接核查题干和 30B 回答。RAG、skills、规则树三组逐题共用一次英文 PREPARE，各从本组知识库选材，再在原会话核查。查询用量和查询失败只计入这三组。步骤级新建计划默认绑定英文提示及独立 120B 裁判。题目级从旧输入新建英文计划使用 `prepare --prompt-profile verifier_english_v1`，断连确认使用同一参数。下文按日期记录已完成批次的实际协议。[英文提示词全文](../docs/Verifier英文提示词.md)
+新版两级 verifier 使用同一题在 Combined Language 中的原始官方答案。纯 120B 直接核查题干、完整30B回答和官方答案。RAG、skills、规则树逐题共用一次英文 PREPARE，各自选材，在原会话的 CHECK 中接收该题答案和本组材料。两级均复用已发布 bench 的回答和标签。离线建库的三库共用一次有官方答案的120B首审。[实际英文提示词](../docs/Verifier英文提示词.md)
 
-新版步骤级在 node14 使用个人 conda 环境 `/data0/zengzheni/PhysicsVerifier-huhengyuan/envs/physicsverifier`。四组检查入口为 `python -m scripts.run_aligned_step_evaluation`。先以 `prepare --parent <材料发布目录> --output <新目录>` 绑定已验收的英文三库和冻结 bench；明确以原 `aligned_old99` 为父目录时绑定已定稿的同批 n2000 三库。随后后台 `run --output <新目录> --gpu 4`，重新连接后执行 `confirm-detached --output <新目录>`。四组发布结束后，同一服务器自动完成独立裁判及计分。`score --output <新目录>` 从原始响应离线复算。[步骤执行入口](run_aligned_step_evaluation.py)
+node14 运行使用个人解释器 `/data0/zengzheni/PhysicsVerifier-huhengyuan/envs/physicsverifier/bin/python`。步骤级入口为 `-m scripts.run_aligned_step_evaluation`。只跑纯组时使用 `prepare --pure-only --output <新目录>`；四组使用 `prepare --parent <已验收的材料发布目录> --output <新目录>`。显式传入原 `aligned_old99` 会采用已定稿的同批 n2000 三库。两种计划均固定6道开发题、99道正式题及其对应官方答案。后台运行 `run --output <新目录> --gpu 4`，重新连接后执行 `confirm-detached --output <新目录>`。程序核对实际输入 token 中的答案，开发验收通过后运行正式检查及独立120B裁判。`score --output <新目录>` 可离线复算。[步骤级入口](run_aligned_step_evaluation.py)
+
+题目级新建计划使用 `-m scripts.run_final_answer_revision prepare --root <结果根> --material-parent <已验收的材料发布目录> --output <新目录> --await-release`。该入口复用冻结474题的回答及标签，并沿用上次有参考对照的467道可测题。后台准备、开发验收及正式执行分别使用 `prepare`、`pilot`、`run`，每次重新连接后以同一结果目录执行 `confirm-detached`。本轮先执行步骤级纯组。[题目级入口](run_final_answer_revision.py)
 
 单独对已发布的冻结 BM25 四组诊断计分时，使用 `python -m scripts.run_step_match_judge run --published <bm25_n2000/step> --output <独立裁判结果目录> --gpu 4`，同样在服务器后台启动，重新连接后将 `run` 换为 `confirm`。开发验收使用 `--controls`。结果目录内的 `publication.json` 绑定原诊断，`judgments/` 保存逐条请求及响应，`details.json` 和 `metrics.json` 保存逐题命中及四组三项。原命令将 `run` 换为 `score` 可在服务关闭后回放。[裁判入口](run_step_match_judge.py) · [计分口径](../docs/效果测评.md#步骤级)
 

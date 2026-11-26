@@ -84,9 +84,11 @@ def production(bench, published):
     else:
         require(vr.sha(published / 'inputs.json') == frozen.INPUTS, 'Verifier cohort or answers changed')
         files['inputs.json'] = frozen.INPUTS
+    arms = list(ARMS) if tasks else plan['configuration']['arms']
+    require(arms in (['pure'], list(ARMS)), 'Unrecognized published comparison arms')
     results = {}
     for row in rows:
-        for arm in ARMS:
+        for arm in arms:
             key = row['id'], arm
             path = base.path_for(published, 'formal', arm, row)
             task = tasks.get(key)
@@ -107,7 +109,7 @@ def production(bench, published):
             results[key] = dict(status=value['status'], failed=not base.runtime.healthy_result(value),
                                 diagnostics=value['diagnostics'], source=str(path), sha256=sha)
     return rows, results, coverage, dict(benchmark=str(bench), benchmark_files=BENCH_FILES,
-                                        published=str(published), files=files)
+                                        published=str(published), files=files, **({'arms': arms} if arms == ['pure'] else {}))
 
 
 def controls():
@@ -134,10 +136,12 @@ def controls():
 
 def prepare(out, rows, results, coverage, source):
     jobs, bindings = {}, []
+    arms = source.get('arms', ARMS)
+    require(list(arms) in (['pure'], list(ARMS)), 'Invalid judge population')
     for row in rows:
         sid = row['id']
         require(sid not in frozen.sources.STEP_HOLD, 'Question outside the authorized cohort')
-        for arm in ARMS:
+        for arm in arms:
             item = results[sid, arm]
             keys = []
             for diagnosis in item['diagnostics']:
@@ -147,6 +151,7 @@ def prepare(out, rows, results, coverage, source):
                 keys.append(key)
             bindings.append(dict(id=sid, arm=arm, status=item['status'], failed=item['failed'], keys=keys,
                                  published_sha256=item['sha256'], path=item.get('source')))
+    require(len(results) == len(bindings) == len(rows) * len(arms), 'Unexpected published tasks')
     publication = dict(source=source, coverage=coverage, bindings=bindings)
     cfg = dict(protocol=match.VERSION, publication_sha256=vr.digest(publication), instruction=match.INSTRUCTION,
                code={name: vr.sha(transport.a.ROOT / name) for name in CODE},
@@ -155,7 +160,21 @@ def prepare(out, rows, results, coverage, source):
                max_tokens=MAX_OUTPUT, limits=dict(context_window=131072, request_timeout_seconds=1200))
     plan = dict(configuration=cfg, configuration_sha256=vr.digest(cfg))
     write(out / 'publication.json', publication)
-    write(out / 'judge_plan.json', plan)
+    plan_path = out / 'judge_plan.json'
+    if plan_path.exists():
+        saved = vr.read(plan_path)
+        if saved['configuration_sha256'] in {
+                '9c13cfcaa35b4d521f774137a8a0cf8aebdf38497b12eabdf39f1bf11cebfa6c',
+                '685441da5fe7a014c541df938c8f8ceadfc8f4f2b7cb65d6dc61148dcda514e8'}:
+            # The earlier four-arm receipts predate arm selection and final-bench binding.
+            # Their exact inputs, checker outputs, judge messages, validator and reducer must still agree.
+            earlier_code = {**cfg['code'],
+                'scripts/run_step_match_judge.py': '325b07bab930c8f7557dec7396df2ba56061bcb91eb7b8395406b2cc23507110',
+                'scripts/run_final_answer_revision.py': 'fb8bbcdfd15ad0ef4941c22f8b4b03753b7ecc243dd2bffc048f0f41bb352cfc'}
+            require(saved['configuration'] == dict(cfg, code=earlier_code) and
+                    vr.digest(saved['configuration']) == saved['configuration_sha256'], 'Frozen judge contract drift')
+            plan = saved
+    write(plan_path, plan)
     return plan, bindings, jobs
 
 
@@ -190,7 +209,7 @@ def evaluate(out, data, *, tokenizer=None, client=None, offline=False, stop=None
         vr.atomic(out / 'status.json', dict(status, state='incomplete'))
         raise ValueError(f"Judge coverage incomplete: {len(missing)} missing, {len(failed)} content failures")
     by_id = {row['id']: row for row in rows}
-    groups = {a: [] for a in ARMS}
+    groups = {a: [] for a in source.get('arms', ARMS)}
     for b in bindings:
         sid, arm = b['id'], b['arm']
         groups[arm].append(match.score_row(by_id[sid], results[sid, arm], [decisions[k] for k in b['keys']]))

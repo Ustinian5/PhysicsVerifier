@@ -7,7 +7,6 @@ classification failures remain failures rather than fabricated negative labels.
 import argparse
 from collections import Counter
 from contextlib import contextmanager, nullcontext
-import copy
 import hashlib
 import json
 import math
@@ -51,7 +50,8 @@ def bind(files, path):
 def source_hashes(*, english=False):
     values = step.source_files()
     if english:
-        values['rule_framework/verifier_english.py'] = vr.sha(a.ROOT / 'rule_framework/verifier_english.py')
+        for name in ('rule_framework/verifier_english.py', 'scripts/frozen_verifier_exam_answers.py'):
+            values[name] = vr.sha(a.ROOT / name)
     for n in ('rule_framework/final_answer_revision.py', 'rule_framework/final_answer_protocol.py',
               'scripts/run_final_answer_revision.py', 'scripts/audit_final_answer_metrics.py',
               'scripts/run_final_answer_labels.py'):
@@ -70,106 +70,59 @@ def control_rows():
     return rows
 
 
-def prepare(out, root, *, prompt_profile=None):
-    require(Path('/proc').exists(), 'Formal preparation runs on the server')
-    require(not (out / 'plan.json').exists(), 'Revision already prepared')
-    current = root / 'aligned_old99/evaluation_revision'
-    cp = step.verify(current)['configuration']
-    english = en.active(cp if prompt_profile is None else {'prompt_profile': prompt_profile})
-    archive = root / 'corrected/pipeline/check_prompt_revision_bilingual'
-    src = root / 'corrected'
-    files = {}
-    questions = bind(files, src / 'final_labels/questions.json')
-    refs = {x['id']: x for x in bind(files, src / 'final_labels/references_private.json')}
-    lc = bind(files, src / 'final_labels/plan.json')['configuration']
-    old_rows = bind(files, archive / 'final_inputs.json')
-    old_gold = bind(files, archive / 'final_labels_private.json')
-    bind(files, archive / 'final_metrics.json')
-    rows = []
-    for question in questions:
-        sid = question['id']; generation = bind(files, src / 'collection/generated' / (sid + '.json'))
-        require(generation['id'] == sid and
-                generation['signature'] == vr.digest([question, lc['generator_config']]) and
-                generation['model'] == lc['generator_config']['generator'], '30B input/model binding mismatch')
-        ev = generation['evidence']; path = src / 'collection' / ev['file']
-        require(vr.sha(path) == ev['sha256'], '30B raw evidence drift'); files[str(path)] = ev['sha256']
-        row = dict(id=sid, question=question['question'], prediction=generation['prediction'], context='',
-                   reference=refs[sid]['reference'], generation_status=generation['state'],
-                   question_sha256=vr.digest(question['question']), answer_sha256=vr.digest(generation['prediction']),
-                   reference_sha256=vr.digest(refs[sid]['reference']))
-        label_path = src / 'final_labels/labels' / (sid + '.json')
-        if label_path.exists():
-            label = bind(files, label_path)
-            raw = src / 'final_labels' / label['evidence']['file']
-            require(vr.sha(raw) == label['evidence']['sha256'], 'Original label evidence drift')
-            files[str(raw)] = label['evidence']['sha256']
-            require(label['signature'] == vr.digest([dict(question, prediction=row['prediction']), row['reference'], lc]),
-                    'Original label binds another answer/reference')
-            row['old_verdict'] = label['judgment']['verdict'] if label['state'] == 'complete' else None
-        if generation['state'] != 'complete':
-            row['eligibility_failure'] = 'original_30b_generation_incomplete'
-        elif not row['reference'] or any(not s.strip() for s in row['reference']):
-            row['eligibility_failure'] = 'original_reference_missing'
-        rows.append(row)
-    require(len(rows) == 702 and len({r['id'] for r in rows}) == 702, 'Frozen candidate inventory drift')
-    byid = {r['id']: r for r in rows}
-    require(len(old_rows) == 600 and all(p.public(r) == p.public(byid[r['id']]) for r in old_rows),
-            'Old 600 use different 30B answers')
-    require(all(old_gold[sid]['verdict'] == byid[sid]['old_verdict'] for sid in old_gold), 'Old gold mismatch')
-    for name in ('cases', 'skills', 'catalog'):
-        value = bind(files, current / (name + '.json'))
-        immutable(out / (name + '.json'), value)
-    for name in ('plan', 'source_quarantine', 'acceptance'):
-        bind(files, current / (name + '.json'))
-    for name in ('sources', 'isolation', 'bench_questions'):
-        bind(files, current.parent / 'evaluation' / (name + '.json'))
-    for name in ('split', 'family_components'):
-        bind(files, src / 'source_screen' / (name + '.json'))
-    # Remaining original reserve rows must be covered by the same source filter
-    # before they can replace a quarantined old benchmark item.
-    heldout = [dict(id='final:' + r['id'], question=r['question']) for r in rows]
-    heldout += vr.read(current.parent / 'evaluation/bench_questions.json')
-    screen = a.bounded.FamilyScreen(heldout)
-    cases = vr.read(out / 'cases.json'); skills = vr.read(out / 'skills.json')
-    sources = vr.read(current.parent / 'evaluation/sources.json')
-    existing_ids = {sid for d in cases for sid in d['source_ids']}
-    source_map = {r['id']: r for r in sources}
-    candidate_overlaps = []
-    for sid in sorted(existing_ids):
-        material = [d['text'] for d in cases + skills if sid in d['source_ids']]
-        matches = screen.matches(dict(source_map[sid], prediction='\n'.join(material)))
-        if matches:
-            candidate_overlaps.append(dict(source_id=sid, matches=matches))
-    tree = base.p.TreeMemory(vr.read(out / 'catalog.json'))
-    for rid, rule in tree.corpus.leaves.items():
-        matches = screen.matches(dict(id=rid, question='', prediction=json.dumps(rule, ensure_ascii=False)))
-        if matches:
-            candidate_overlaps.append(dict(rule_id=rid, matches=matches))
-    immutable(out / 'isolation_candidates.json', dict(candidates=candidate_overlaps,
-        policy=a.bounded.ISOLATION_POLICY, scope='702 candidate questions plus existing heldouts against retained source/case/skill texts and all rule leaves',
-        semantic_family_independence_proven=False, known_watermelon_source_absent=(step.old.KNOWN_SOURCE not in existing_ids)))
-    require(step.old.KNOWN_SOURCE not in existing_ids, 'Known exposed source still retained')
-    immutable(out / 'candidates.json', rows)
-    pilot = copy.deepcopy(cp['pilot_inputs'])
-    require(len(pilot) == 6 and not {r['id'] for r in pilot} & set(byid), 'Development/test overlap')
-    immutable(out / 'pilot_inputs.json', pilot)
-    cfg = dict(protocol=p.VERSION, root=str(root), archive=str(archive), material_parent=str(current),
-        source_hashes=source_hashes(english=english), dependencies=files,
-        candidates_sha256=vr.sha(out/'candidates.json'), pilot_sha256=vr.sha(out/'pilot_inputs.json'),
-        material_hashes={name: vr.sha(out/(name+'.json')) for name in ('cases','skills','catalog')},
-        isolation_sha256=vr.sha(out/'isolation_candidates.json'), contract=p.contract(english=english),
-        limits=cp['limits'], api_base=cp['api_base'], model=base.r.EXPECTED_MODEL,
-        fixed_harmony_date=a.DATE, controls=control_rows(), quota_per_class=300,
-        service_lock=str(root/'organization_service_18083.lock'), human_gold=False,
-        review_policy='All eligible original candidates without an explicit assistant disposition receive one blind 120B reference audit; '
-                      'different or uncertain verdicts require explicit assistant adjudication before release.',
-        classification_failure_policy='Retain without resampling; report coverage separately.')
-    if english:
-        cfg['prompt_profile'] = en.PROFILE
-    immutable(out/'plan.json', dict(configuration=cfg, configuration_sha256=vr.digest(cfg)))
-    base.old.emit(out, 'prepared_review_pending', candidates=len(rows),
-                  preexcluded=sum(bool(r.get('eligibility_failure')) for r in rows),
-                  isolation_candidates=len(candidate_overlaps), model_calls=0)
+def prepare(out, root, *, prompt_profile=None, material_parent=None):
+    require(Path('/proc').exists(), 'Prepare the frozen final benchmark on the server')
+    require(prompt_profile in (None, en.PROFILE), 'Unknown final checker profile')
+    require(not (out/'plan.json').exists(), 'Final evaluation already prepared')
+    require(material_parent is not None, 'Specify the material publication for a new four-arm final check')
+    from scripts import frozen_verifier_exam_answers as exams
+    from scripts import frozen_bm25_sources as libraries
+    from scripts.run_final_exam_reference import HOLD
+    bench = root / 'aligned_old99/final_revision_balanced'
+    release_path = bench / 'bench_release.json'
+    require(vr.sha(release_path) == 'ff89b8ef9f0fc9d894f06051057e634849db572e27e34f970dcc8273ec28af91',
+            'Different frozen 474-question bench')
+    release = vr.read(release_path)
+    files = {str(release_path): vr.sha(release_path)}
+    paths = {'bench_release': release_path}
+    for name, field in [('inputs','inputs_sha256'), ('labels_private','labels_sha256'), ('dispositions','dispositions_sha256')]:
+        path = bench / (name + '.json')
+        require(vr.sha(path) == release[field], 'Frozen ' + name + ' changed')
+        paths[name] = path
+    all_rows = vr.read(paths['inputs'])
+    labels = vr.read(paths['labels_private'])
+    require(len(all_rows) == 474 and Counter(r['verdict'] for r in labels.values()) ==
+            {'correct': 237, 'incorrect': 237}, 'Different frozen classes')
+    held = libraries.FINAL_HOLD | {HOLD}
+    rows = [r for r in all_rows if r['id'] not in held]
+    require(len(rows) == 467, 'Different previously approved final comparison scope')
+    references = exams.official(root, 'final', rows, files)
+    pilots, pilot_refs = exams.development(root, a.ROOT / 'data/combined_language_only.json', files)
+    require(not references.keys() & pilot_refs.keys(), 'Development/test overlap')
+    references.update(pilot_refs)
+    materials, source = step.old.released_libraries(material_parent, root / 'aligned_old99/evaluation', files)
+    paths.update(materials, pilot_inputs=bench / 'pilot_inputs.json')
+    hashes = {}
+    for name, path in paths.items():
+        files[str(path)] = hashes[name] = vr.sha(path)
+        link = out / (name + '.json')
+        if link.is_symlink():
+            require(link.resolve(strict=True) == path.resolve(), 'Released link changed')
+        else:
+            link.symlink_to(path.resolve())
+    prior_file = root / 'aligned_old99/evaluation/plan.json'
+    require(vr.sha(prior_file) == 'bd1dfa374044e22c1349853b0709bea8b4a8cfdc587c55dac3d37c06194df23b',
+            'Different verifier runtime contract')
+    files[str(prior_file)] = vr.sha(prior_file)
+    prior = vr.read(prior_file)['configuration']
+    cfg = dict(protocol=p.VERSION, root=str(root), frozen_benchmark=str(bench), material_source=source,
+               prompt_profile=en.PROFILE, contract=p.contract(english=True), released_files=hashes,
+               dependencies=files, source_hashes=source_hashes(english=True), model=base.r.EXPECTED_MODEL,
+               limits=prior['limits'], fixed_harmony_date=prior['fixed_harmony_date'], api_base=prior['api_base'],
+               check_exam_references=references, exam_reference_required=True, eligible_ids=[r['id'] for r in rows],
+               registered_questions=len(all_rows), held_ids=sorted(held), human_gold=False)
+    immutable(out / 'plan.json', dict(configuration=cfg, configuration_sha256=vr.digest(cfg)))
+    return verify(out)
 
 
 def execution_plan(out, *, register=False, prepared=None):
@@ -207,6 +160,13 @@ def verify(out, *, register=False):
     # Verify all immutable inputs before issuing an execution-only amendment.
     original = vr.read(out/'plan.json'); c = original['configuration']
     require(vr.digest(c) == original['configuration_sha256'], 'Revision plan drift')
+    if c.get('frozen_benchmark'):
+        require(c['source_hashes'] == source_hashes(english=True) and c['exam_reference_required']
+                and c['contract'] == p.contract(english=True), 'Reference-aware final protocol drift')
+        for name, sha in c['released_files'].items():
+            require(vr.sha(out / (name + '.json')) == sha, 'Frozen benchmark/material changed: ' + name)
+        vr.EvidenceCache(out/'evidence_cache.json').check(c['dependencies'])
+        return original
     for key, name in [('candidates_sha256','candidates.json'),('pilot_sha256','pilot_inputs.json'),
                       ('isolation_sha256','isolation_candidates.json')]:
         require(c[key] == vr.sha(out/name), 'Frozen data drift: ' + name)
@@ -478,6 +438,11 @@ def freeze_bench(out):
 
 def released(out, plan):
     release=vr.read(out/'bench_release.json')
+    if plan['configuration'].get('frozen_benchmark'):
+        hashes = plan['configuration']['released_files']
+        require(all(vr.sha(out/(key+'.json')) == hashes[key] for key in
+                    ('bench_release','labels_private','inputs','dispositions')), 'Original bench release changed')
+        return vr.read(out/'dispositions.json')
     require(release['configuration_sha256']==plan['configuration_sha256'], 'Released benchmark configuration changed')
     for path,digest in release['files'].items():require(vr.sha(Path(path))==digest,'Released review changed')
     require(vr.sha(out/'inputs.json')==release['inputs_sha256'] and
@@ -565,10 +530,21 @@ def run_question(out, row, phase, plan, tokenizer, client, memories):
             input_sha256=vr.digest(p.public(row)),configuration_sha256=plan['configuration_sha256']))
 
 
+def eligible_inputs(rows, config):
+    indices = config['eligible_ids']
+    held = set(config['held_ids'])
+    eligible = [r for r in rows if r['id'] not in held]
+    require(len(rows) == config['registered_questions'] and [r['id'] for r in eligible] == indices
+            and len(rows) == len(eligible) + len(held), 'Registered/evaluated cohort mismatch')
+    return eligible
+
+
 def run_checks(out, plan, tokenizer, client, pilot):
     memories=stores(out)
     rows=vr.read(out/('pilot_inputs.json' if pilot else 'inputs.json'))
     if not pilot:
+        if plan['configuration'].get('frozen_benchmark'):
+            rows = eligible_inputs(rows, plan['configuration'])
         released(out,plan)
         accepted=vr.read(out/'pilot_acceptance.json')
         require(accepted['passed'] and accepted['configuration_sha256']==plan['configuration_sha256'],'Pilot not accepted')
@@ -666,6 +642,12 @@ def score(out):
     plan=verify(out);released(out,plan)
     english = en.active(plan['configuration'])
     rows=vr.read(out/'inputs.json');labels={sid:d['verdict'] for sid,d in vr.read(out/'labels_private.json').items()}
+    coverage = {}
+    if plan['configuration'].get('frozen_benchmark'):
+        rows = eligible_inputs(rows, plan['configuration'])
+        labels = {r['id']: labels[r['id']] for r in rows}
+        coverage = dict(registered_questions=plan['configuration']['registered_questions'],
+                        evaluated_questions=len(rows), held_ids=plan['configuration']['held_ids'])
     groups={};files={}
     for arm in ARMS:
         predictions={}
@@ -682,7 +664,7 @@ def score(out):
         groups[arm]=measure(labels,predictions)
     immutable(out/'metrics.json',dict(groups=groups,positive_class=p.POSITIVE_CLASS,
         confusion=p.contract()['confusion'],model_calls_for_scoring=0,human_gold=False,
-        benchmark_sha256=vr.sha(out/'bench_release.json'),files=files))
+        benchmark_sha256=vr.sha(out/'bench_release.json'),files=files, **coverage))
     base.old.emit(out,'completed',groups={a:g['original_binary_view'] for a,g in groups.items()})
 
 
@@ -717,17 +699,30 @@ def confirm(out, signature):
 
 
 def prepare_signature(prompt_profile=None):
-    english = en.active({'prompt_profile': prompt_profile})
-    return vr.digest(dict(stage='prepare_final_revision',sources=source_hashes(english=english),contract=p.contract(english=english)))
+    require(prompt_profile in (None, en.PROFILE), 'Unknown final checker profile')
+    return vr.digest(dict(stage='prepare_published_final_benchmark', sources=source_hashes(english=True),
+                          contract=p.contract(english=True)))
 
 
 def repair_signature(out):
     return vr.digest(['register-repair', vr.sha(out/'plan.json'), source_hashes()])
 
 
-def online(out, mode):
+def online(out, mode, *, gpu=4):
     require(Path('/proc').exists(),'Server only')
     plan=verify(out);c=plan['configuration'];code=1
+    if c.get('frozen_benchmark'):
+        require(mode in ('pilot', 'run'), 'This bench is already labeled and frozen')
+        from scripts import serve_frozen_bm25 as node
+        with base.r.run_lock(out/'active.lock'):
+            base.runtime.wait_detached(out, plan['configuration_sha256'])
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(node.host.HOT/'models/gpt-oss-120b', local_files_only=True)
+            with node.service(out, gpu, out/'STOP', plan['configuration_sha256']) as endpoint:
+                require(endpoint == c['api_base'], 'Wrong official-reference checker endpoint')
+                with httpx.Client(trust_env=False) as client:
+                    run_checks(out, plan, tokenizer, client, pilot=mode == 'pilot')
+        return
     with base.r.run_lock(out/'active.lock'),base.r.run_lock(Path(c['service_lock'])):
         (out/'runner.pid').write_text(str(os.getpid()))
         try:
@@ -753,16 +748,26 @@ def main():
     parser.add_argument('mode',choices=['prepare','verify','review','freeze','rescore-archive','pilot','run','score','confirm-detached','status','register-repair','confirm-repair'])
     parser.add_argument('--output',type=Path,required=True);parser.add_argument('--root',type=Path)
     parser.add_argument('--prompt-profile', choices=[en.PROFILE], help='Bind new online prompts when preparing from an older input release')
+    parser.add_argument('--material-parent', type=Path, help='Released libraries for a new English four-arm comparison')
+    parser.add_argument('--gpu', type=int, choices=(4, 5, 6, 7), default=4)
     parser.add_argument('--await-release',action='store_true',help='Require fresh reconnect acceptance for detached offline work')
     args=parser.parse_args();out=args.output.resolve()
     require(Path('/proc').exists(),'Formal preparation/execution/scoring runs on server')
     require(args.prompt_profile is None or args.mode in ('prepare', 'confirm-detached'), 'Prompt profile is frozen at prepare')
+    if (out/'plan.json').exists() and vr.read(out/'plan.json')['configuration'].get('frozen_benchmark'):
+        require(args.mode not in ('review', 'freeze', 'rescore-archive', 'register-repair', 'confirm-repair'),
+                'This run uses the existing published benchmark; labels and dispositions are already frozen')
     if args.mode=='confirm-detached':
         confirm(out,verify(out)['configuration_sha256'] if (out/'plan.json').exists() else prepare_signature(args.prompt_profile))
     elif args.mode=='confirm-repair':confirm(out/'repair_validation',repair_signature(out))
     elif args.mode=='verify':verify(out);print('verified')
-    elif args.mode=='status':verify(out);print(dict(Counter(x['state'] for x in dispositions(out).values())))
-    elif args.mode in {'review','pilot','run'}:online(out,args.mode)
+    elif args.mode=='status':
+        config = verify(out)['configuration']
+        if config.get('frozen_benchmark'):
+            print(dict(registered=config['registered_questions'], eligible=len(config['eligible_ids'])))
+        else:
+            print(dict(Counter(x['state'] for x in dispositions(out).values())))
+    elif args.mode in {'review','pilot','run'}:online(out,args.mode,gpu=args.gpu)
     else:
         require(args.await_release,'Start offline work detached with --await-release, then confirm from a new SSH session')
         with base.r.run_lock(out/'active.lock'):
@@ -777,7 +782,8 @@ def main():
                 require(not (out/'STOP').exists(),'STOP requested')
                 if args.mode=='prepare':
                     require(args.root is not None,'--root is required for prepare')
-                    prepare(out,args.root.resolve(),prompt_profile=args.prompt_profile)
+                    prepare(out,args.root.resolve(),prompt_profile=args.prompt_profile,
+                            material_parent=args.material_parent.resolve() if args.material_parent else None)
                 elif args.mode=='register-repair':
                     effective=verify(out,register=True)
                     base.old.emit(control,'repair_bound',configuration_sha256=effective['configuration_sha256'],model_calls=0)

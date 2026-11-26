@@ -7,6 +7,7 @@ import argparse
 from contextlib import ExitStack, contextmanager
 import copy
 import hashlib
+import json
 import os
 from pathlib import Path
 import time
@@ -16,6 +17,7 @@ from rule_framework import verifier_english as en
 
 import httpx
 
+from scripts import frozen_verifier_exam_answers as exams
 from scripts import run_aligned_organization as a
 from scripts.run_qwen30b_step_checks import reference_rows
 
@@ -30,7 +32,7 @@ def code_hashes(*, english=False):
         'scripts/run_bench_reannotation.py', 'scripts/bench_reannotation_runtime.py'}
     if english:
         from scripts import run_step_match_judge as judge
-        names.update((*judge.CODE, 'rule_framework/verifier_english.py', 'scripts/resume_aligned_step_evaluation.py',
+        names.update((*judge.CODE, 'scripts/frozen_verifier_exam_answers.py', 'rule_framework/verifier_english.py', 'scripts/resume_aligned_step_evaluation.py',
                       'scripts/serve_frozen_bm25.py', 'scripts/run_node14_final_pilot.py'))
     return {n: vr.sha(a.ROOT / n) for n in sorted(names)}
 
@@ -106,19 +108,9 @@ def score_parity(legacy):
                 exact_full_score_objects=True, scores=values, old_metrics_sha256=vr.sha(legacy / 'metrics.json'))
 
 
-def prepare(out, parent, *, prompt_profile=None, benchmark=None):
-    """Read a released material snapshot and the frozen benchmark as data."""
-    from scripts import run_step_match_judge as judge
-    require(not (out / 'plan.json').exists(), 'Prepared already; never overwrite a release')
-    require(prompt_profile in (None, en.PROFILE), 'Unknown prompt profile')
-    bench = benchmark or (parent / 'evaluation' if (parent / 'evaluation/inputs.json').exists() else judge.frozen.PARENT)
-    rows, coverage = judge.benchmark(bench)
-    files = {str(bench / name): sha for name, sha in judge.BENCH_FILES.items()}
-    runtime_plan = bench / 'plan.json'
-    require(vr.sha(runtime_plan) == 'bd1dfa374044e22c1349853b0709bea8b4a8cfdc587c55dac3d37c06194df23b',
-            'Frozen checker configuration changed')
-    prior = vr.read(runtime_plan)['configuration']
-    files[str(runtime_plan)] = vr.sha(runtime_plan)
+def released_libraries(parent, bench, files):
+    from scripts import run_frozen_step_bm25 as frozen
+    require(parent is not None, 'Four-arm evaluation needs a released library parent')
     pc = vr.read(parent / 'plan.json')
     require(vr.digest(pc['configuration']) == pc['configuration_sha256'], 'Parent input plan changed')
     files[str(parent / 'plan.json')] = vr.sha(parent / 'plan.json')
@@ -144,9 +136,38 @@ def prepare(out, parent, *, prompt_profile=None, benchmark=None):
         paths = {k: Path(flat['material_path']) / (k + '.json') for k in ('cases', 'skills')}
         require(all(vr.sha(p) == flat['files'][p.name] for p in paths.values()), 'Flat library changed')
         paths['catalog'] = parent / 'evaluation_revision/catalog.json'
-        require(vr.sha(paths['catalog']) == source['measured_tree_sha256'] == judge.frozen.sources.TREE, 'Tree changed')
+        require(vr.sha(paths['catalog']) == source['measured_tree_sha256'] == frozen.sources.TREE, 'Tree changed')
         files[str(source_path)] = vr.sha(source_path)
         material_source = 'Frozen common-first-review n2000 release'
+    return paths, material_source
+
+
+def prepare(out, parent, *, prompt_profile=None, benchmark=None, pure_only=False):
+    """Read a released material snapshot and the frozen benchmark as data."""
+    from scripts import run_step_match_judge as judge
+    require(not (out / 'plan.json').exists(), 'Prepared already; never overwrite a release')
+    require(prompt_profile in (None, en.PROFILE), 'Unknown prompt profile')
+    bench = benchmark or (parent / 'evaluation' if parent and (parent / 'evaluation/inputs.json').exists() else judge.frozen.sources.RESULTS / 'aligned_old99/evaluation')
+    rows, coverage = judge.benchmark(bench)
+    files = {str(bench / name): sha for name, sha in judge.BENCH_FILES.items()}
+    runtime_plan = bench / 'plan.json'
+    require(vr.sha(runtime_plan) == 'bd1dfa374044e22c1349853b0709bea8b4a8cfdc587c55dac3d37c06194df23b',
+            'Frozen checker configuration changed')
+    prior = vr.read(runtime_plan)['configuration']
+    files[str(runtime_plan)] = vr.sha(runtime_plan)
+    # The original bench may be a symlink to the archive; the paired reference release lives on node14.
+    root = bench.parent.parent
+    if not (root / 'step_exam_reference/source_answers.json').exists():
+        root = judge.frozen.sources.RESULTS
+    references = exams.official(root, 'step', rows, files)
+    controls, dev_refs = exams.development(root, a.ROOT / 'data/combined_language_only.json', files)
+    require(not (references.keys() & dev_refs.keys()), 'Benchmark/development overlap')
+    references.update(dev_refs)
+    arms = ['pure'] if pure_only else list(base.p.ARMS)
+    if pure_only:
+        paths, material_source = {}, None
+    else:
+        paths, material_source = released_libraries(parent, bench, files)
     paths['inputs'] = bench / 'inputs.json'
     released = {}
     for name, path in paths.items():
@@ -159,10 +180,12 @@ def prepare(out, parent, *, prompt_profile=None, benchmark=None):
     c = {k: prior[k] for k in ('api_base', 'model', 'model_files', 'limits', 'controls', 'arms', 'fixed_harmony_date',
                                'budget_limits', 'query_max_tokens', 'reference_token_cap', 'max_items', 'tree_branches')}
     c.update(protocol=ENGLISH_VERSION, prompt_profile=en.PROFILE, pure_prompt=en.STEP_DIRECT, check_prompt=en.STEP_CHECK,
-             prepare_instruction=en.QUERY, prepare_arms=base.p.prepared_arms(english=True), parent=str(parent),
+             prepare_instruction=en.QUERY, prepare_arms=[arm for arm in arms if arm != 'pure'], arms=arms,
+             controls=controls, check_exam_references=references, exam_reference_required=True,
+             parent=str(parent) if parent else None,
              source_hashes=code_hashes(english=True), dependencies=files, released_files=released,
              step_match_judge=judge.match.VERSION, step_benchmark=str(bench), cohort=coverage,
-             sample_ids=[r['id'] for r in rows], planned_checks=len(rows) * len(base.p.ARMS), material_source=material_source,
+             sample_ids=[r['id'] for r in rows], planned_checks=len(rows) * len(arms), material_source=material_source,
              formal_released=True, human_gold=False)
     vr.atomic(out / 'plan.json', dict(configuration=c, configuration_sha256=vr.digest(c)))
     return verify(out)
@@ -241,6 +264,30 @@ def score(out, plan=None):
     return report
 
 
+def verify_exam_delivery(out, phase, row, arm, config, tokenizer, result):
+    if not config.get('exam_reference_required'):
+        return
+    answer = base.check_options(row, config)['official_reference']
+    if arm != 'pure' and result.get('failure_stage') == 'prepare':
+        return
+    turn = 'turn_01' if arm == 'pure' else 'turn_02'
+    folder = base.path_for(out, phase, arm, row).parent / turn
+    messages = vr.read(folder / 'request.json')['request']['messages']
+    body = messages[-1]['content']
+    # CHECK appends an instruction after the JSON; the direct request is just the JSON object.
+    payload, _ = json.JSONDecoder().raw_decode(body)
+    require(payload.get(en.EXAM_REFERENCE) == answer, 'Exam answer missing from the actual CHECK')
+    if arm == 'pure':
+        require(messages == base.p.direct_messages(row, official_reference=answer),
+                'Extra or missing input in pure baseline')
+    else:
+        require(messages[:2] == base.p.query_messages(row, english=True)
+                and en.EXAM_REFERENCE not in messages[1]['content'], 'Exam answer exposed in PREPARE')
+    raw = vr.read(folder / 'response.sse')
+    actual = tokenizer.decode(raw['prompt_token_ids'], skip_special_tokens=False)
+    require(body in actual, 'Exam answer missing from the model-visible input tokens')
+
+
 def check_published(out, row, phase, arm, memory, plan, tokenizer, client):
     from scripts import resume_aligned_step_evaluation as recovery
     shared = (phase == 'formal' and 'step_match_judge' in plan['configuration'] and arm != 'pure')
@@ -282,9 +329,11 @@ def run(out, *, gpu=4):
                 require(actual == vr.read(Path(c['legacy']) / 'runtime.json'), 'Historical runtime package/model mismatch')
                 base.old.bind_runtime(out / 'runtime.json', actual)
             tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True, trust_remote_code=False)
-            memories = dict(pure=None, case_rag=base.p.FlatMemory(vr.read(out / 'cases.json')),
-                flat_skills=base.p.FlatMemory(vr.read(out / 'skills.json')),
-                rule_tree=base.p.TreeMemory(vr.read(out / 'catalog.json')))
+            memories = {'pure': None}
+            if any(arm != 'pure' for arm in c['arms']):
+                memories.update(case_rag=base.p.FlatMemory(vr.read(out / 'cases.json')),
+                                flat_skills=base.p.FlatMemory(vr.read(out / 'skills.json')),
+                                rule_tree=base.p.TreeMemory(vr.read(out / 'catalog.json')))
             with a.configured(out, tokenizer), reused_controls(out, plan), httpx.Client(trust_env=False) as client:
                 for phase, rows in [('controls', c['controls']), ('formal', vr.read(out / 'inputs.json'))]:
                     if phase == 'formal':
@@ -296,17 +345,20 @@ def run(out, *, gpu=4):
                                 'Released-material controls not accepted')
                     results = []
                     for i, row in enumerate(rows):
-                        arms = c['arms'][i % 4:] + c['arms'][:i % 4]
+                        offset = i % len(c['arms'])
+                        arms = c['arms'][offset:] + c['arms'][:offset]
                         if en.active(c):
                             arms = ['pure', *(arm for arm in arms if arm != 'pure')]
                         for arm in arms:
                             require(not (out / 'STOP').exists(), 'STOP requested')
-                            results.append(check_published(out, row, phase, arm, memories[arm], plan, tokenizer, client))
+                            result = check_published(out, row, phase, arm, memories[arm], plan, tokenizer, client)
+                            verify_exam_delivery(out, phase, row, arm, c, tokenizer, result)
+                            results.append(result)
                     if phase == 'controls':
-                        require(len(results) == 20 and all(base.runtime.healthy_result(r) and r['protocol_audit']['passed']
+                        require(len(results) == len(rows) * len(c['arms']) and all(base.runtime.healthy_result(r) and r['protocol_audit']['passed']
                                 for r in results), 'Control content/protocol failure; no bulk release')
                         vr.atomic(out / 'engineering_acceptance.json', dict(configuration_sha256=plan['configuration_sha256'],
-                            passed=True, checks=20, physical_quality_certified=False, score_threshold_used=False))
+                            passed=True, checks=len(results), physical_quality_certified=False, score_threshold_used=False))
             if judged:
                 # Close the checker hooks before the independent conversations start.
                 data = judge.production(Path(c['step_benchmark']), out)
@@ -334,14 +386,17 @@ def main():
     parser.add_argument('--prompt-profile', choices=[en.PROFILE], help='Bind new online prompts when preparing from an older input release')
     parser.add_argument('--benchmark', type=Path, help='Frozen step benchmark for a new English release')
     parser.add_argument('--gpu', type=int, choices=(4, 5, 6, 7), default=4)
+    parser.add_argument('--pure-only', action='store_true', help='Freeze only the direct 120B baseline')
     args = parser.parse_args(); out = args.output.resolve()
+    require(not args.pure_only or args.command == 'prepare', 'Arms are frozen at prepare')
     require(args.prompt_profile is None or args.command == 'prepare', 'Prompt profile is frozen at prepare')
     if args.command == 'prepare':
-        if args.parent is None:
-            parser.error('prepare requires --parent')
-        parent = args.parent.resolve()
+        if args.parent is None and not args.pure_only:
+            parser.error('four-arm prepare requires --parent')
+        parent = args.parent.resolve() if args.parent else None
         with base.r.run_lock(out / 'active.lock'):
-            prepare(out, parent, prompt_profile=args.prompt_profile, benchmark=args.benchmark.resolve() if args.benchmark else None)
+            prepare(out, parent, prompt_profile=args.prompt_profile, benchmark=args.benchmark.resolve() if args.benchmark else None,
+                    pure_only=args.pure_only)
     elif args.command == 'verify': verify(out)
     elif args.command == 'score': score(out)
     elif args.command == 'run': run(out, gpu=args.gpu)

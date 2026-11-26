@@ -35,6 +35,8 @@ def active(config):
 
 def bound_exam_answer(config, sample_id, input_sha256):
     if 'check_exam_references' not in config:
+        if config.get('exam_reference_required'):
+            raise ValueError('Required current-problem exam answers are missing')
         return None
     if not active(config):
         raise ValueError('Reference-aware checks require the English profile')
