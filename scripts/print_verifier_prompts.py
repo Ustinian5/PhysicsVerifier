@@ -4,6 +4,7 @@ import json
 from rule_framework import step_match, bounded_tree, final_answer_revision as final, flat_skill_rag as step
 from rule_framework import organization_followup, semantic_index_retrieval as selection, verifier_english as en
 from scripts import continuous_context_v2 as quotes, pilot_retrieval_fusion as fusion
+from scripts import repair_step_judge_locations as judge_location
 from scripts import rebuild_qwen30b_corpus as solver, run_bench_reannotation as annotator
 from scripts import run_combined_source_screen as screen, run_corrected_extraction as build
 from scripts import run_timed_semantic_retrieval as timed, replay_retrieval_rank_role as rank_role
@@ -75,10 +76,13 @@ def render():
         show(name + ' / CHECK with a historical RAG case', rag[-1:])
     show('Step evidence-quote repair', [dict(role='user', content=quotes.repair_message(
         {'diagnostics':[{'evidence':{'quote':'3 metres per second'}}]}, [0], english=True))])
-    show('Independent post-publication step matching', step_match.messages(row, dict(
+    judge_messages = step_match.messages(row, dict(
         message='The stated speed is inconsistent with distance divided by time.', evidence={'quote': row['prediction']}),
         [dict(root_id='E1', claim='The numerical speed is incorrect.', reason='12 m divided by 3 s gives 4 m/s.',
-              correct_relation='v = d/t', premises='The given speed is constant.', quote=row['prediction'])]))
+              correct_relation='v = d/t', premises='The given speed is constant.', quote=row['prediction'])])
+    show('Independent post-publication step matching', judge_messages)
+    show('Evidence location for 31 failed pure baseline citations, November 26', judge_location.location_messages(
+        judge_messages, dict(disposition='same_root', root_ids=['E1'])))
     prefix = final.query_messages(row, english=True) + [dict(role='assistant', content=json.dumps(queries))]
     show('Retrieval development / English query rewrite', fusion.rewrite_messages(row,prefix,english=True)[-1:])
     show('Semantic candidate ranking / page or merge', timed.model_text(selection.RANK+'24.',

@@ -516,6 +516,22 @@ User
 {"active_reference_roots": [{"claim": "The numerical speed is incorrect.", "correct_relation": "v = d/t", "premises": "The given speed is constant.", "quote": "The speed is 3 m/s.", "reason": "12 m divided by 3 s gives 4 m/s.", "root_id": "E1"}], "context": "", "problem": "A cart travels 12 m in 3 s at constant speed. Find its speed.", "published_diagnosis": {"message": "The stated speed is inconsistent with distance divided by time.", "quote": "The speed is 3 m/s."}, "student_solution": "The speed is 3 m/s."}
 ````
 
+## Evidence location for 31 failed pure baseline citations, November 26
+
+System
+
+````text
+Locate the statement in this student's numbered solution that the published diagnosis actually criticizes. The previous judge classified the claim, but its quoted evidence could not be verified. Select the shortest continuous range of original lines that shows the claim in context. Read later corrections. A shared topic, a correct reference statement or an unrelated occurrence is insufficient. For an earlier same_root judgment, the passage must support the stated cause and correction direction for each proposed root. If the evidence is absent or you cannot identify a sufficient passage, return null for both line numbers.
+
+Return only one JSON object with inclusive, one-based line numbers: {"start_line":3,"end_line":4} or {"start_line":null,"end_line":null}. Do not copy the passage or issue a new root classification.
+````
+
+User
+
+````text
+{"active_reference_roots": [{"claim": "The numerical speed is incorrect.", "correct_relation": "v = d/t", "premises": "The given speed is constant.", "quote": "The speed is 3 m/s.", "reason": "12 m divided by 3 s gives 4 m/s.", "root_id": "E1"}], "context": "", "earlier_judgment": {"disposition": "same_root", "root_ids": ["E1"]}, "numbered_student_solution": [[1, "The speed is 3 m/s."]], "problem": "A cart travels 12 m in 3 s at constant speed. Find its speed.", "published_diagnosis": {"message": "The stated speed is inconsistent with distance divided by time.", "quote": "The speed is 3 m/s."}}
+````
+
 ## Retrieval development / English query rewrite
 
 User
