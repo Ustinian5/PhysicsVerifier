@@ -4,6 +4,8 @@
 
 node14 使用个人解释器 `/data0/zengzheni/PhysicsVerifier-huhengyuan/envs/physicsverifier/bin/python`。步骤级模块为 `scripts.run_aligned_step_evaluation`。纯组使用 `prepare --pure-only --output <新目录>`，四组使用 `prepare --parent <已验收的参考答案指导建库目录> --output <新目录>`。两者均复用原6道开发题、99道可测题。后台执行 `run --output <新目录> --gpu 4`，重新连接后以 `confirm-detached --output <新目录>` 放行。程序逐题比对公开输入、历史材料及实际服务输入 token；开发验收通过后执行正式检查和独立步骤裁判。离线复算用 `score --output <新目录>`。[步骤级入口](run_aligned_step_evaluation.py)
 
+11月26日步骤级纯组有31条首轮裁决需要补定位。仅此批次使用 `python -m scripts.repair_step_judge_locations score --published <english_blind_verifier/step_pure>` 离线复算。结果根的 `metrics.json` 汇总原32条有效裁决和31条补裁；`step_judge/location_repair/` 保存补裁清单、逐条原文位置和运行回执。[定位补裁入口](repair_step_judge_locations.py)
+
 题目级新建计划使用 `-m scripts.run_final_answer_revision prepare --root <结果根> --material-parent <已验收的材料发布目录> --output <新目录> --await-release`。该入口复用冻结474题的回答及标签，并沿用上次有参考对照的467道可测题。后台准备、开发验收及正式执行分别使用 `prepare`、`pilot`、`run`，每次重新连接后以同一结果目录执行 `confirm-detached`。[题目级入口](run_final_answer_revision.py)
 
 单独对已发布的冻结 BM25 四组诊断计分时，使用 `python -m scripts.run_step_match_judge run --published <bm25_n2000/step> --output <独立裁判结果目录> --gpu 4`，同样在服务器后台启动，重新连接后将 `run` 换为 `confirm`。开发验收使用 `--controls`。结果目录内的 `publication.json` 绑定原诊断，`judgments/` 保存逐条请求及响应，`details.json` 和 `metrics.json` 保存逐题命中及四组三项。原命令将 `run` 换为 `score` 可在服务关闭后回放。[裁判入口](run_step_match_judge.py) · [计分口径](../docs/效果测评.md#步骤级)
