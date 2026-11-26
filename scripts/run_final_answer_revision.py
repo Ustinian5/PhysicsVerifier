@@ -50,8 +50,7 @@ def bind(files, path):
 def source_hashes(*, english=False):
     values = step.source_files()
     if english:
-        for name in ('rule_framework/verifier_english.py', 'scripts/frozen_verifier_exam_answers.py'):
-            values[name] = vr.sha(a.ROOT / name)
+        values['rule_framework/verifier_english.py'] = vr.sha(a.ROOT / 'rule_framework/verifier_english.py')
     for n in ('rule_framework/final_answer_revision.py', 'rule_framework/final_answer_protocol.py',
               'scripts/run_final_answer_revision.py', 'scripts/audit_final_answer_metrics.py',
               'scripts/run_final_answer_labels.py'):
@@ -75,7 +74,6 @@ def prepare(out, root, *, prompt_profile=None, material_parent=None):
     require(prompt_profile in (None, en.PROFILE), 'Unknown final checker profile')
     require(not (out/'plan.json').exists(), 'Final evaluation already prepared')
     require(material_parent is not None, 'Specify the material publication for a new four-arm final check')
-    from scripts import frozen_verifier_exam_answers as exams
     from scripts import frozen_bm25_sources as libraries
     from scripts.run_final_exam_reference import HOLD
     bench = root / 'aligned_old99/final_revision_balanced'
@@ -96,11 +94,8 @@ def prepare(out, root, *, prompt_profile=None, material_parent=None):
     held = libraries.FINAL_HOLD | {HOLD}
     rows = [r for r in all_rows if r['id'] not in held]
     require(len(rows) == 467, 'Different previously approved final comparison scope')
-    references = exams.official(root, 'final', rows, files)
-    pilots, pilot_refs = exams.development(root, a.ROOT / 'data/combined_language_only.json', files)
-    require(not references.keys() & pilot_refs.keys(), 'Development/test overlap')
-    references.update(pilot_refs)
-    materials, source = step.old.released_libraries(material_parent, root / 'aligned_old99/evaluation', files)
+    step.old.frozen_development_inputs(bench / 'pilot_inputs.json', {r['id'] for r in all_rows}, files)
+    materials, source = step.old.released_libraries(material_parent, files)
     paths.update(materials, pilot_inputs=bench / 'pilot_inputs.json')
     hashes = {}
     for name, path in paths.items():
@@ -119,7 +114,7 @@ def prepare(out, root, *, prompt_profile=None, material_parent=None):
                prompt_profile=en.PROFILE, contract=p.contract(english=True), released_files=hashes,
                dependencies=files, source_hashes=source_hashes(english=True), model=base.r.EXPECTED_MODEL,
                limits=prior['limits'], fixed_harmony_date=prior['fixed_harmony_date'], api_base=prior['api_base'],
-               check_exam_references=references, exam_reference_required=True, eligible_ids=[r['id'] for r in rows],
+               online_reference_visible=False, eligible_ids=[r['id'] for r in rows],
                registered_questions=len(all_rows), held_ids=sorted(held), human_gold=False)
     immutable(out / 'plan.json', dict(configuration=cfg, configuration_sha256=vr.digest(cfg)))
     return verify(out)
@@ -161,8 +156,9 @@ def verify(out, *, register=False):
     original = vr.read(out/'plan.json'); c = original['configuration']
     require(vr.digest(c) == original['configuration_sha256'], 'Revision plan drift')
     if c.get('frozen_benchmark'):
-        require(c['source_hashes'] == source_hashes(english=True) and c['exam_reference_required']
-                and c['contract'] == p.contract(english=True), 'Reference-aware final protocol drift')
+        require(c.get('online_reference_visible') is False and en.online_english(c)
+                and c['source_hashes'] == source_hashes(english=True) and c['contract'] == p.contract(english=True),
+                'Blind final-answer protocol drift')
         for name, sha in c['released_files'].items():
             require(vr.sha(out / (name + '.json')) == sha, 'Frozen benchmark/material changed: ' + name)
         vr.EvidenceCache(out/'evidence_cache.json').check(c['dependencies'])
@@ -338,6 +334,8 @@ def request_once(out, folder, messages, max_tokens, validator, plan, tokenizer, 
     effective = validate_effective_input(raw, tokenizer, c['fixed_harmony_date'])
     actual = tokenizer.decode(raw['prompt_token_ids'],skip_special_tokens=False)
     require(all(m['content'] in actual for m in messages), 'Lost model-visible input or shared prefix')
+    if c.get('online_reference_visible') is False:
+        en.verify_visible_users(actual, messages)
     usage = raw.get('usage') or {}
     require(type(usage.get('prompt_tokens')) is int and type(usage.get('completion_tokens')) is int and
             0 < usage['completion_tokens'] <= max_tokens and
@@ -467,13 +465,9 @@ def stores(out):
                 rule_tree=base.p.TreeMemory(vr.read(out/'catalog.json')))
 
 
-def check_exam_answer(row, config):
-    return en.bound_exam_answer(config, row['id'], vr.digest(p.public(row)))
-
-
 def run_question(out, row, phase, plan, tokenizer, client, memories):
     config = plan['configuration']
-    english, limits = en.active(config), config['limits']
+    english, limits = en.online_english(config), config['limits']
     key = vr.digest(row['id'])[:24]
     query_dir = out/phase/'queries'/key
     prefix = None
@@ -499,8 +493,7 @@ def run_question(out, row, phase, plan, tokenizer, client, memories):
             retrieval = dict(provided_complete_ids=[], reference_tokens=0)
             value, status, reason = None, 'content_failure', 'Shared PREPARE failed'
             if prefix['status'] == 'complete':
-                packet = p.reference_packet(row, arm, prefix['value'], memories[arm], count, english=english,
-                                            official_reference=check_exam_answer(row, config))
+                packet = p.reference_packet(row, arm, prefix['value'], memories[arm], count, english=english)
                 immutable(folder/'reference_packet.json', packet)
                 files[str(folder/'reference_packet.json')] = vr.sha(folder/'reference_packet.json')
                 messages, retrieval = packet['messages'], packet['retrieval']
@@ -509,7 +502,7 @@ def run_question(out, row, phase, plan, tokenizer, client, memories):
             charged, responses, files = 0, 0, {}
             usage = dict(prompt_tokens=0, completion_tokens=0, total_tokens=0)
             retrieval = base.p.no_retrieval()
-            messages = p.direct_messages(row, official_reference=check_exam_answer(row, config))
+            messages = p.direct_messages(row)
         if messages is not None:
             available = limits['wall_seconds_per_sample'] - charged
             require(available > 0, 'Cumulative wall-time budget exhausted before CHECK')
@@ -585,7 +578,7 @@ def verify_arm(row, arm, path, value, prefix, plan):
     require(value['id'] == row['id'] and value['arm'] == arm and
             value['configuration_sha256'] == plan['configuration_sha256'] and
             value['input_sha256'] == vr.digest(p.public(row)), 'Wrong result/cohort binding')
-    english = en.active(plan['configuration'])
+    english = en.online_english(plan['configuration'])
     staged = base.p.uses_preparation(arm, english=english)
     require(staged == (prefix is not None), 'Wrong preparation evidence for this arm')
     packet_path = path.parent/'reference_packet.json'
@@ -600,7 +593,7 @@ def verify_arm(row, arm, path, value, prefix, plan):
         files, charged, responses = {}, 0, 0
         usage = dict(prompt_tokens=0, completion_tokens=0, total_tokens=0)
     if not staged:
-        expected = p.direct_messages(row, official_reference=check_exam_answer(row, plan['configuration']))
+        expected = p.direct_messages(row)
     elif prefix['status'] == 'complete':
         packet = bind(files, packet_path)
         # FlatMemory.view sends id, title, text. Atomic JSON sorts the stored object keys.
@@ -610,8 +603,7 @@ def verify_arm(row, arm, path, value, prefix, plan):
         require(isinstance(references, list) and all(isinstance(ref, dict) and set(ref) == set(fields)
                 for ref in references), 'Invalid stored full-material fields')
         sent = [{k: ref[k] for k in fields} for ref in references]
-        expected = p.continuation_messages(row, prefix['value'], sent, arm=arm, english=english,
-                                            official_reference=check_exam_answer(row, plan['configuration']))
+        expected = p.continuation_messages(row, prefix['value'], sent, arm=arm, english=english)
         require(packet['messages'] == expected and packet['retrieval'] == value['retrieval']
                 and (arm != 'pure' or not packet['references']), 'Wrong shared prefix or supplied materials')
     else:

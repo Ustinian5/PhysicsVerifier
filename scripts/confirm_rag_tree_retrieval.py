@@ -222,8 +222,8 @@ def evaluate(row):
     root,arm,tree,store,old,budget = worker_state
     parent=root/PARENT
     folder = budget.out/'rows'/row['id']
-    if arm == 'pure' and en.active(old['configuration']):
-        messages = final.p.direct_messages(row, official_reference=final.check_exam_answer(row, budget.plan['configuration']))
+    if arm == 'pure' and en.online_english(old['configuration']):
+        messages = final.p.direct_messages(row)
         check = budget.call(folder/'check', messages, budget.limits['max_tokens_per_response'],
                             final.p.original.validate_verdict, [], time.monotonic())
         result = dict(status=check['status'], value=check['value'])

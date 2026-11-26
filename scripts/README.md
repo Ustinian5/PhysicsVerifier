@@ -1,8 +1,8 @@
 # 脚本入口
 
-2026-11-26 两级纯组的正式定义为120B直接核查题干和冻结30B原答。下述两个新建计划入口仍给纯组传入本题官方答案，其当前版本已暂停使用。三个知识组收到本题答案的做法也待用户核对。建库首审继续使用建库题的官方答案，两级 bench 沿用已发布回答与标签。[批次状态](../docs/项目进展.md)
+两级正式 verifier 的四组均隐藏测试题官方答案及 bench 标签。纯120B直接核查题干和冻结30B原答，三个知识组在英文 PREPARE、各库检索后以同一会话 CHECK。三库须来自对照建库题官方答案的同一份首审。[评测协议](../docs/效果测评.md)
 
-node14 运行使用个人解释器 `/data0/zengzheni/PhysicsVerifier-huhengyuan/envs/physicsverifier/bin/python`。步骤级入口为 `-m scripts.run_aligned_step_evaluation`。只跑纯组时使用 `prepare --pure-only --output <新目录>`；四组使用 `prepare --parent <已验收的材料发布目录> --output <新目录>`。显式传入原 `aligned_old99` 会采用已定稿的同批 n2000 三库。两种计划均固定6道开发题、99道正式题及其对应官方答案。后台运行 `run --output <新目录> --gpu 4`，重新连接后执行 `confirm-detached --output <新目录>`。程序核对实际输入 token 中的答案，开发验收通过后运行正式检查及独立120B裁判。`score --output <新目录>` 可离线复算。[步骤级入口](run_aligned_step_evaluation.py)
+node14 使用个人解释器 `/data0/zengzheni/PhysicsVerifier-huhengyuan/envs/physicsverifier/bin/python`。步骤级模块为 `scripts.run_aligned_step_evaluation`。纯组使用 `prepare --pure-only --output <新目录>`，四组使用 `prepare --parent <已验收的参考答案指导建库目录> --output <新目录>`。两者均复用原6道开发题、99道可测题。后台执行 `run --output <新目录> --gpu 4`，重新连接后以 `confirm-detached --output <新目录>` 放行。程序逐题比对公开输入、历史材料及实际服务输入 token；开发验收通过后执行正式检查和独立步骤裁判。离线复算用 `score --output <新目录>`。[步骤级入口](run_aligned_step_evaluation.py)
 
 题目级新建计划使用 `-m scripts.run_final_answer_revision prepare --root <结果根> --material-parent <已验收的材料发布目录> --output <新目录> --await-release`。该入口复用冻结474题的回答及标签，并沿用上次有参考对照的467道可测题。后台准备、开发验收及正式执行分别使用 `prepare`、`pilot`、`run`，每次重新连接后以同一结果目录执行 `confirm-detached`。[题目级入口](run_final_answer_revision.py)
 

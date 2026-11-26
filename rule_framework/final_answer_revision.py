@@ -117,8 +117,8 @@ def staged_prompt(english):
     return en.FINAL_CHECK if english else STAGED_PROMPT
 
 
-def direct_messages(row, *, official_reference=None):
-    return en.direct_messages(public(row), en.FINAL_DIRECT, official_reference=official_reference)
+def direct_messages(row):
+    return en.direct_messages(public(row), en.FINAL_DIRECT)
 
 
 def query_messages(row, *, english=False):
@@ -129,7 +129,7 @@ def query_messages(row, *, english=False):
     return result
 
 
-def continuation_messages(row, queries, references, *, arm, english=False, official_reference=None):
+def continuation_messages(row, queries, references, *, arm, english=False):
     require(memory.uses_preparation(arm, english=english), 'English pure checks must use direct_messages')
     require(arm != 'pure' or not references, 'Pure arm received reference material')
     memory.validate_queries(queries, english=english)
@@ -138,9 +138,6 @@ def continuation_messages(row, queries, references, *, arm, english=False, offic
         references = [en.case_view(item) for item in references]
     result.append(dict(role='assistant', content=json.dumps(queries, ensure_ascii=False)))
     fields = {'stage': 'CHECK', 'Reference material': references}
-    if official_reference is not None:
-        require(english, 'Official references require an explicit reference-aware prompt')
-        fields[en.EXAM_REFERENCE] = en.exam_answer(official_reference)
     content = json.dumps(fields, ensure_ascii=False).replace('<|', '\\u003c|')
     if english:
         content += '\nJudge the committed final answer in the first user message.'
@@ -154,11 +151,11 @@ def continuation_messages(row, queries, references, *, arm, english=False, offic
     return result
 
 
-def reference_packet(row, arm, queries, store, count_tokens, *, english=False, official_reference=None):
+def reference_packet(row, arm, queries, store, count_tokens, *, english=False):
     # Reuse the exact lexical ranking, Top2 tree routing, no-flat-fallback,
     # complete-item admission and 8192 material-token cap from v15.
     def continue_for_arm(r, q, refs):
-        return continuation_messages(r, q, refs, arm=arm, english=english, official_reference=official_reference)
+        return continuation_messages(r, q, refs, arm=arm, english=english)
     return memory.reference_packet(public(row), arm, queries, store, count_tokens,
                                    english=english, render=continue_for_arm)
 

@@ -160,7 +160,7 @@ def test_server_pipeline_runs_judge_after_publication_and_skips_held_input(tmp_p
     judge.vr.atomic(tmp_path / 'inputs.json', [held, row])
     for name in ('cases', 'skills', 'catalog'):
         judge.vr.atomic(tmp_path / (name + '.json'), {})
-    controls = [dict(row, id='control' + str(i)) for i in range(5)]
+    controls = [dict(row, id='control' + str(i)) for i in range(6)]
     cfg = dict(prompt_profile=step.en.PROFILE, step_match_judge=matching.VERSION, step_benchmark=str(tmp_path),
                arms=list(judge.ARMS), api_base='http://127.0.0.1:18083/v1', controls=controls,
                cohort={'held_ids': [held['id']]}, sample_ids=[row['id']])
@@ -182,8 +182,12 @@ def test_server_pipeline_runs_judge_after_publication_and_skips_held_input(tmp_p
         checked.append((phase, item['id'], arm))
         return {'status': 'completed', 'protocol_audit': {'passed': True}}
     monkeypatch.setattr(step.a.bench, 'run_condition', check)
+    # This orchestration fixture substitutes the transport without creating any raw requests.
+    verified = []
+    monkeypatch.setattr(step, 'verify_blind_delivery',
+                        lambda out, phase, item, arm, *args: verified.append((phase, item['id'], arm)))
     def production(bench, out):
-        assert bench == out == tmp_path and len(checked) == 24
+        assert bench == out == tmp_path and len(checked) == 28 and checked == verified
         return data
     monkeypatch.setattr(judge, 'production', production)
     step.run(tmp_path)

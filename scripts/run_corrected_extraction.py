@@ -163,6 +163,8 @@ def call(out, journal, tokenizer, stage, key, payload):
     require(len(json.dumps(body,ensure_ascii=False).encode())<=cfg['max_request_input_bytes'],'Request byte budget exceeded')
     raw,evidence=journal.call(stage,key,body)
     effective=validate_effective_input(raw,tokenizer,cfg['fixed_date'])
+    if en.active(cfg) and stage in {'extract_experience', 'repair_experience'}:
+        en.verify_visible_users(tokenizer.decode(raw['prompt_token_ids'], skip_special_tokens=False), messages)
     text=c.corpus.harmony.decode_response(raw,model=cfg['model'],max_tokens=cfg['max_tokens'],native_tools=None)['content'].strip()
     if text.startswith('```json\n') and text.endswith('```'):text=text[8:-3].strip()
     try:

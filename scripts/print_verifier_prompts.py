@@ -28,10 +28,10 @@ def render():
              'For both tasks the pure 120B reads the problem and the student response and checks them directly. '
              'RAG, flat skills and the rule tree share one English PREPARE, retrieve from their own libraries, '
              'and CHECK in that conversation. All four use the same student response and scoring criteria. '
-             'All checkers receive the same official answer for the current problem. The pure arm receives it in its '
-             'direct request; the knowledge arms receive it in CHECK after retrieval. The frozen benchmark annotations '
-             'are used for scoring. The step annotation examples below are for development; the current evaluation '
-             'reuses the previously published benchmark.', '']
+             'The official answer guides the first 120B review of each construction problem. All four online checkers '
+             'are blind to the test problem\'s official answer and benchmark labels. Only the three knowledge arms '
+             'receive historical material from that review process. Scoring uses the frozen benchmark annotations. '
+             'The annotation examples below are for development; this evaluation reuses the published benchmark.', '']
 
     def show(title, messages):
         lines.extend(['## ' + title, ''])
@@ -67,11 +67,11 @@ def render():
     show('Independent final-answer labels', final.original.label_messages(row, answer))
     show('Independent final-answer label review', final.review_messages(row, answer))
     for name, module in [('Step',step), ('Final answer',final)]:
-        show(name + ' / pure direct check', module.direct_messages(row, official_reference=answer))
+        show(name + ' / pure direct check', module.direct_messages(row))
         show(name + ' / shared PREPARE for the three knowledge arms', module.query_messages(row, english=True))
         item = dict(id='S1', title='Mean speed', text='Check distance divided by elapsed time.')
-        show(name + ' / skills or rule-tree CHECK', module.continuation_messages(row, queries, [item], arm='flat_skills', english=True, official_reference=answer)[2:])
-        rag = module.continuation_messages(row, queries, [case], arm='case_rag', english=True, official_reference=answer)
+        show(name + ' / skills or rule-tree CHECK', module.continuation_messages(row, queries, [item], arm='flat_skills', english=True)[2:])
+        rag = module.continuation_messages(row, queries, [case], arm='case_rag', english=True)
         show(name + ' / CHECK with a historical RAG case', rag[-1:])
     show('Step evidence-quote repair', [dict(role='user', content=quotes.repair_message(
         {'diagnostics':[{'evidence':{'quote':'3 metres per second'}}]}, [0], english=True))])

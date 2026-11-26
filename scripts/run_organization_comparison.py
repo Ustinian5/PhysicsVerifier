@@ -322,11 +322,8 @@ def register_content_failure_recovery(output):
         verify(output)
 
 
-def check_options(row, config):
-    if not en.active(config):
-        return {}
-    reference = en.bound_exam_answer(config, row['id'], vr.digest(p.source_payload(row)))
-    return {'english': True, **({'official_reference': reference} if reference is not None else {})}
+def check_options(config):
+    return {'english': True} if en.online_english(config) else {}
 
 
 def verify_direct_step(folder, messages, result=None):
@@ -355,19 +352,18 @@ def verify_direct_step(folder, messages, result=None):
 
 def recorded_delivery(path, row, arm, plan, result):
     config = plan.get('configuration', {})
-    if p.uses_preparation(arm, english=en.active(config)):
+    if p.uses_preparation(arm, english=en.online_english(config)):
         return vr.read(path.with_name('reference_packet.json'))['packet']['retrieval']
-    options = check_options(row, config)
-    verify_direct_step(path.parent, p.direct_messages(row, official_reference=options.get('official_reference')), result)
+    verify_direct_step(path.parent, p.direct_messages(row), result)
     return p.no_retrieval()
 
 
 @contextmanager
-def checking(row, arm, packet, prefix, *, english=False, official_reference=None):
+def checking(row, arm, packet, prefix, *, english=False):
     staged = p.uses_preparation(arm, english=english)
     require(staged == (prefix is not None) == (packet is not None), 'Wrong inputs for this checking arm')
     retrieval = packet['retrieval'] if staged else p.no_retrieval()
-    messages = packet['messages'] if staged else p.direct_messages(row, official_reference=official_reference)
+    messages = packet['messages'] if staged else p.direct_messages(row)
     provided = retrieval['provided_complete_ids']
     def initial(*args, **kwargs):
         events = [dict(tool='provide_reference', arguments={'ids': provided}, result=packet['references'])] if staged else []
@@ -409,10 +405,10 @@ def path_for(output, phase, arm, row):
 
 def run_condition(output, row, phase, arm, memory, plan, tokenizer, client):
     path = path_for(output, phase, arm, row)
-    options = check_options(row, plan.get('configuration', {}))
+    options = check_options(plan.get('configuration', {}))
     staged = p.uses_preparation(arm, english=bool(options))
     if not staged:
-        direct = p.direct_messages(row, official_reference=options.get('official_reference'))
+        direct = p.direct_messages(row)
         if not path.exists():
             verify_direct_step(path.parent, direct)
     if path.exists():

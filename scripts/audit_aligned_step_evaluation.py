@@ -85,7 +85,7 @@ class Audit:
         item = e.read(path); base.runtime.audit_result(item)
         require(item['id'] == row['id'] and item['configuration_sha256'] == plan['configuration_sha256'],
                 'Wrong sample/configuration')
-        options = base.check_options(row, plan['configuration'])
+        options = base.check_options(plan['configuration'])
         staged = base.p.uses_preparation(arm, english=bool(options))
         if item.get('failure_stage') == 'prepare':
             require(staged and base.complete_content_failure(item), 'Unverified failed PREPARE')
@@ -104,7 +104,7 @@ class Audit:
             used_in = prefix['evidence']['usage']['prompt_tokens']
             used_out = prefix['evidence']['usage']['completion_tokens']
         else:
-            messages = base.p.direct_messages(row, official_reference=options.get('official_reference'))
+            messages = base.p.direct_messages(row)
             base.verify_direct_step(path.parent, messages, item)
             used_in, used_out, provided = 0, 0, []
         paths = sorted(path.parent.glob('turn_*/request.json'))

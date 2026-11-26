@@ -39,11 +39,9 @@ def test_current_english_prepare_and_check_have_only_their_permitted_inputs(modu
     assert en.EXAM_REFERENCE not in data and 'PRIVATE' not in str(check) and '<|' not in str(check)
     if arm == 'case_rag':
         assert '旧题' in data['Reference material'][0]['text'] and en.REVIEW in data['Reference material'][0]['text']
-    opened = module.continuation_messages(ROW, QUERIES, refs, official_reference=EXAM, **opts)
-    assert opened[:-1] == check[:-1] and '<|' not in str(opened)
-    opened_data = json.loads(opened[-1]['content'].split('\n',1)[0])
-    assert opened_data.pop(en.EXAM_REFERENCE) == EXAM and opened_data == data
-    assert opened[-1]['content'].split('\n',1)[1] == check[-1]['content'].split('\n',1)[1]
+    assert set(data) == {'stage', 'Reference material'}
+    with pytest.raises(TypeError, match='official_reference'):
+        module.continuation_messages(ROW, QUERIES, refs, official_reference=EXAM, **opts)
 
 
 @pytest.mark.parametrize('module', [step, final])
@@ -53,10 +51,8 @@ def test_pure_receives_only_the_direct_check(module):
     assert [m['role'] for m in messages] == ['system', 'user']
     assert json.loads(messages[1]['content']) == {k: ROW[k] for k in ('question','prediction','context')}
     assert all(word not in str(messages) for word in ('PREPARE','queries','Reference material','PRIVATE','<|'))
-    opened = module.direct_messages(ROW, official_reference=EXAM)
-    assert opened[0] == messages[0]
-    assert json.loads(opened[1]['content']) == dict(json.loads(messages[1]['content']), **{en.EXAM_REFERENCE: EXAM})
-    assert '<|' not in str(opened)
+    with pytest.raises(TypeError, match='official_reference'):
+        module.direct_messages(ROW, official_reference=EXAM)
     with pytest.raises(ValueError, match='direct_messages'):
         module.continuation_messages(ROW, QUERIES, [], arm='pure', english=True)
     with pytest.raises(ValueError, match='direct_messages'):
@@ -123,11 +119,17 @@ def test_new_step_plan_rejects_archived_bilingual_receipt_before_check(tmp_path)
         online.query(tmp_path,ROW,plan,None,None)
 
 
-def test_official_reference_is_bound_to_the_current_answer():
-    config = dict(PROFILE,check_exam_references={'test':dict(label=EXAM,input_sha256=execution.vr.digest(final.public(ROW)))})
-    assert execution.check_exam_answer(ROW,PROFILE) is None and execution.check_exam_answer(ROW,config) == EXAM
-    with pytest.raises(ValueError, match='different input'):
-        execution.check_exam_answer(dict(ROW,prediction='A different response'),config)
+@pytest.mark.parametrize('leak', [{'check_exam_references': {}}, {'exam_reference_required': True},
+                                  {'online_reference_visible': True}])
+def test_old_reference_visible_plans_cannot_issue_formal_requests(tmp_path, monkeypatch, leak):
+    config = dict(PROFILE, **leak)
+    with pytest.raises(ValueError, match='formal verifier'):
+        online.run_condition(tmp_path, ROW, 'formal', 'pure', None, {'configuration': config}, None, None)
+    runner, plan, tok, calls = fake_runtime(monkeypatch)
+    plan['configuration'].update(config)
+    with pytest.raises(ValueError, match='formal verifier'):
+        runner.run_question(tmp_path, ROW, 'formal', plan, tok, None, {})
+    assert not calls
 
 
 def test_frozen_source_location_beats_another_variant_and_rejects_swaps(tmp_path):
@@ -178,9 +180,8 @@ def test_annotation_profile_follows_saved_manifest(tmp_path):
     assert annotator.annotation_system({}) == annotator.SYSTEM
 
 
-@pytest.mark.parametrize('with_exam',[False,True])
 @pytest.mark.parametrize('valid_query', [True, False])
-def test_final_direct_baseline_and_three_shared_checks(tmp_path, monkeypatch, with_exam, valid_query):
+def test_final_direct_baseline_and_three_shared_checks(tmp_path, monkeypatch, valid_query):
     prepare = final.query_messages(ROW, english=True)
     verdict = dict(verdict='incorrect', student_final_answer='3 m/s', reason='The units and number do not agree.')
     def respond(messages):
@@ -190,15 +191,13 @@ def test_final_direct_baseline_and_three_shared_checks(tmp_path, monkeypatch, wi
     r, plan, tok, calls = fake_runtime(monkeypatch, content=respond)
     config = plan['configuration']
     config.update(PROFILE)
-    if with_exam:
-        config['check_exam_references']={'test':dict(label=EXAM,input_sha256=execution.vr.digest(final.public(ROW)))}
     plan['configuration_sha256'] = r.vr.digest(config)
     stores = dict(case_rag=step.FlatMemory([dict(PAST,title='Constant force')]),
                   flat_skills=step.FlatMemory([]),rule_tree=step.TreeMemory(catalog()))
     def run():
         r.run_question(tmp_path, ROW, 'formal', plan, tok, None, stores)
     run()
-    direct = final.direct_messages(ROW, official_reference=EXAM if with_exam else None)
+    direct = final.direct_messages(ROW)
     sent = [c['messages'] for c in calls]
     assert sent[:2] == [direct, prepare] and len(sent) == (5 if valid_query else 2)
     assert 'PRIVATE' not in str(sent)
@@ -216,7 +215,7 @@ def test_final_direct_baseline_and_three_shared_checks(tmp_path, monkeypatch, wi
         check = call['messages']
         assert check[:2] == prepare and json.loads(check[2]['content']) == QUERIES
         fields = json.loads(check[-1]['content'].split('\n',1)[0])
-        assert fields.get(en.EXAM_REFERENCE) == (EXAM if with_exam else None)
+        assert set(fields) == {'stage', 'Reference material'}
         assert call['max_tokens'] == 16384 - 3
     for arm in KNOWLEDGE_ARMS:
         result = r.vr.read(tmp_path/'formal'/arm/key/'result.json')

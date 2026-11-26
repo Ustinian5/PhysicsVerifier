@@ -17,13 +17,13 @@ from rule_framework import verifier_english as en
 
 import httpx
 
-from scripts import frozen_verifier_exam_answers as exams
 from scripts import run_aligned_organization as a
 from scripts.run_qwen30b_step_checks import reference_rows
 
 base, vr, require = a.base, a.vr, a.require
 VERSION = 'corrected100_oldv15_released_v1'
-ENGLISH_VERSION = 'english_step_direct_with_120b_judge_v1'
+ENGLISH_VERSION = 'english_step_blind_with_120b_judge_v1'
+PILOT_SHA = '618991c554aebc6d2875aab871eaa6a8713e6089008534b7718e586254385855'
 KNOWN_SOURCE = '62a07c4b8297c063fcb852b972e21db38f50ed9137326ff13b104f085544bdf0'
 
 
@@ -32,7 +32,7 @@ def code_hashes(*, english=False):
         'scripts/run_bench_reannotation.py', 'scripts/bench_reannotation_runtime.py'}
     if english:
         from scripts import run_step_match_judge as judge
-        names.update((*judge.CODE, 'scripts/frozen_verifier_exam_answers.py', 'rule_framework/verifier_english.py', 'scripts/resume_aligned_step_evaluation.py',
+        names.update((*judge.CODE, 'rule_framework/verifier_english.py', 'scripts/resume_aligned_step_evaluation.py',
                       'scripts/serve_frozen_bm25.py', 'scripts/run_node14_final_pilot.py'))
     return {n: vr.sha(a.ROOT / n) for n in sorted(names)}
 
@@ -108,38 +108,69 @@ def score_parity(legacy):
                 exact_full_score_objects=True, scores=values, old_metrics_sha256=vr.sha(legacy / 'metrics.json'))
 
 
-def released_libraries(parent, bench, files):
-    from scripts import run_frozen_step_bm25 as frozen
+def frozen_development_inputs(path, formal_ids, files):
+    require(vr.sha(path) == PILOT_SHA, 'Different fixed development inputs')
+    rows = vr.read(path)
+    ids = {r['id'] for r in rows}
+    require(len(rows) == len(ids) == 6 and ids.isdisjoint(formal_ids)
+            and all(r == base.p.source_payload(r) for r in rows), 'Development inputs are not six held-out public rows')
+    files[str(path)] = PILOT_SHA
+    return rows
+
+
+def verify_library_first_reviews(build, evidence, inputs):
+    rows = {r['id']: r for r in inputs}
+    for experience in vr.read(build / 'semantic_experience.json'):
+        if experience['semantic_audit']['status'] != 'error_found':
+            continue
+        sid = experience['sample_id']
+        row = rows[sid]
+        record_path = build / 'experiences' / (sid + '.json')
+        require(vr.sha(record_path) == evidence[str(record_path.resolve())], 'Source experience changed')
+        record = vr.read(record_path)
+        calls = record['evidence']
+        require(record['value'] == experience and 1 <= len(calls) <= 2, 'Different first-review experience')
+        lines = [{'line': i, 'text': text} for i, text in enumerate(row['prediction'].splitlines(keepends=True), 1)]
+        for stage, call in zip(('extract_experience', 'repair_experience'), calls):
+            raw_path = build / call['file']
+            require(raw_path.parent.parent.name == stage and vr.sha(raw_path) == call['sha256'] == evidence[str(raw_path)],
+                    'Unbound construction request')
+            raw = vr.read(raw_path)
+            payload = json.loads(raw['request']['messages'][1]['content'])
+            require(raw['status'] == 'received' and payload['sample_id'] == sid and payload['question'] == row['question']
+                    and payload['prediction_lines'] == lines and payload.get(en.EXAM_REFERENCE) == row['official_reference']['label'],
+                    'First-review request did not receive its own official answer')
+
+
+def released_libraries(parent, files):
     require(parent is not None, 'Four-arm evaluation needs a released library parent')
     pc = vr.read(parent / 'plan.json')
-    require(vr.digest(pc['configuration']) == pc['configuration_sha256'], 'Parent input plan changed')
-    files[str(parent / 'plan.json')] = vr.sha(parent / 'plan.json')
-    if en.active(pc['configuration']):
-        receipt_path = parent / 'construction_acceptance.json'
-        receipt = vr.read(receipt_path)
-        require(receipt['passed'] and pc['configuration'].get('scope') == 'materials_only', 'Unreleased English libraries')
-        paths = {k: parent / 'materials' / (k + '.json') for k in ('cases', 'skills', 'catalog')}
-        require(all(receipt['files'][str(p.relative_to(parent))] == vr.sha(p) for p in paths.values())
-                and receipt['isolation_sha256'] == vr.sha(parent / 'material_isolation.json'), 'Library receipt drift')
-        files[str(receipt_path)] = vr.sha(receipt_path)
-        files[str(parent / 'material_isolation.json')] = receipt['isolation_sha256']
-        material_source = 'English construction release'
-    else:
-        # The parent of the original step bench also contains superseded libraries.
-        # Use the published common-first-review n2000 release for this explicit archived input.
-        require(bench == parent / 'evaluation', 'Supply the published English construction or the frozen aligned_old99 parent')
-        source_path = parent.parent / 'library_source_rerun_20261124/bm25_n2000/sources.json'
-        require(vr.sha(source_path) == '2558df2ba5685ed607d5bec6492f67a4c4811b90a4fe369e53301772c573d966',
-                'Common-first-review library release changed')
-        source = vr.read(source_path)
-        flat = source['groups']['n2000']
-        paths = {k: Path(flat['material_path']) / (k + '.json') for k in ('cases', 'skills')}
-        require(all(vr.sha(p) == flat['files'][p.name] for p in paths.values()), 'Flat library changed')
-        paths['catalog'] = parent / 'evaluation_revision/catalog.json'
-        require(vr.sha(paths['catalog']) == source['measured_tree_sha256'] == frozen.sources.TREE, 'Tree changed')
-        files[str(source_path)] = vr.sha(source_path)
-        material_source = 'Frozen common-first-review n2000 release'
-    return paths, material_source
+    cfg = pc['configuration']
+    require(vr.digest(cfg) == pc['configuration_sha256'], 'Parent input plan changed')
+    require(en.active(cfg) and cfg.get('scope') == 'materials_only',
+            'The knowledge arms require libraries derived from the same official-answer-guided first review')
+    evidence = vr.read(parent / 'source_evidence.json')
+    require(vr.digest(evidence) == cfg['evidence_digest'], 'Construction provenance changed')
+    build = Path(cfg['root']) / 'construction'
+    for name in ('plan.json', 'inputs.json', 'semantic_experience.json'):
+        path = (build / name).resolve(strict=True)
+        require(vr.sha(path) == evidence[str(path)], 'First-review source changed: ' + name)
+        files[str(path)] = evidence[str(path)]
+    first = vr.read(build / 'plan.json')
+    inputs = vr.read(build / 'inputs.json')
+    require(en.active(first['configuration']) and vr.digest(first['configuration']) == first['configuration_sha256']
+            and vr.digest(inputs) == first['configuration']['inputs_sha256'] and inputs
+            and all(en.exam_answer(r['official_reference']['label']) for r in inputs),
+            'Missing official answers in the frozen building inputs')
+    verify_library_first_reviews(build, evidence, inputs)
+    receipt_path = parent / 'construction_acceptance.json'
+    receipt = vr.read(receipt_path)
+    paths = {k: parent / 'materials' / (k + '.json') for k in ('cases', 'skills', 'catalog')}
+    require(receipt['passed'] and all(receipt['files'][str(p.relative_to(parent))] == vr.sha(p) for p in paths.values())
+            and receipt['isolation_sha256'] == vr.sha(parent / 'material_isolation.json'), 'Library receipt drift')
+    for path in (parent / 'plan.json', parent / 'source_evidence.json', parent / 'material_isolation.json', receipt_path):
+        files[str(path)] = vr.sha(path)
+    return paths, 'Common official-answer-guided first review of the construction questions'
 
 
 def prepare(out, parent, *, prompt_profile=None, benchmark=None, pure_only=False):
@@ -155,19 +186,13 @@ def prepare(out, parent, *, prompt_profile=None, benchmark=None, pure_only=False
             'Frozen checker configuration changed')
     prior = vr.read(runtime_plan)['configuration']
     files[str(runtime_plan)] = vr.sha(runtime_plan)
-    # The original bench may be a symlink to the archive; the paired reference release lives on node14.
-    root = bench.parent.parent
-    if not (root / 'step_exam_reference/source_answers.json').exists():
-        root = judge.frozen.sources.RESULTS
-    references = exams.official(root, 'step', rows, files)
-    controls, dev_refs = exams.development(root, a.ROOT / 'data/combined_language_only.json', files)
-    require(not (references.keys() & dev_refs.keys()), 'Benchmark/development overlap')
-    references.update(dev_refs)
+    pilot = judge.frozen.sources.RESULTS / 'aligned_old99/final_revision_balanced/pilot_inputs.json'
+    controls = frozen_development_inputs(pilot, {r['id'] for r in rows} | set(coverage['held_ids']), files)
     arms = ['pure'] if pure_only else list(base.p.ARMS)
     if pure_only:
         paths, material_source = {}, None
     else:
-        paths, material_source = released_libraries(parent, bench, files)
+        paths, material_source = released_libraries(parent, files)
     paths['inputs'] = bench / 'inputs.json'
     released = {}
     for name, path in paths.items():
@@ -181,7 +206,7 @@ def prepare(out, parent, *, prompt_profile=None, benchmark=None, pure_only=False
                                'budget_limits', 'query_max_tokens', 'reference_token_cap', 'max_items', 'tree_branches')}
     c.update(protocol=ENGLISH_VERSION, prompt_profile=en.PROFILE, pure_prompt=en.STEP_DIRECT, check_prompt=en.STEP_CHECK,
              prepare_instruction=en.QUERY, prepare_arms=[arm for arm in arms if arm != 'pure'], arms=arms,
-             controls=controls, check_exam_references=references, exam_reference_required=True,
+             controls=controls, online_reference_visible=False,
              parent=str(parent) if parent else None,
              source_hashes=code_hashes(english=True), dependencies=files, released_files=released,
              step_match_judge=judge.match.VERSION, step_benchmark=str(bench), cohort=coverage,
@@ -198,7 +223,8 @@ def verify(out):
     require(c['source_hashes'] == code_hashes(english=en.active(c)), 'Code drift')
     if 'step_match_judge' in c:
         from rule_framework import step_match
-        require(en.active(c) and c['step_match_judge'] == step_match.VERSION, 'Wrong step adjudicator')
+        require(c.get('online_reference_visible') is False and en.online_english(c)
+                and c['step_match_judge'] == step_match.VERSION, 'Wrong online inputs or step adjudicator')
     else:
         a.verify(Path(c['parent']))
     for name, sha in c['released_files'].items():
@@ -264,28 +290,38 @@ def score(out, plan=None):
     return report
 
 
-def verify_exam_delivery(out, phase, row, arm, config, tokenizer, result):
-    if not config.get('exam_reference_required'):
-        return
-    answer = base.check_options(row, config)['official_reference']
-    if arm != 'pure' and result.get('failure_stage') == 'prepare':
-        return
-    turn = 'turn_01' if arm == 'pure' else 'turn_02'
-    folder = base.path_for(out, phase, arm, row).parent / turn
-    messages = vr.read(folder / 'request.json')['request']['messages']
-    body = messages[-1]['content']
-    # CHECK appends an instruction after the JSON; the direct request is just the JSON object.
-    payload, _ = json.JSONDecoder().raw_decode(body)
-    require(payload.get(en.EXAM_REFERENCE) == answer, 'Exam answer missing from the actual CHECK')
+def verify_blind_delivery(out, phase, row, arm, memory, tokenizer, result):
+    def check(folder, raw_name, expected):
+        sent = vr.read(folder / 'request.json')['request']['messages']
+        require(sent == expected, 'Unexpected input in the blind verifier request')
+        raw = vr.read(folder / raw_name)
+        rendered = tokenizer.decode(raw['prompt_token_ids'], skip_special_tokens=False)
+        en.verify_visible_users(rendered, sent)
+
+    folder = base.path_for(out, phase, arm, row).parent
     if arm == 'pure':
-        require(messages == base.p.direct_messages(row, official_reference=answer),
-                'Extra or missing input in pure baseline')
+        expected = base.p.direct_messages(row)
+        turn = 1
     else:
-        require(messages[:2] == base.p.query_messages(row, english=True)
-                and en.EXAM_REFERENCE not in messages[1]['content'], 'Exam answer exposed in PREPARE')
-    raw = vr.read(folder / 'response.sse')
-    actual = tokenizer.decode(raw['prompt_token_ids'], skip_special_tokens=False)
-    require(body in actual, 'Exam answer missing from the model-visible input tokens')
+        shared = out / 'queries' / vr.digest(row['id'])[:24]
+        check(shared, 'raw.json', base.p.query_messages(row, english=True))
+        if result.get('failure_stage') == 'prepare':
+            return
+        queries = vr.read(shared / 'result.json')['queries']
+        packet = vr.read(folder / 'reference_packet.json')['packet']
+        store = memory.memory if arm == 'rule_tree' else memory
+        items = [store.view(sid) for sid in packet['retrieval']['provided_complete_ids']]
+        expected = base.p.continuation_messages(row, queries, items, arm=arm, english=True)
+        turn = 2
+    first_turn = folder / f'turn_{turn:02d}'
+    check(first_turn, 'response.sse', expected)
+    repair = folder / f'turn_{turn + 1:02d}'
+    if (repair / 'request.json').exists():
+        diagnosis = vr.read(folder / 'first_diagnosis.json')
+        quote_prompt = base.quotes.repair_message(diagnosis, base.quotes.invalid_quotes(diagnosis, row), english=True)
+        check(repair, 'response.sse', expected + [
+            dict(role='assistant', content=vr.read(first_turn / 'response.json')['content']),
+            dict(role='user', content=quote_prompt)])
 
 
 def check_published(out, row, phase, arm, memory, plan, tokenizer, client):
@@ -352,7 +388,8 @@ def run(out, *, gpu=4):
                         for arm in arms:
                             require(not (out / 'STOP').exists(), 'STOP requested')
                             result = check_published(out, row, phase, arm, memories[arm], plan, tokenizer, client)
-                            verify_exam_delivery(out, phase, row, arm, c, tokenizer, result)
+                            if judged:
+                                verify_blind_delivery(out, phase, row, arm, memories[arm], tokenizer, result)
                             results.append(result)
                     if phase == 'controls':
                         require(len(results) == len(rows) * len(c['arms']) and all(base.runtime.healthy_result(r) and r['protocol_audit']['passed']

@@ -309,8 +309,8 @@ def prepare_messages(row, system, instruction):
     return [dict(role='system', content=system), dict(role='user', content=data + '\n' + instruction)]
 
 
-def direct_messages(row, *, official_reference=None):
-    return en.direct_messages(source_payload(row), en.STEP_DIRECT, official_reference=official_reference)
+def direct_messages(row):
+    return en.direct_messages(source_payload(row), en.STEP_DIRECT)
 
 
 def uses_preparation(arm, *, english):
@@ -347,7 +347,7 @@ def validate_queries(value, *, english=False):
     return value
 
 
-def continuation_messages(row, queries, references, *, english=False, arm=None, official_reference=None):
+def continuation_messages(row, queries, references, *, english=False, arm=None):
     if arm is not None:
         require(uses_preparation(arm, english=english), 'English pure checks must use direct_messages')
     validate_queries(queries, english=english)
@@ -356,9 +356,6 @@ def continuation_messages(row, queries, references, *, english=False, arm=None, 
         references = [en.case_view(item) for item in references]
     result.append({'role': 'assistant', 'content': json.dumps(queries, ensure_ascii=False)})
     fields = {'stage': 'CHECK', 'Reference material': references}
-    if official_reference is not None:
-        require(english, 'Official references require an explicit reference-aware prompt')
-        fields[en.EXAM_REFERENCE] = en.exam_answer(official_reference)
     data = json.dumps(fields, ensure_ascii=False).replace('<|', '\\u003c|')
     instruction = ('Check the complete current solution.' if english else
                    'Check the complete original answer in this conversation. Submit final diagnostics JSON.')
@@ -408,15 +405,13 @@ class TreeMemory:
                         'total_leaf_count': len(self.memory.docs), 'flat_fallback': False}
 
 
-def reference_packet(row, arm, queries, memory, count_tokens, *, english=False, render=None, official_reference=None):
+def reference_packet(row, arm, queries, memory, count_tokens, *, english=False, render=None):
     """Same query, complete-item and context budgets for all representations."""
     require(uses_preparation(arm, english=english), 'English pure checks must use direct_messages')
-    if official_reference is not None:
-        require(english and render is None, 'Step reference-aware checks require the English renderer')
     validate_queries(queries, english=english)
     if render is None:
         # The legacy runners can still supply their original continuation via the module.
-        render = (partial(continuation_messages, english=True, arm=arm, official_reference=official_reference)
+        render = (partial(continuation_messages, english=True, arm=arm)
                   if english else continuation_messages)
     query = '\n'.join(queries['queries'])
     if arm == 'pure':

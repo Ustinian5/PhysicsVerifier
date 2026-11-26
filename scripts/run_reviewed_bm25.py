@@ -76,10 +76,8 @@ def prefix_record(parent, old, phase, row):
 def evaluate_row(out, parent, old, phase, row, plan, memories, tokenizer, client, source_files):
     key = vr.digest(row['id'])[:24]
     limits = plan['configuration']['limits']
-    english = final.en.active(plan['configuration'])
-    require(english == final.en.active(old['configuration']), 'Incompatible shared PREPARE language')
-    reference = final.check_exam_answer(row, plan['configuration'])
-    require(reference == final.check_exam_answer(row, old['configuration']), 'Incompatible exam reference for baseline reuse')
+    english = final.en.online_english(plan['configuration'])
+    require(english == final.en.online_english(old['configuration']), 'Incompatible shared PREPARE language')
     prefix = None
     def count(messages):
         return len(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
@@ -111,8 +109,7 @@ def evaluate_row(out, parent, old, phase, row, plan, memories, tokenizer, client
         delivery = dict(provided_complete_ids=[], reference_tokens=0)
         reason, usage, wall = 'Shared PREPARE failed', dict(prefix['usage']), prefix['wall_seconds']
         if prefix['status'] == 'complete':
-            packet = final.p.reference_packet(row, arm, prefix['value'], memories[arm], count, english=english,
-                                              official_reference=reference)
+            packet = final.p.reference_packet(row, arm, prefix['value'], memories[arm], count, english=english)
             delivery = packet['retrieval']
             require(len(delivery['provided_complete_ids']) <= final.base.p.MAX_ITEMS and
                     delivery['reference_tokens'] <= final.base.p.REFERENCE_TOKEN_CAP, 'Material budget exceeded')
