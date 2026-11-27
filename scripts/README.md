@@ -4,13 +4,13 @@
 
 node14 使用个人解释器 `/data0/zengzheni/PhysicsVerifier-huhengyuan/envs/physicsverifier/bin/python`。在项目目录执行 `python -m scripts.run_reference_guided_verifier audit` 可从2,000份登记重新核对来源和实际可见题面。结果根 `english_blind_verifier/build_scope_audit.json` 保存逐题处置、题族对应关系、独立分问范围和原件哈希。该操作在 CPU 上执行。[来源与运行入口](run_reference_guided_verifier.py)
 
-当前三库输入位于 `english_blind_verifier/formal`。在 node14 用个人 conda 环境运行 `python -m scripts.run_reference_guided_verifier prepare --approved-scope-sha256 45069193260a70295387de18c96017b3331f440eadde4c49a658a30d1f7e82ea --judge-location-policy lines_once --gpus 4 5 6 7`，会在 CPU 上根据保存的原始首审复核 `construction/field_release.json`、准备或核对 `libraries/plan.json`，模型调用为零。三库的正式发布凭据为该目录下的 `libraries/construction_acceptance.json`。GPU4按序建树，GPU5–7从相同的错题案例独立提炼 skills，按原案例顺序合并。断开 SSH 后以同一入口的 `confirm` 核对后台 `run` 进程。原始首审和11月26日的停止现场保存在上一级。[字段核查](../docs/效果测评.md#verifier-字段核查)
+现行两级实验直接读取已发布的三库，发布回执为 `english_blind_verifier/formal/libraries/construction_acceptance.json`。同一批990份错题经验、提炼输入与候选规则的原件核查见 `formal/field_acceptance.json`。[三库发布入口](run_reference_guided_verifier.py) · [字段核查](../docs/效果测评.md#verifier-字段核查)
 
-新版步骤级四组共用一轮式独立裁判。纯组沿用 `english_blind_verifier/step_pure` 的99份检查，沿用已通过验收的63条裁决。三库发布后，三个知识组先跑固定6道开发题，再跑同一批99道正式题。裁判同时给出根因判定和原答行号，纯组首轮统计位于 `step_judge_lines/pure/first_pass.json`，本次四组统计的目标位置为同级 `step_formal/step_judge_first_pass/first_pass.json`，验收回执为 `step_formal/judge_acceptance.json`。用 `python -m scripts.run_aligned_step_evaluation score --output <步骤级结果目录>` 可从原件复算。[步骤级入口](run_aligned_step_evaluation.py) · [一轮式裁判](run_step_line_judge.py)
+新版步骤级由 `python -m scripts.step_check_format` 执行。`prepare` 在 CPU 上验证之前成功的7项，并从原始响应恢复第3题的 RAG 空诊断。`run` 在 node14 后台续跑，退出启动会话后重新连接执行 `confirm`。固定6题三个知识组全部通过后，执行99道正式题及一轮式独立盲裁。纯组复用99份检查和63条裁决。`score` 从原件复算，四组裁判验收见 `english_blind_verifier/step_formal/judge_acceptance.json`。[步骤级入口](step_check_format.py) · [一轮式裁判](run_step_line_judge.py)
 
 历史逐字引文口径中，11月26日纯组有31条首轮裁决经补定位后完成。仅此批次使用 `python -m scripts.repair_step_judge_locations score --published <english_blind_verifier/step_pure>` 离线复算。结果根的 `metrics.json` 汇总原32条有效裁决和31条补裁；`step_judge/location_repair/` 保存补裁清单、逐条原文位置和运行回执。[定位补裁入口](repair_step_judge_locations.py)
 
-题目级新建计划使用 `-m scripts.run_final_answer_revision prepare --root <结果根> --material-parent <已验收的材料发布目录> --output <新目录> --await-release`。该入口复用冻结474题的回答及标签，并沿用上次有参考对照的467道可测题。后台准备、开发验收及正式执行分别使用 `prepare`、`pilot`、`run`，每次重新连接后以同一结果目录执行 `confirm-detached`。[题目级入口](run_final_answer_revision.py)
+新版题目级使用 `python -m scripts.run_structured_final`。`prepare` 绑定已发布三库、原6道开发题、冻结474题及输出格式。后台启动 `run` 后重新连接执行 `confirm`。6题四组共24项通过后，依原题序执行467道可测题；`score` 从原件复算。当前结果目录为 `english_blind_verifier/formal/final_structured`，其中 `pilot_acceptance.json` 为开发验收回执，`metrics.json` 为正式成绩。[题目级入口](run_structured_final.py) · [生成格式](../rule_framework/final_output_format.py)
 
 复现历史逐字引文裁判的冻结 BM25 四组诊断时，使用 `python -m scripts.run_step_match_judge run --published <bm25_n2000/step> --output <独立裁判结果目录> --gpu 4`，同样在服务器后台启动，重新连接后将 `run` 换为 `confirm`。开发验收使用 `--controls`。结果目录内的 `publication.json` 绑定原诊断，`judgments/` 保存逐条请求及响应，`details.json` 和 `metrics.json` 保存逐题命中及四组三项。原命令将 `run` 换为 `score` 可在服务关闭后回放。[裁判入口](run_step_match_judge.py) · [计分口径](../docs/效果测评.md#步骤级)
 
