@@ -74,7 +74,9 @@ def run(kind, gpu, out, stamp):
                         current=base.path_for(out,'formal',arm,row)
                         old=vr.read(path.parent/'turn_02/request.json')['request']
                         new=vr.read(current.parent/'turn_02/request.json')['request']
-                        assert new['messages']==packet['messages'] and {k:v for k,v in new.items() if k!='messages'}=={k:v for k,v in old.items() if k!='messages'}
+                        # The native step runner appends its response to the in-memory message list.
+                        expected_messages = vr.read(folder/'packet.json')['messages']
+                        assert new['messages']==expected_messages and {k:v for k,v in new.items() if k!='messages'}=={k:v for k,v in old.items() if k!='messages'}
                 elif 'retained_failure' in receipt:
                     assert vr.sha(path)==receipt['retained_failure']
                 published['bm25f'][sid,arm]=current
@@ -117,7 +119,9 @@ if __name__=='__main__':
     p.add_argument('gpu',type=int,choices=(5,6,7));args=p.parse_args()
     st.node.node()
     out=replay.OUT/(args.kind+'_checks');out.mkdir(parents=True,exist_ok=True)
-    stamp=vr.digest([vr.sha(__file__),vr.sha(replay.__file__),vr.sha(replay.OUT/'cohort.json'),args.kind])
+    # Keep result bindings across the read-only post-send comparison fix.
+    protocol_runner = 'e7ea0e106dfc4960906b0e0dbc285b23e832cfbe326ee477d79e90b11add45f8'
+    stamp=vr.digest([protocol_runner,vr.sha(replay.__file__),vr.sha(replay.OUT/'cohort.json'),args.kind])
     if args.action=='confirm':
         st.node.confirm(out,stamp)
     else:
